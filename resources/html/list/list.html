@@ -1,0 +1,137 @@
+{# Music Hub · 聚合点歌列表卡 #}
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8" />
+<style>
+  *{margin:0;padding:0;box-sizing:border-box}
+  :root{
+    --mh-nm:#ec4141;--mh-nm-deep:#c62f2f;--mh-hero-a:#ef4e44;--mh-hero-b:#d0362c;
+    --mh-card-a:#fdf8f7;--mh-card-b:#f9e9e6;--mh-soft:#fbeeea;--mh-muted:#8a5a52;
+    --mh-text:#3a1d18;--mh-chip:rgba(236,65,65,.09);--mh-line:rgba(236,65,65,.16);
+    --src-ncm:#ec4141;--src-kg:#2ca6e0;--src-qq:#31c27c;
+  }
+  html{width:fit-content}
+  body{font-family:"MiSans","HarmonyOS Sans SC","Microsoft YaHei UI","PingFang SC",sans-serif;
+    background:var(--mh-soft);color:var(--mh-text);-webkit-font-smoothing:antialiased}
+  .page{width:640px;padding:26px 22px}
+
+  .hero{position:relative;overflow:hidden;border-radius:26px 26px 22px 22px;padding:30px 26px 24px;
+    background:linear-gradient(135deg,var(--mh-hero-a),var(--mh-hero-b));color:#fff;isolation:isolate}
+  .hero::before{content:"";position:absolute;inset:0;z-index:-1;
+    background:radial-gradient(58% 46% at 86% 8%,rgba(255,255,255,.28) 0%,transparent 68%),
+               radial-gradient(50% 44% at 4% 98%,rgba(0,0,0,.30) 0%,transparent 72%),
+               linear-gradient(160deg,rgba(255,255,255,.12) 0%,transparent 46%)}
+  .hero::after{content:"";position:absolute;inset:0;z-index:-1;opacity:.05;mix-blend-mode:overlay;
+    background:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='140' height='140'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.9' numOctaves='2'/%3E%3CfeColorMatrix type='saturate' values='0'/%3E%3C/filter%3E%3Crect width='140' height='140' filter='url(%23n)'/%3E%3C/svg%3E")}
+  .hero-top{display:flex;align-items:center;gap:10px}
+  .hero-icon{width:44px;height:44px;border-radius:14px;display:grid;place-items:center;flex:none;
+    background:rgba(255,255,255,.18);backdrop-filter:blur(6px);box-shadow:inset 0 0 0 1px rgba(255,255,255,.25)}
+  .hero-icon svg{width:24px;height:24px}
+  .hero-brand{font-size:12px;font-weight:800;letter-spacing:3.5px;opacity:.9}
+  .hero-ver{margin-left:auto;font-size:11px;font-weight:700;padding:5px 12px;border-radius:999px;
+    background:rgba(255,255,255,.16);backdrop-filter:blur(4px)}
+  .hero-kw{margin-top:14px;font-size:33px;font-weight:900;letter-spacing:.5px;line-height:1.18;
+    text-shadow:0 2px 18px rgba(0,0,0,.18);word-break:break-all}
+  .hero-stats{display:flex;gap:10px;margin-top:16px;flex-wrap:wrap}
+  .stat-chip{display:inline-flex;align-items:center;gap:7px;padding:8px 15px;border-radius:13px;
+    background:rgba(255,255,255,.15);backdrop-filter:blur(4px);font-size:13px;font-weight:700}
+  .stat-chip b{font-size:17px}
+
+  .body-card{background:linear-gradient(180deg,var(--mh-card-a),var(--mh-card-b));
+    border-radius:0 0 26px 26px;padding:8px 16px 16px;margin-top:-8px;position:relative}
+  .rows{display:flex;flex-direction:column}
+  .row{display:flex;align-items:center;gap:13px;padding:11px 8px;border-radius:16px;
+    border-bottom:1px dashed var(--mh-line)}
+  .row:last-child{border-bottom:none}
+  .row-idx{width:30px;text-align:center;font-size:15px;font-weight:800;color:var(--mh-muted);
+    font-variant-numeric:tabular-nums;flex:none}
+  .row-idx.top{color:var(--mh-nm);font-size:17px}
+  .row-cover{width:46px;height:46px;border-radius:11px;object-fit:cover;flex:none;
+    box-shadow:0 3px 10px rgba(0,0,0,.14)}
+  .row-cover-ph{width:46px;height:46px;border-radius:11px;flex:none;display:grid;place-items:center;
+    background:var(--mh-chip);color:var(--mh-nm);font-size:18px}
+  .row-main{flex:1;min-width:0}
+  .row-name{font-size:15.5px;font-weight:700;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+  .row-sub{font-size:12px;color:var(--mh-muted);margin-top:3px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+  .row-right{display:flex;flex-direction:column;align-items:flex-end;gap:4px;flex:none}
+  .row-dur{font-size:11.5px;color:var(--mh-muted);font-variant-numeric:tabular-nums}
+  .row-badges{display:flex;gap:5px}
+  .badge{font-size:10px;font-weight:800;padding:2.5px 8px;border-radius:999px;letter-spacing:.5px}
+  .badge-vip{background:linear-gradient(135deg,#f7b733,#e8892c);color:#fff}
+  .badge-trial{background:rgba(0,0,0,.10);color:var(--mh-muted)}
+  .src-dot{display:inline-flex;align-items:center;gap:5px;font-size:10.5px;font-weight:800;color:var(--sc)}
+  .src-dot::before{content:"";width:7px;height:7px;border-radius:50%;background:var(--sc);box-shadow:0 0 6px var(--sc)}
+  .src-ncm{--sc:var(--src-ncm)}.src-kg{--sc:var(--src-kg)}.src-qq{--sc:var(--src-qq)}
+  .vchip{display:inline-grid;place-items:center;width:19px;height:19px;border-radius:7px;
+    font-size:10px;font-weight:900;color:#fff;box-shadow:0 2px 5px rgba(0,0,0,.16)}
+  .v-ncm{background:linear-gradient(135deg,#ff6b81,#ec4141)}
+  .v-kg{background:linear-gradient(135deg,#5bb8ff,#2ca6e0)}
+  .v-qq{background:linear-gradient(135deg,#3ed598,#1fae72)}
+
+  .tip{margin-top:14px;display:flex;align-items:center;gap:9px;padding:12px 15px;border-radius:14px;
+    background:var(--mh-chip);color:var(--mh-muted);font-size:12.5px;font-weight:600;line-height:1.6}
+  .footer{display:flex;justify-content:space-between;align-items:center;padding:14px 6px 2px;
+    color:var(--mh-muted);font-size:11px;font-weight:700;letter-spacing:.6px}
+  .footer .brand{display:inline-flex;align-items:center;gap:6px}
+</style>
+</head>
+<body>
+<div class="page">
+  <div class="hero">
+    <div class="hero-top">
+      <div class="hero-icon">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M9 18.5V6.8l10-2v11.2"/><circle cx="6.6" cy="18.5" r="2.4"/><circle cx="16.6" cy="16" r="2.4"/></svg>
+      </div>
+      <div class="hero-brand">MUSIC HUB{% if data.source != 'auto' %} · {{ {'ncm':'网易云','kg':'酷狗','qq':'QQ音乐'}.get(data.source,'聚合') }}{% else %} · 聚合{% endif %}</div>
+      <div class="hero-ver">v{{ data.version }}</div>
+    </div>
+    <div class="hero-kw">{{ data.keyword }}</div>
+    <div class="hero-stats">
+      <div class="stat-chip"><b>{{ data.total }}</b> 首结果</div>
+      <div class="stat-chip">回复 <b>听N</b> 播放</div>
+      {% if data.tip %}<div class="stat-chip">{{ data.tip }}</div>{% endif %}
+    </div>
+  </div>
+
+  <div class="body-card">
+    <div class="rows">
+      {% for s in data.songs %}
+      <div class="row">
+        <div class="row-idx{% if s.index <= 3 %} top{% endif %}">{{ s.index }}</div>
+        {% if s.cover %}
+        <img class="row-cover" src="{{ s.cover }}" referrerpolicy="no-referrer" onerror="this.outerHTML='<div class=&quot;row-cover-ph&quot;>♪</div>'" />
+        {% else %}
+        <div class="row-cover-ph">♪</div>
+        {% endif %}
+        <div class="row-main">
+          <div class="row-name">{{ s.songName }}</div>
+          <div class="row-sub">{{ s.singerName }}{% if s.albumName %} · {{ s.albumName }}{% endif %}</div>
+        </div>
+        <div class="row-right">
+          <div class="row-dur">{{ s.duration }}</div>
+          <div class="row-badges">
+            {% if s.versions %}
+            {% for v in s.versions %}<span class="vchip v-{{ v.source }}" title="{{ v.sourceName }}">{{ {'ncm':'网','kg':'狗','qq':'Q'}.get(v.source, '?') }}</span>{% endfor %}
+            {% if s.payplay %}<span class="badge badge-vip">VIP</span>{% endif %}
+            {% else %}
+            {% if data.source == 'auto' %}<span class="src-dot src-{{ s.source }}">{{ s.sourceName }}</span>{% endif %}
+            {% if s.payplay %}<span class="badge badge-vip">VIP</span>{% endif %}
+            {% if s.trial %}<span class="badge badge-trial">试听</span>{% endif %}
+            {% endif %}
+          </div>
+        </div>
+      </div>
+      {% endfor %}
+    </div>
+    {% if data.tip %}
+    <div class="tip">{{ data.tip }}</div>
+    {% endif %}
+    <div class="footer">
+      <span class="brand">♪ Music Hub 聚合点歌</span>
+      <span>{{ data.shown }} / {{ data.total }} 首</span>
+    </div>
+  </div>
+</div>
+</body>
+</html>

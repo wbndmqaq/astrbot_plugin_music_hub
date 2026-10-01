@@ -1,0 +1,138 @@
+"""帮助卡数据（唯一事实来源：帮助模板 / 文本兜底 / WebUI 共用）。"""
+
+from __future__ import annotations
+
+VERSION = "1.0.1"
+
+HELP_SECTIONS = [
+    {
+        "title": "聚合点歌",
+        "tag": "全员",
+        "items": [
+            {"name": "点歌 关键词", "desc": "三平台聚合搜索，结果混排", "example": "点歌 晴天"},
+            {"name": "点歌 ncm:关键词", "desc": "指定音源搜索（kg:/qq: 同理）", "example": "点歌 kg:晴天"},
+            {"name": "听N", "desc": "播放列表中的第 N 首", "example": "听1"},
+            {"name": "听N 音源", "desc": "指定音源播放（ncm/kg/qq）", "example": "听1 qq"},
+            {"name": "听所有", "desc": "串行播放整个列表（最多 30 首）", "example": "听所有"},
+            {"name": "换源 音源", "desc": "把刚播的歌换到另一音源", "example": "换源 kg"},
+            {"name": "播放 关键词", "desc": "直接播放首个搜索结果", "example": "播放 晴天"},
+        ],
+    },
+    {
+        "title": "歌词 / 详情",
+        "tag": "全员",
+        "items": [
+            {
+                "name": "歌词 [关键词]",
+                "desc": "查看歌词（带序号复用当前列表）",
+                "example": "歌词 / 歌词 晴天",
+            },
+            {"name": "歌词下页 / 歌词上页", "desc": "长歌词翻页", "example": "歌词下页"},
+            {"name": "逐字歌词 [关键词]", "desc": "逐字歌词（KRC/QRC）", "example": "逐字歌词"},
+            {"name": "评论 [关键词]", "desc": "热门评论", "example": "评论"},
+            {"name": "评论下页", "desc": "看最新评论（网易云/QQ）", "example": "评论下页"},
+            {"name": "专辑评论 / 歌单评论", "desc": "按名定位后看评论", "example": "歌单评论 私藏"},
+            {"name": "相似 [关键词]", "desc": "相似歌曲推荐", "example": "相似"},
+            {"name": "相似歌单 [关键词]", "desc": "相似歌单（网易云）", "example": "相似歌单"},
+            {"name": "版本 [关键词]", "desc": "歌曲其他版本（酷狗/QQ）", "example": "版本"},
+            {"name": "AI推荐 [关键词]", "desc": "AI 相似推荐（酷狗）", "example": "AI推荐"},
+            {"name": "MV搜 关键词", "desc": "搜索 MV，听N 发送", "example": "MV搜 晴天"},
+            {"name": "高潮 [关键词]", "desc": "歌曲高潮片段（酷狗）", "example": "高潮"},
+        ],
+    },
+    {
+        "title": "点歌台（群排队）",
+        "tag": "全员",
+        "items": [
+            {"name": "排队 关键词", "desc": "加入点歌台队列，按序自动播放", "example": "排队 晴天"},
+            {"name": "队列", "desc": "查看当前队列", "example": "队列"},
+            {"name": "切歌", "desc": "跳过当前播放（管理员）", "example": "切歌"},
+            {"name": "清空队列", "desc": "清空队列（管理员）", "example": "清空队列"},
+        ],
+    },
+    {
+        "title": "浏览发现",
+        "tag": "全员",
+        "items": [
+            {"name": "排行榜 [榜单名]", "desc": "官方榜单", "example": "排行榜 / 排行榜 飙升榜"},
+            {"name": "排行推荐", "desc": "编辑推荐榜单（酷狗）", "example": "排行推荐"},
+            {"name": "新歌 [地区]", "desc": "新歌速递", "example": "新歌 华语"},
+            {"name": "歌手 关键词", "desc": "歌手热门歌曲", "example": "歌手 周杰伦"},
+            {"name": "歌手专辑 关键词", "desc": "歌手的专辑列表", "example": "歌手专辑 周杰伦"},
+            {"name": "歌手MV 关键词", "desc": "歌手的 MV（QQ）", "example": "歌手MV 周杰伦"},
+            {"name": "相似歌手 关键词", "desc": "相似歌手（QQ）", "example": "相似歌手 周杰伦"},
+            {"name": "专辑 关键词", "desc": "专辑曲目", "example": "专辑 叶惠美"},
+            {"name": "歌单 关键词", "desc": "歌单曲目", "example": "歌单 私藏"},
+            {"name": "歌单推荐 [分类]", "desc": "推荐歌单", "example": "歌单推荐 华语"},
+            {"name": "相关歌单 关键词", "desc": "相关歌单推荐（网易云）", "example": "相关歌单 私藏"},
+            {"name": "精品歌单 [分类]", "desc": "精品歌单（网易云）", "example": "精品歌单 华语"},
+            {"name": "主题歌单", "desc": "主题歌单（酷狗）", "example": "主题歌单"},
+            {"name": "好歌精选", "desc": "热门好歌精选（酷狗）", "example": "好歌精选"},
+            {"name": "编辑精选", "desc": "编辑精选专题（酷狗）", "example": "编辑精选"},
+            {"name": "乐库", "desc": "乐库推荐（酷狗）", "example": "乐库"},
+            {"name": "歌单分类", "desc": "可用分类（网易云/酷狗）", "example": "歌单分类"},
+            {"name": "MV榜", "desc": "MV 榜（网易云）", "example": "MV榜"},
+            {"name": "电台", "desc": "精选电台（网易云）", "example": "电台"},
+            {"name": "热门歌手", "desc": "热门歌手（网易云）", "example": "热门歌手"},
+            {"name": "热搜", "desc": "热搜榜", "example": "热搜"},
+            {"name": "搜索建议 关键词", "desc": "搜索联想词", "example": "搜索建议 晴天"},
+            {"name": "来首歌", "desc": "随机来一首", "example": "来首歌"},
+            {"name": "猜你喜欢", "desc": "猜你喜欢（QQ）", "example": "猜你喜欢"},
+            {"name": "banner", "desc": "首页 banner（网易云）", "example": "banner"},
+        ],
+    },
+    {
+        "title": "账号（需登录）",
+        "tag": "全员",
+        "items": [
+            {"name": "日推", "desc": "每日推荐歌曲", "example": "日推"},
+            {"name": "历史日推", "desc": "往期日推（网易云黑胶/酷狗登录）", "example": "历史日推"},
+            {"name": "FM", "desc": "私人电台 / 私人FM", "example": "FM"},
+            {"name": "喜欢", "desc": "红心列表（网易云/QQ）", "example": "喜欢"},
+            {"name": "红心 / 取消红心", "desc": "收藏当前播放的歌（网易云/QQ）", "example": "红心"},
+            {"name": "关注列表", "desc": "关注的歌手（QQ）", "example": "关注列表"},
+            {"name": "听歌排行", "desc": "我的听歌排行（网易云）", "example": "听歌排行"},
+            {"name": "我的歌单", "desc": "我的歌单列表（三平台）", "example": "我的歌单"},
+            {"name": "云盘", "desc": "我的云盘歌曲", "example": "云盘"},
+            {"name": "已购", "desc": "已购音乐（酷狗）", "example": "已购"},
+            {"name": "最近在听", "desc": "最近播放记录", "example": "最近在听"},
+            {"name": "历史", "desc": "本会话播放历史（可重播）", "example": "历史"},
+        ],
+    },
+    {
+        "title": "订阅推送（管理员）",
+        "tag": "管理员",
+        "items": [
+            {"name": "订阅 日推", "desc": "每天定时推送网易云日推", "example": "订阅 日推"},
+            {
+                "name": "订阅新歌 歌手名",
+                "desc": "关注歌手并每日推送新歌（酷狗）",
+                "example": "订阅新歌 周杰伦",
+            },
+            {"name": "退订 日推 / 退订新歌 歌手名", "desc": "取消订阅", "example": "退订 日推"},
+            {"name": "我的订阅", "desc": "查看订阅列表", "example": "我的订阅"},
+        ],
+    },
+    {
+        "title": "登录管理",
+        "tag": "管理员",
+        "items": [
+            {"name": "ncm登录 / kg登录 / qq登录", "desc": "三平台扫码登录", "example": "ncm登录"},
+            {"name": "状态", "desc": "查看三平台登录状态", "example": "状态"},
+            {"name": "ncm登出 / kg登出 / qq登出", "desc": "退出登录", "example": "ncm登出"},
+        ],
+    },
+    {
+        "title": "系统",
+        "tag": "管理员",
+        "items": [
+            {"name": "帮助", "desc": "本帮助", "example": "音乐帮助"},
+            {"name": "设置", "desc": "查看当前配置", "example": "音乐设置"},
+            {"name": "音质 [档位]", "desc": "设置最高音质", "example": "音质 lossless"},
+            {"name": "开启 / 关闭 功能", "desc": "临时开关 点歌/解析/卡片/语音/文件", "example": "关闭 语音"},
+            {"name": "统计", "desc": "调用统计（WebUI 图表更全）", "example": "统计"},
+            {"name": "测试", "desc": "三平台 API 连通性检查", "example": "音乐测试"},
+            {"name": "WebUI", "desc": "获取管理面板地址", "example": "音乐WebUI"},
+        ],
+    },
+]

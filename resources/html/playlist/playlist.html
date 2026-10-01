@@ -1,0 +1,68 @@
+{# Music Hub · 歌单推荐卡（双列网格） #}
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8" />
+<style>
+  *{margin:0;padding:0;box-sizing:border-box}
+  :root{
+    --mh-nm:#ec4141;--mh-nm-deep:#c62f2f;--mh-hero-a:#ef4e44;--mh-hero-b:#d0362c;
+    --mh-card-a:#fdf8f7;--mh-card-b:#f9e9e6;--mh-soft:#fbeeea;--mh-muted:#8a5a52;
+    --mh-text:#3a1d18;--mh-chip:rgba(236,65,65,.09);--mh-line:rgba(236,65,65,.16);
+  }
+  html{width:fit-content}
+  body{font-family:"MiSans","HarmonyOS Sans SC","Microsoft YaHei UI","PingFang SC",sans-serif;
+    background:var(--mh-soft);color:var(--mh-text);-webkit-font-smoothing:antialiased}
+  .page{width:640px;padding:26px 22px}
+  .hero{position:relative;overflow:hidden;border-radius:26px 26px 22px 22px;padding:28px 26px 22px;
+    background:linear-gradient(135deg,var(--mh-hero-a),var(--mh-hero-b));color:#fff;isolation:isolate}
+  .hero::before{content:"";position:absolute;inset:0;z-index:-1;
+    background:radial-gradient(58% 46% at 86% 8%,rgba(255,255,255,.28) 0%,transparent 68%),
+               radial-gradient(50% 44% at 4% 98%,rgba(0,0,0,.30) 0%,transparent 72%)}
+  .hero-src{font-size:11px;font-weight:800;letter-spacing:3px;opacity:.9}
+  .hero-title{margin-top:8px;font-size:31px;font-weight:900;line-height:1.2;text-shadow:0 2px 18px rgba(0,0,0,.18)}
+  .hero-sub{margin-top:8px;font-size:13px;font-weight:600;opacity:.9}
+  .grid{background:linear-gradient(180deg,var(--mh-card-a),var(--mh-card-b));
+    border-radius:0 0 26px 26px;padding:14px;margin-top:-8px;position:relative;
+    display:grid;grid-template-columns:1fr 1fr;gap:12px}
+  .pl{background:rgba(255,255,255,.6);border:1px solid var(--mh-line);border-radius:18px;padding:10px;
+    display:flex;flex-direction:column;transition:transform .3s;box-shadow:0 4px 14px rgba(0,0,0,.05)}
+  .pl-cover{position:relative;width:100%;aspect-ratio:1;border-radius:13px;overflow:hidden;background:var(--mh-chip)}
+  .pl-cover img{width:100%;height:100%;object-fit:cover}
+  .pl-count{position:absolute;right:7px;top:7px;display:inline-flex;align-items:center;gap:4px;
+    font-size:10px;font-weight:800;color:#fff;padding:3px 9px;border-radius:999px;
+    background:rgba(0,0,0,.5);backdrop-filter:blur(4px)}
+  .pl-name{font-size:13.5px;font-weight:800;margin-top:9px;line-height:1.45;display:-webkit-box;
+    -webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden;min-height:38px}
+  .pl-meta{display:flex;justify-content:space-between;align-items:center;margin-top:6px;
+    font-size:10.5px;color:var(--mh-muted);font-weight:600}
+  .footer{display:flex;justify-content:space-between;align-items:center;padding:14px 6px 2px;
+    color:var(--mh-muted);font-size:11px;font-weight:700;letter-spacing:.6px}
+</style>
+</head>
+<body>
+<div class="page">
+  <div class="hero">
+    <div class="hero-src">MUSIC HUB{% if data.sourceName %} · {{ data.sourceName }}{% endif %}</div>
+    <div class="hero-title">{{ data.title }}</div>
+    {% if data.subtitle %}<div class="hero-sub">{{ data.subtitle }}</div>{% endif %}
+  </div>
+  <div class="grid">
+    {% for p in data.items %}
+    <div class="pl">
+      <div class="pl-cover">
+        {% if p.cover %}<img src="{{ p.cover }}" referrerpolicy="no-referrer" />{% endif %}
+        <span class="pl-count">▶ {{ p.playCountText }}</span>
+      </div>
+      <div class="pl-name">{{ p.name }}</div>
+      <div class="pl-meta"><span>by {{ p.creator or '佚名' }}</span><span>{{ p.trackCount }} 首</span></div>
+    </div>
+    {% endfor %}
+  </div>
+  <div class="footer">
+    <span>♪ Music Hub 聚合点歌</span>
+    <span>{{ data.items|length }} 个歌单</span>
+  </div>
+</div>
+</body>
+</html>

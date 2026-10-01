@@ -1,0 +1,91 @@
+{# Music Hub · 热门评论卡 #}
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8" />
+<style>
+  *{margin:0;padding:0;box-sizing:border-box}
+  :root{
+    --mh-nm:#ec4141;--mh-nm-deep:#c62f2f;--mh-hero-a:#ef4e44;--mh-hero-b:#d0362c;
+    --mh-card-a:#fdf8f7;--mh-card-b:#f9e9e6;--mh-soft:#fbeeea;--mh-muted:#8a5a52;
+    --mh-text:#3a1d18;--mh-chip:rgba(236,65,65,.09);--mh-line:rgba(236,65,65,.16);
+  }
+  html{width:fit-content}
+  body{font-family:"MiSans","HarmonyOS Sans SC","Microsoft YaHei UI","PingFang SC",sans-serif;
+    background:var(--mh-soft);color:var(--mh-text);-webkit-font-smoothing:antialiased}
+  .page{width:640px;padding:26px 22px}
+  .hero{position:relative;overflow:hidden;border-radius:26px 26px 0 0;padding:22px 24px;color:#fff;
+    background:linear-gradient(135deg,var(--mh-hero-a),var(--mh-hero-b));isolation:isolate}
+  .hero::before{content:"";position:absolute;inset:0;z-index:-1;
+    background:radial-gradient(60% 60% at 88% 0%,rgba(255,255,255,.28) 0%,transparent 64%),
+               radial-gradient(52% 56% at 0% 100%,rgba(0,0,0,.30) 0%,transparent 72%)}
+  .hero-row{display:flex;align-items:center;gap:14px}
+  .cover{width:64px;height:64px;border-radius:16px;object-fit:cover;flex:none;
+    box-shadow:0 8px 22px rgba(0,0,0,.30),0 0 0 3px rgba(255,255,255,.22)}
+  .cover-ph{width:64px;height:64px;border-radius:16px;flex:none;display:grid;place-items:center;font-size:26px;
+    background:rgba(255,255,255,.15);box-shadow:0 0 0 3px rgba(255,255,255,.22)}
+  .meta{flex:1;min-width:0}
+  .src-tag{font-size:10.5px;font-weight:800;letter-spacing:2.5px;opacity:.9}
+  .title{font-size:22px;font-weight:900;margin-top:4px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+  .artist{font-size:12.5px;opacity:.88;margin-top:3px;font-weight:600}
+  .pill{margin-left:auto;flex:none;font-size:11px;font-weight:800;padding:6px 13px;border-radius:999px;
+    background:rgba(255,255,255,.18)}
+  .comments{background:linear-gradient(180deg,var(--mh-card-a),var(--mh-card-b));padding:8px 18px 18px}
+  .cmt{display:flex;gap:12px;padding:14px 4px;border-bottom:1px dashed var(--mh-line)}
+  .cmt:last-child{border-bottom:none}
+  .ava{width:38px;height:38px;border-radius:50%;object-fit:cover;flex:none;box-shadow:0 3px 10px rgba(0,0,0,.14)}
+  .ava-ph{width:38px;height:38px;border-radius:50%;flex:none;display:grid;place-items:center;flex:none;
+    background:var(--mh-chip);color:var(--mh-nm);font-weight:800;font-size:15px}
+  .cmt-main{flex:1;min-width:0}
+  .cmt-head{display:flex;align-items:center;gap:8px;flex-wrap:wrap}
+  .nick{font-size:13px;font-weight:800}
+  .hot-badge{font-size:9.5px;font-weight:800;padding:2px 8px;border-radius:999px;
+    background:linear-gradient(135deg,#f7b733,#e8892c);color:#fff;letter-spacing:1px}
+  .cmt-time{margin-left:auto;font-size:10.5px;color:var(--mh-muted)}
+  .cmt-body{font-size:14px;line-height:1.85;margin-top:6px;color:var(--mh-text);word-break:break-word;
+    display:-webkit-box;-webkit-line-clamp:5;-webkit-box-orient:vertical;overflow:hidden}
+  .cmt-foot{margin-top:7px;font-size:11px;color:var(--mh-muted);font-weight:700;
+    display:flex;align-items:center;gap:4px}
+  .cmt-foot svg{width:12px;height:12px}
+</style>
+</head>
+<body>
+<div class="page">
+  <div class="hero">
+    <div class="hero-row">
+      {% if data.cover %}<img class="cover" src="{{ data.cover }}" referrerpolicy="no-referrer" />
+      {% else %}<div class="cover-ph">♪</div>{% endif %}
+      <div class="meta">
+        <div class="src-tag">{{ data.sourceName }} · 热评</div>
+        <div class="title">{{ data.songName }}</div>
+        <div class="artist">{{ data.singerName }}</div>
+      </div>
+      <div class="pill">{{ data.total }} 条</div>
+    </div>
+  </div>
+  <div class="comments">
+    {% for c in data.comments %}
+    <div class="cmt">
+      {% if c.avatar %}<img class="ava" src="{{ c.avatar }}" referrerpolicy="no-referrer" onerror="this.outerHTML='<div class=&quot;ava-ph&quot;>{{ c.nick[0] if c.nick else '友' }}</div>'" />
+      {% else %}<div class="ava-ph">{{ c.nick[0] if c.nick else '友' }}</div>{% endif %}
+      <div class="cmt-main">
+        <div class="cmt-head">
+          <span class="nick">{{ c.nick }}</span>
+          {% if c.hot %}<span class="hot-badge">热</span>{% endif %}
+          <span class="cmt-time">{{ c.time }}</span>
+        </div>
+        <div class="cmt-body">{{ c.content }}</div>
+        <div class="cmt-foot">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 21s-7.5-4.7-9.6-9A5.4 5.4 0 0 1 12 6.4 5.4 5.4 0 0 1 21.6 12c-2.1 4.3-9.6 9-9.6 9z"/></svg>
+          {{ c.likes }}
+        </div>
+      </div>
+    </div>
+    {% endfor %}
+    <div style="display:flex;justify-content:space-between;color:var(--mh-muted);font-size:11px;font-weight:700;padding:12px 4px 0">
+      <span>♪ Music Hub 聚合点歌</span><span>热评 {{ data.comments|length }} 条</span>
+    </div>
+  </div>
+</div>
+</body>
+</html>

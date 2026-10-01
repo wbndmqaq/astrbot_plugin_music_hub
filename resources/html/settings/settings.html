@@ -1,0 +1,80 @@
+{# Music Hub · 设置总览卡 #}
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8" />
+<style>
+  *{margin:0;padding:0;box-sizing:border-box}
+  :root{
+    --mh-nm:#ec4141;--mh-nm-deep:#c62f2f;--mh-hero-a:#ef4e44;--mh-hero-b:#d0362c;
+    --mh-card-a:#fdf8f7;--mh-card-b:#f9e9e6;--mh-soft:#fbeeea;--mh-muted:#8a5a52;
+    --mh-text:#3a1d18;--mh-chip:rgba(236,65,65,.09);--mh-line:rgba(236,65,65,.16);
+  }
+  html{width:fit-content}
+  body{font-family:"MiSans","HarmonyOS Sans SC","Microsoft YaHei UI","PingFang SC",sans-serif;
+    background:var(--mh-soft);color:var(--mh-text);-webkit-font-smoothing:antialiased}
+  .page{width:640px;padding:26px 22px}
+  .hero{position:relative;overflow:hidden;border-radius:26px 26px 22px 22px;padding:26px 26px 22px;
+    background:linear-gradient(135deg,var(--mh-hero-a),var(--mh-hero-b));color:#fff;isolation:isolate}
+  .hero::before{content:"";position:absolute;inset:0;z-index:-1;
+    background:radial-gradient(58% 46% at 86% 8%,rgba(255,255,255,.28) 0%,transparent 68%),
+               radial-gradient(50% 44% at 4% 98%,rgba(0,0,0,.30) 0%,transparent 72%)}
+  .hero-title{font-size:29px;font-weight:900;text-shadow:0 2px 16px rgba(0,0,0,.16)}
+  .hero-sub{margin-top:8px;font-size:12.5px;font-weight:600;opacity:.92}
+  .body-card{background:linear-gradient(180deg,var(--mh-card-a),var(--mh-card-b));
+    border-radius:0 0 26px 26px;padding:14px 18px 14px;margin-top:-8px;position:relative}
+  .sec-title{font-size:13px;font-weight:800;letter-spacing:1.5px;color:var(--mh-muted);padding:8px 4px 8px}
+  .src-row{display:flex;align-items:center;gap:10px;padding:10px 12px;border-radius:14px;
+    background:rgba(255,255,255,.55);border:1px solid var(--mh-line);margin-bottom:8px}
+  .src-name{font-size:14px;font-weight:800;flex:none;width:64px}
+  .src-state{font-size:10.5px;font-weight:800;padding:3px 10px;border-radius:999px;flex:none}
+  .src-state.on{background:rgba(34,197,94,.13);color:#16a34a}
+  .src-state.off{background:rgba(125,140,163,.15);color:var(--mh-muted)}
+  .src-api{flex:1;font-size:11px;color:var(--mh-muted);font-weight:600;text-align:right;
+    white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+  .toggles{display:grid;grid-template-columns:1fr 1fr 1fr;gap:8px}
+  .tg{display:flex;align-items:center;justify-content:space-between;gap:6px;padding:10px 13px;
+    border-radius:13px;background:rgba(255,255,255,.55);border:1px solid var(--mh-line);
+    font-size:12.5px;font-weight:700}
+  .tg .st{font-size:10px;font-weight:800;padding:3px 9px;border-radius:999px;flex:none}
+  .tg .st.on{background:rgba(34,197,94,.13);color:#16a34a}
+  .tg .st.off{background:rgba(125,140,163,.15);color:var(--mh-muted)}
+  .tip{margin-top:12px;padding:12px 15px;border-radius:14px;background:var(--mh-chip);
+    color:var(--mh-muted);font-size:12.5px;font-weight:600;line-height:1.7}
+  .footer{display:flex;justify-content:space-between;padding:12px 6px 2px;color:var(--mh-muted);
+    font-size:11px;font-weight:700;letter-spacing:.6px}
+</style>
+</head>
+<body>
+<div class="page">
+  <div class="hero">
+    <div class="hero-title">{{ data.title }}</div>
+    <div class="hero-sub">默认音源：{{ data.defaultSource }} · 列表数 {{ data.maxList }} · WebUI 端口 {{ data.webui.port }}{{ '（启用）' if data.webui.enabled else '（未启用）' }}</div>
+  </div>
+  <div class="body-card">
+    <div class="sec-title">音源</div>
+    {% for s in data.sources %}
+    <div class="src-row">
+      <span class="src-name">{{ s.name }}</span>
+      <span class="src-state {{ 'on' if s.enabled else 'off' }}">{{ '已启用' if s.enabled else '未配置' }}</span>
+      <span class="src-state {{ 'on' if s.logged else 'off' }}">{{ '已登录' if s.logged else '未登录' }}</span>
+      <span class="src-api">{{ s.apiBase }} · 音质 {{ s.quality }}</span>
+    </div>
+    {% endfor %}
+    <div class="sec-title">开关</div>
+    <div class="toggles">
+      {% for t in data.toggles %}
+      <div class="tg"><span>{{ t.name }}</span><span class="st {{ 'on' if t.on else 'off' }}">{{ '开' if t.on else '关' }}</span></div>
+      {% endfor %}
+    </div>
+    {% if data.tip %}
+    <div class="tip">{{ data.tip }}</div>
+    {% endif %}
+    <div class="footer">
+      <span>♪ Music Hub 聚合点歌</span>
+      <span>WebUI 可视化管理</span>
+    </div>
+  </div>
+</div>
+</body>
+</html>

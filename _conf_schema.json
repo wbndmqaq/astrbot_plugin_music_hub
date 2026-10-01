@@ -1,0 +1,331 @@
+{
+  "enable": {
+    "description": "总开关",
+    "type": "bool",
+    "default": true,
+    "hint": "关闭后点歌/播放/队列、歌词评论榜单等发现指令、账号指令与订阅推送全部静默；帮助、设置、统计、登录类指令不受影响。"
+  },
+  "defaultSource": {
+    "description": "默认音源",
+    "type": "string",
+    "options": ["auto", "ncm", "kg", "qq"],
+    "labels": ["聚合（三平台混搜）", "网易云音乐", "酷狗音乐", "QQ音乐"],
+    "default": "auto",
+    "hint": "不带音源前缀的 `点歌` / `播放` 使用该音源。聚合模式下三平台结果交错混排。"
+  },
+  "maxList": {
+    "description": "点歌列表数量",
+    "type": "int",
+    "default": 10,
+    "hint": "1-20。聚合模式下为每个平台各取的数量。"
+  },
+  "enableSongRequest": {
+    "description": "允许点歌",
+    "type": "bool",
+    "default": true
+  },
+  "enableResolve": {
+    "description": "允许链接解析",
+    "type": "bool",
+    "default": true,
+    "hint": "自动识别三平台分享链接/卡片并点歌。"
+  },
+  "resolveCards": {
+    "description": "解析分享卡片",
+    "type": "bool",
+    "default": true,
+    "hint": "解析 QQ 群里的 JSON 音乐卡片消息。"
+  },
+  "renderListCard": {
+    "description": "列表渲染为图片卡片",
+    "type": "bool",
+    "default": true,
+    "hint": "关闭后所有列表/卡片以纯文本发送（未安装 Playwright 时自动纯文本）。"
+  },
+  "sendTextInfo": {
+    "description": "发送歌曲识别信息",
+    "type": "bool",
+    "default": true,
+    "hint": "发歌前先发一条「识别：音源 ♪ 歌名 - 歌手 / 音质」文本。"
+  },
+  "identifyPrefix": {
+    "description": "识别信息前缀",
+    "type": "string",
+    "default": "识别："
+  },
+  "ncm": {
+    "description": "网易云音乐",
+    "type": "object",
+    "items": {
+      "apiBase": {
+        "description": "api-enhanced 服务地址",
+        "type": "string",
+        "default": "",
+        "hint": "自建 NeteaseCloudMusicApiEnhanced 服务，如 http://127.0.0.1:3000。留空禁用网易云音源。"
+      },
+      "cookie": {
+        "description": "登录 Cookie",
+        "type": "string",
+        "default": "",
+        "secret": true,
+        "hint": "扫码登录后自动写入，也可手动粘贴 MUSIC_U=... 。留空为匿名。"
+      },
+      "uid": {
+        "description": "用户 ID",
+        "type": "string",
+        "default": "",
+        "invisible": true
+      },
+      "quality": {
+        "description": "最高音质",
+        "type": "string",
+        "options": ["auto", "standard", "higher", "exhigh", "lossless", "hires", "jyeffect", "sky", "dolby", "jymaster"],
+        "labels": ["自动", "标准", "较高", "极高", "无损", "Hi-Res", "高清臻音", "沉浸环绕", "杜比全景", "超清母带"],
+        "default": "auto"
+      },
+      "qualityUnblock": {
+        "description": "VIP 歌自动解灰",
+        "type": "bool",
+        "default": true,
+        "hint": "全部音质拿不到 URL 时用 unblock 音源兜底（音质可能降低，标记「解灰」）。"
+      }
+    }
+  },
+  "kg": {
+    "description": "酷狗音乐",
+    "type": "object",
+    "items": {
+      "apiBase": {
+        "description": "KuGouMusicApi 服务地址",
+        "type": "string",
+        "default": "",
+        "hint": "自建 KuGouMusicApi 服务，如 http://127.0.0.1:4000。留空禁用酷狗音源。"
+      },
+      "cookie": {
+        "description": "登录 Cookie",
+        "type": "string",
+        "default": "",
+        "secret": true,
+        "hint": "扫码登录后自动写入（token=...;userid=...）。留空为匿名：搜索与免费歌可用、VIP 歌只有 60 秒试听；部分部署环境下匿名搜索可能被上游风控拦截，异常时请扫码登录。"
+      },
+      "uid": {
+        "description": "用户 ID",
+        "type": "string",
+        "default": "",
+        "invisible": true
+      },
+      "quality": {
+        "description": "最高音质",
+        "type": "string",
+        "options": ["auto", "128", "320", "flac", "high", "super", "viper_clear", "viper_tape"],
+        "labels": ["自动", "标准", "HQ", "无损", "Hi-Res", "Super", "蝰蛇超清", "蝰蛇母带"],
+        "default": "auto"
+      },
+      "trialFallback": {
+        "description": "VIP 歌发试听片段",
+        "type": "bool",
+        "default": true,
+        "hint": "未登录/非会员拿不到完整 URL 时，发送 60 秒试听。"
+      }
+    }
+  },
+  "qq": {
+    "description": "QQ音乐",
+    "type": "object",
+    "items": {
+      "credential": {
+        "description": "登录凭证",
+        "type": "string",
+        "default": "",
+        "secret": true,
+        "hint": "扫码登录后自动写入（JSON）。留空为匿名：免费歌可完整播放，VIP 歌仅试听。"
+      },
+      "uin": {
+        "description": "用户 ID",
+        "type": "string",
+        "default": "",
+        "invisible": true
+      },
+      "quality": {
+        "description": "最高音质",
+        "type": "string",
+        "options": ["auto", "128", "320", "flac", "atmos", "master", "atmos_db"],
+        "labels": ["自动", "标准", "HQ", "无损", "全景声", "臻品母带", "杜比全景"],
+        "default": "auto",
+        "hint": "取不到时自动按阶梯向下降级。"
+      },
+      "trialFallback": {
+        "description": "VIP 歌发试听片段",
+        "type": "bool",
+        "default": true
+      }
+    }
+  },
+  "sendVocal": {
+    "description": "以语音发送",
+    "type": "bool",
+    "default": true
+  },
+  "uploadFile": {
+    "description": "以群/好友文件发送",
+    "type": "bool",
+    "default": true
+  },
+  "disableHighQualityVocal": {
+    "description": "语音降级为低音质",
+    "type": "bool",
+    "default": false,
+    "hint": "PC 端 QQ 语音兼容：语音压制成 16kHz 单声道。群文件仍保留高音质。"
+  },
+  "ffmpegCompress": {
+    "description": "失败时压缩重试",
+    "type": "bool",
+    "default": true,
+    "hint": "无损/大文件发送失败时用 ffmpeg 压成 mp3 重试（需系统安装 ffmpeg）。"
+  },
+  "compressBitrate": {
+    "description": "压缩码率 (kbps)",
+    "type": "int",
+    "default": 128
+  },
+  "downloadTimeout": {
+    "description": "下载超时 (ms)",
+    "type": "int",
+    "default": 120000
+  },
+  "keepFileSec": {
+    "description": "临时文件保留 (秒)",
+    "type": "int",
+    "default": 60
+  },
+  "sendNativeCard": {
+    "description": "发送原生音乐卡片",
+    "type": "bool",
+    "default": false,
+    "hint": "仅 OneBot(aiocqhttp) 平台有效：发送 QQ/酷狗/网易云官方小程序卡片。"
+  },
+  "qqofficialAdapt": {
+    "description": "QQ 官方接口适配",
+    "type": "bool",
+    "default": true,
+    "hint": "qq_official 平台：文本与媒体合并发送节省配额、语音失败转文件。"
+  },
+  "qqofficialChunkedUpload": {
+    "description": "QQ 官方分片上传",
+    "type": "bool",
+    "default": true,
+    "hint": "qq_official >10MB 文件走官方分片上传（需 AstrBot ≥4.27.3）。"
+  },
+  "rateLimitMs": {
+    "description": "音源请求最小间隔 (ms)",
+    "type": "int",
+    "default": 250,
+    "hint": "网易云/酷狗每个请求之间的最小间隔，防止突发触发风控。0 = 关闭。"
+  },
+  "cooldownSec": {
+    "description": "点歌冷却 (秒)",
+    "type": "int",
+    "default": 0,
+    "hint": "同群两次点歌的最小间隔，防刷屏。0 = 关闭。"
+  },
+  "scheduler": {
+    "description": "定时任务",
+    "type": "object",
+    "items": {
+      "enable": {
+        "description": "启用定时任务",
+        "type": "bool",
+        "default": true
+      },
+      "signinHour": {
+        "description": "每日执行时刻 (小时)",
+        "type": "int",
+        "default": 8,
+        "hint": "0-23。分钟随机错峰。"
+      },
+      "ncmSignin": {
+        "description": "网易云每日自动签到",
+        "type": "bool",
+        "default": true,
+        "hint": "需已登录网易云。"
+      },
+      "qqRefresh": {
+        "description": "QQ 凭证保活刷新",
+        "type": "bool",
+        "default": true,
+        "hint": "每日刷新 QQ 音乐登录凭证，降低掉线概率。"
+      }
+    }
+  },
+  "acl": {
+    "description": "黑白名单",
+    "type": "object",
+    "items": {
+      "mode": {
+        "description": "模式",
+        "type": "string",
+        "options": ["off", "blacklist", "whitelist"],
+        "labels": ["关闭", "黑名单", "白名单"],
+        "default": "off",
+        "hint": "名单填写用户 ID 或群号，一行一个（WebUI 可视化管理）。"
+      },
+      "blacklist": {
+        "description": "黑名单",
+        "type": "list",
+        "default": []
+      },
+      "whitelist": {
+        "description": "白名单",
+        "type": "list",
+        "default": []
+      }
+    }
+  },
+  "webui": {
+    "description": "WebUI 管理面板",
+    "type": "object",
+    "items": {
+      "enable": {
+        "description": "启用 WebUI",
+        "type": "bool",
+        "default": true
+      },
+      "host": {
+        "description": "监听地址",
+        "type": "string",
+        "default": "0.0.0.0",
+        "hint": "0.0.0.0 允许局域网访问；仅本机访问填 127.0.0.1。"
+      },
+      "port": {
+        "description": "端口",
+        "type": "int",
+        "default": 17818
+      },
+      "password": {
+        "description": "登录密码",
+        "type": "string",
+        "default": "",
+        "secret": true,
+        "obvious_hint": true,
+        "hint": "WebUI 登录密码（≥6 位）。留空则首次启动自动生成随机密码并写回此处。会话有效期 12 小时。"
+      }
+    }
+  },
+  "stats": {
+    "description": "调用统计",
+    "type": "object",
+    "items": {
+      "enable": {
+        "description": "记录调用统计",
+        "type": "bool",
+        "default": true,
+        "hint": "按天/音源/动作计数，WebUI 图表展示。"
+      },
+      "retentionDays": {
+        "description": "明细保留天数",
+        "type": "int",
+        "default": 30
+      }
+    }
+  }
+}
