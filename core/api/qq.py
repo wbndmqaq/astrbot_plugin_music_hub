@@ -10,9 +10,11 @@
 from __future__ import annotations
 
 import asyncio
+import functools
 import json
 import re
 import time
+from collections.abc import Awaitable, Callable
 from pathlib import Path
 
 from ..errors import ApiError, NotEnabledError
@@ -70,6 +72,26 @@ def available() -> bool:
 
 def import_error() -> str:
     return str(_IMPORT_ERROR) if not available() else ""
+
+
+def _guard_sdk(fn):
+    """SDK 调用统一出口：BaseApiException → _map，ValidationError → 固定文案 ApiError。
+
+    库对上游报文的 model_validate 无任何包装，pydantic.ValidationError（ValueError
+    子类）不是 BaseApiException，会穿透所有 `except BaseApiException` 调用点，把
+    "1 validation error for ..." 原文甩给用户；在出口统一兜住，方法体不必逐个加 try。
+    """
+
+    @functools.wraps(fn)
+    async def wrapper(self, *args, **kwargs):
+        try:
+            return await fn(self, *args, **kwargs)
+        except BaseApiException as e:
+            raise self._map(e) from e
+        except ValueError as e:
+            raise ApiError("QQ 音乐响应解析失败，请稍后重试", source="qq") from e
+
+    return wrapper
 
 
 def _norm_song(item, idx: int = 0) -> dict | None:
@@ -231,10 +253,9 @@ def parse_lrc(lrc: str) -> list[str]:
 class QQClient:
     source = "qq"
 
-    def __init__(self, config, device_path: Path, cred_path: Path):
+    def __init__(self, config, device_path: Path):
         self._config = config
         self._device_path = device_path
-        self._cred_path = cred_path
         self._client: Client | None = None
         self._lock = asyncio.Lock()
         self._cdn_cache: tuple[float, str] = (0.0, "")
@@ -275,6 +296,7 @@ class QQClient:
         """登录态变更后主动失效缓存（扫码成功 / 登出 / 刷新失败）。"""
         self._cred_cache = (0.0, None)
 
+    @_guard_sdk
     async def get_client(self):
         """懒加载单例 Client（带登录态）。未安装库抛 NotEnabledError。"""
         if not available():
@@ -289,8 +311,11 @@ class QQClient:
                     pass
                 self._client = Client(device_path=str(self._device_path))
                 await self._client.__aenter__()
-            # 仅在 client 尚无有效登录态时补一次：扫码成功后库会自己更新 credential，
-            # 每次调用都重写会用配置里的旧值（或 None）把刚拿到的有效凭证冲掉。
+            # 仅在 client 尚无有效登录态时补一次注入。库不会替插件维护 client 上的
+            # 凭证：只有 refresh 不传参 / phone_authorize / logout 三个路径会回写，
+            # 插件的 refresh 恒传显式 cred、QQ/微信/MOBILE 扫码路径（qr_consume）
+            # 库也不回写——那两处成功后由插件显式回写（见对应方法）。
+            # 这里同样不能每次调用都重写：会把刚拿到/刚刷新的有效凭证冲掉。
             # 判据必须是 musicid/musickey，不能是 `credential is None`——
             # qqmusic_api 的 setter 是 `value or Credential()`，None 会被兜底成空凭证，
             # 判 None 永远为假，配置里的凭证在插件重启后永远注入不进来。
@@ -314,16 +339,23 @@ class QQClient:
         平台适配点：core.search 不必知道 QQ 用的是枚举而不是裸值。
         """
         st = _QQ_TYPE_BY_NAME.get(param)
-        return SearchType(st) if st else None
+        # 不能写 `if st`：SONG=0 会被判假返回 None，core/search 把 None 当
+        # 「该类型不支持」静默返回空列表
+        return SearchType(st) if st is not None else None
 
+    @_guard_sdk
     async def search(
         self, keyword: str, limit: int = 10, type_: SearchType | None = None, page: int = 1
     ) -> list[dict]:
+        """page 从 1 起（ncm 是 0 起）——三源 page 语义不统一，调用方传值时注意。"""
         client = await self.get_client()
         st = type_ or SearchType.SONG
         if isinstance(st, str):  # 容忍直接传参数名
             st = self.search_type(st) or SearchType.SONG
-        res = await client.search.search_by_type(keyword=keyword, search_type=st, num=limit, page=page)
+        try:
+            res = await client.search.search_by_type(keyword=keyword, search_type=st, num=limit, page=page)
+        except BaseApiException as e:
+            raise self._map(e) from e
         if st == SearchType.SONG:
             return [s for s in (_norm_song(x, i) for i, x in enumerate(res.song or [])) if s][:limit]
         if st == SearchType.SONGLIST:
@@ -364,6 +396,7 @@ class QQClient:
             "playCount": int(getattr(item, "play_count", 0) or getattr(item, "playcnt", 0) or 0),
         }
 
+    @_guard_sdk
     async def song_detail(self, sid: str) -> dict | None:
         client = await self.get_client()
         try:
@@ -373,10 +406,16 @@ class QQClient:
         except BaseApiException as e:
             raise self._map(e) from e
 
+    @_guard_sdk
     async def similar_songs(self, song_id: str, limit: int = 10) -> list[dict]:
+        # 上游按数字 songid 查相似；actions 层会传 sid2 或回退 sid(mid)，mid 非数字时
+        # 裸 int() 抛的 ValueError 不在任何 except 面里，这里前置归一成明确报错
+        song_id = int(song_id) if str(song_id).isdecimal() else 0
+        if not song_id:
+            raise ApiError("歌曲缺少有效 id", source="qq")
         client = await self.get_client()
         try:
-            res = await client.song.get_similar_song(int(song_id or 0))
+            res = await client.song.get_similar_song(song_id)
             # 返回 .song 是 SimilarSongGroup 分组列表，歌曲在各组的 .song 里
             groups = getattr(res, "song", None) or []
             songs: list = []
@@ -386,6 +425,7 @@ class QQClient:
         except BaseApiException as e:
             raise self._map(e) from e
 
+    @_guard_sdk
     async def other_versions(self, song: dict, limit: int = 15) -> list[dict]:
         """同曲其他版本（Live/伴奏/重录…）。参数两可：song id 或 mid。"""
         client = await self.get_client()
@@ -399,6 +439,7 @@ class QQClient:
         except BaseApiException as e:
             raise self._map(e) from e
 
+    @_guard_sdk
     async def suggest(self, keyword: str) -> list[dict]:
         """搜索联想（quick_search HTTP 接口）。"""
         client = await self.get_client()
@@ -416,6 +457,7 @@ class QQClient:
                 out.append({"name": name, "sub": getattr(it, "singer", "") or "", "kind": key})
         return out[:10]
 
+    @_guard_sdk
     async def hot_search(self) -> list[dict]:
         client = await self.get_client()
         try:
@@ -464,6 +506,10 @@ class QQClient:
         purl = getattr(info, "purl", "") or ""
         return {"ok": result == 0 and bool(purl), "code": result, "url": purl}
 
+    # _url_for / _cdn 不加 _guard_sdk：前者抛的 BaseApiException 要保持裸类型，
+    # song_url_best 靠它做单档失败降档；两者漏网的 ValueError 由 song_url_best 的
+    # 装饰器兜住
+    @_guard_sdk
     async def song_url_best(
         self, song: dict, preferred: str = "auto", *, trial_fallback: bool = True
     ) -> dict:
@@ -473,6 +519,7 @@ class QQClient:
         ladder = ladder_for("qq", preferred)
         type_map = {n: (p, f) for n, p, f in QQ_LADDER}
         last_code = None
+        last_exc: BaseApiException | None = None
         for q in ladder:
             primary, fallback = type_map.get(q, (None, None))
             for ftype_name in (primary, fallback):
@@ -483,8 +530,12 @@ class QQClient:
                     continue
                 try:
                     r = await self._url_for(mid, ftype)
-                except BaseApiException:
-                    # 单档取流失败不终止整个阶梯（网络抖动/单点 404），记码继续降档
+                except (RatelimitedError, CredentialExpiredError) as e:
+                    # 风控/凭证失效是账号级故障，降档只会逐档重复失败：直接归因抛出（对齐试听分支）
+                    raise self._map(e) from e
+                except BaseApiException as e:
+                    # 单档取流失败不终止整个阶梯（网络抖动/单点 404），记下来继续降档
+                    last_exc = e
                     continue
                 if r["ok"]:
                     cdn = await self._cdn()
@@ -513,6 +564,10 @@ class QQClient:
                 last_code = r["code"]
             except BaseApiException as e:
                 raise self._map(e) from e
+        if last_exc is not None:
+            # 阶梯全靠异常走到底：真实原因在 last_exc 里，归因它而不是套「无版权」兜底文案；
+            # last_code 分支保留给「有 code 但没抛异常」的路径
+            raise self._map(last_exc)
         if last_code in _NO_LOGIN_CODES:
             raise ApiError(
                 "该歌曲需要 QQ 音乐 VIP/登录才能获取完整链接（可发试听）", code=last_code, source="qq"
@@ -520,6 +575,7 @@ class QQClient:
         raise ApiError("无法获取播放链接（可能无版权或稍后重试）", code=last_code, source="qq")
 
     # ──────────── 歌词 ────────────
+    @_guard_sdk
     async def lyric(self, sid: str) -> dict:
         client = await self.get_client()
         try:
@@ -530,6 +586,7 @@ class QQClient:
         except BaseApiException as e:
             raise self._map(e) from e
 
+    @_guard_sdk
     async def lyric_qrc(self, sid: str) -> dict:
         """逐字歌词：QRC XML → 行列表。"""
         client = await self.get_client()
@@ -556,14 +613,22 @@ class QQClient:
         return await self.comments(song.get("sid2", ""), limit)
 
     # ──────────── 榜单 ────────────
+    @_guard_sdk
     async def new_albums(self, area: int = 1, limit: int = 15) -> list[dict]:
         client = await self.get_client()
-        items = await client.album.get_new_album(area=area, num=limit).collect_items(limit)
+        try:
+            items = await client.album.get_new_album(area=area, num=limit).collect_items(limit)
+        except BaseApiException as e:
+            raise self._map(e) from e
         return [a for a in (_norm_album(x, i) for i, x in enumerate(items)) if a]
 
+    @_guard_sdk
     async def rank_list(self) -> list[dict]:
         client = await self.get_client()
-        res = await client.top.get_category()
+        try:
+            res = await client.top.get_category()
+        except BaseApiException as e:
+            raise self._map(e) from e
         out = []
         idx = 0
         for group in getattr(res, "group", None) or []:
@@ -581,32 +646,48 @@ class QQClient:
                 )
         return out[:40]
 
+    @_guard_sdk
     async def rank_songs(self, top_id: str, limit: int = 30) -> list[dict]:
         client = await self.get_client()
-        songs = await client.top.get_detail(top_id=int(top_id), num=limit).collect_items(limit)
+        try:
+            songs = await client.top.get_detail(top_id=int(top_id), num=limit).collect_items(limit)
+        except BaseApiException as e:
+            raise self._map(e) from e
         return [s for s in (_norm_song(x, i) for i, x in enumerate(songs)) if s]
 
+    @_guard_sdk
     async def new_songs(self, type_: int = 5) -> list[dict]:
         client = await self.get_client()
-        res = await client.recommend.get_recommend_newsong(type=type_)
+        try:
+            res = await client.recommend.get_recommend_newsong(type=type_)
+        except BaseApiException as e:
+            raise self._map(e) from e
         return [s for s in (_norm_song(x, i) for i, x in enumerate(getattr(res, "songs", None) or [])) if s][
             :20
         ]
 
     # ──────────── 歌手 / 专辑 / 歌单 ────────────
+    @_guard_sdk
     async def artist_songs(self, singer_mid: str, limit: int = 30) -> list[dict]:
         client = await self.get_client()
-        songs = await client.singer.get_songs_list(singer_mid, num=limit).collect_items(limit)
+        try:
+            songs = await client.singer.get_songs_list(singer_mid, num=limit).collect_items(limit)
+        except BaseApiException as e:
+            raise self._map(e) from e
         return [s for s in (_norm_song(x, i) for i, x in enumerate(songs)) if s]
 
-    async def artist_songs_by_keyword(self, keyword: str, limit: int = 30) -> tuple[dict | None, list[dict]]:
+    async def _singer_mid_by_keyword(self, keyword: str) -> dict | None:
+        """四个歌手类 *_by_keyword 共用的第一步：按关键词搜歌手取首选，未命中 None。"""
         cands = await self.search(keyword, limit=5, type_=SearchType.SINGER)
-        if not cands:
-            return None, []
-        singer = cands[0]
-        songs = await self.artist_songs(singer["id"], limit)
-        return singer, songs
+        return cands[0] if cands else None
 
+    async def artist_songs_by_keyword(self, keyword: str, limit: int = 30) -> tuple[dict | None, list[dict]]:
+        singer = await self._singer_mid_by_keyword(keyword)
+        if singer is None:
+            return None, []
+        return singer, await self.artist_songs(singer["id"], limit)
+
+    @_guard_sdk
     async def artist_albums(self, singer_mid: str, limit: int = 15) -> list[dict]:
         client = await self.get_client()
         try:
@@ -616,12 +697,12 @@ class QQClient:
             raise self._map(e) from e
 
     async def artist_albums_by_keyword(self, keyword: str, limit: int = 15) -> tuple[dict | None, list[dict]]:
-        cands = await self.search(keyword, limit=5, type_=SearchType.SINGER)
-        if not cands:
+        singer = await self._singer_mid_by_keyword(keyword)
+        if singer is None:
             return None, []
-        singer = cands[0]
         return singer, await self.artist_albums(singer["id"], limit)
 
+    @_guard_sdk
     async def artist_mvs(self, singer_mid: str, limit: int = 10) -> list[dict]:
         client = await self.get_client()
         try:
@@ -631,12 +712,12 @@ class QQClient:
             raise self._map(e) from e
 
     async def artist_mvs_by_keyword(self, keyword: str, limit: int = 10) -> tuple[dict | None, list[dict]]:
-        cands = await self.search(keyword, limit=5, type_=SearchType.SINGER)
-        if not cands:
+        singer = await self._singer_mid_by_keyword(keyword)
+        if singer is None:
             return None, []
-        singer = cands[0]
         return singer, await self.artist_mvs(singer["id"], limit)
 
+    @_guard_sdk
     async def similar_singers(self, singer_mid: str, limit: int = 10) -> list[dict]:
         client = await self.get_client()
         try:
@@ -649,28 +730,45 @@ class QQClient:
     async def similar_singers_by_keyword(
         self, keyword: str, limit: int = 10
     ) -> tuple[dict | None, list[dict]]:
-        cands = await self.search(keyword, limit=5, type_=SearchType.SINGER)
-        if not cands:
+        singer = await self._singer_mid_by_keyword(keyword)
+        if singer is None:
             return None, []
-        singer = cands[0]
         return singer, await self.similar_singers(singer["id"], limit)
 
+    @_guard_sdk
     async def album_songs(self, album_mid: str, limit: int = 30) -> list[dict]:
         client = await self.get_client()
-        songs = await client.album.get_song(album_mid, num=limit).collect_items(limit)
+        try:
+            songs = await client.album.get_song(album_mid, num=limit).collect_items(limit)
+        except BaseApiException as e:
+            raise self._map(e) from e
         return [s for s in (_norm_song(x, i) for i, x in enumerate(songs)) if s]
 
-    async def album_songs_by_keyword(self, keyword: str, limit: int = 30) -> tuple[dict | None, list[dict]]:
-        cands = await self.search(keyword, limit=8, type_=SearchType.ALBUM)
+    async def _expand_or_candidates(
+        self, keyword: str, st, expand: Callable[[dict], Awaitable[tuple[dict | None, list[dict]]]]
+    ) -> tuple[dict | None, list[dict]]:
+        """两个 *_by_keyword 共用骨架：搜不到 → 未命中；唯一命中 → 交给 expand 展开；
+        多命中 → (None, 候选) 交上层出选择列表。expand 收候选项，返回 (meta, songs)。"""
+        cands = await self.search(keyword, limit=8, type_=st)
         if not cands:
             return None, []
         if len(cands) == 1:
-            return cands[0], await self.album_songs(cands[0]["id"], limit)
+            return await expand(cands[0])
         return None, cands
 
+    async def album_songs_by_keyword(self, keyword: str, limit: int = 30) -> tuple[dict | None, list[dict]]:
+        async def expand(c):
+            return c, await self.album_songs(c["id"], limit)
+
+        return await self._expand_or_candidates(keyword, SearchType.ALBUM, expand)
+
+    @_guard_sdk
     async def songlist_songs(self, songlist_id: str, limit: int = 30) -> tuple[dict, list[dict]]:
         client = await self.get_client()
-        res = await client.songlist.get_detail(int(songlist_id), num=limit)
+        try:
+            res = await client.songlist.get_detail(int(songlist_id), num=limit)
+        except BaseApiException as e:
+            raise self._map(e) from e
         info = getattr(res, "info", None)
         creator = getattr(info, "creator", None)
         meta = {
@@ -685,61 +783,77 @@ class QQClient:
         return meta, [s for s in (_norm_song(x, i) for i, x in enumerate(songs)) if s][:limit]
 
     async def songlist_by_keyword(self, keyword: str, limit: int = 30) -> tuple[dict | None, list[dict]]:
-        cands = await self.search(keyword, limit=8, type_=SearchType.SONGLIST)
-        if not cands:
-            return None, []
-        if len(cands) == 1:
-            meta, songs = await self.songlist_songs(cands[0]["id"], limit)
-            return meta, songs
-        return None, cands
+        async def expand(c):
+            return await self.songlist_songs(c["id"], limit)
+
+        return await self._expand_or_candidates(keyword, SearchType.SONGLIST, expand)
 
     # ──────────── 推荐 / 随机 ────────────
-    async def random_song(self) -> dict | None:
+    @_guard_sdk
+    async def _radar_songs(self, limit: int) -> list[dict]:
+        """私人雷达推荐列表。随机歌曲与日推共用同一上游接口，仅取数条数不同。"""
         client = await self.get_client()
-        songs = await client.recommend.get_radar_recommend().collect_items(5)
-        normed = [s for s in (_norm_song(x, i) for i, x in enumerate(songs)) if s]
-        return normed[0] if normed else None
+        try:
+            songs = await client.recommend.get_radar_recommend().collect_items(limit)
+        except BaseApiException as e:
+            raise self._map(e) from e
+        return [s for s in (_norm_song(x, i) for i, x in enumerate(songs)) if s]
 
+    async def random_song(self) -> dict | None:
+        songs = await self._radar_songs(5)
+        return songs[0] if songs else None
+
+    @_guard_sdk
     async def recommend_playlists(self) -> list[dict]:
         client = await self.get_client()
-        items = await client.recommend.get_recommend_songlist().collect_items(15)
+        try:
+            items = await client.recommend.get_recommend_songlist().collect_items(15)
+        except BaseApiException as e:
+            raise self._map(e) from e
         return [p for p in (_norm_songlist(x, i) for i, x in enumerate(items)) if p]
 
     async def daily_recommend(self) -> list[dict]:
-        """日推需登录；匿名返回空由上层提示。"""
-        client = await self.get_client()
+        """日推需登录：本地无有效凭证时直接抛 ApiError（code=1000），由上层引导扫码。"""
         if self._credential() is None:
             raise ApiError("日推需要登录，请先扫码登录 QQ 音乐", code=1000, source="qq")
-        songs = await client.recommend.get_radar_recommend().collect_items(30)
-        return [s for s in (_norm_song(x, i) for i, x in enumerate(songs)) if s]
+        return await self._radar_songs(30)
 
+    @_guard_sdk
     async def guess_songs(self, limit: int = 10) -> list[dict]:
         """猜你喜欢（匿名可用，Android 平台接口）。"""
         client = await self.get_client()
-        res = await client.recommend.get_guess_recommend()
+        try:
+            res = await client.recommend.get_guess_recommend()
+        except BaseApiException as e:
+            raise self._map(e) from e
         songs = getattr(res, "songs", None) or []
         return [s for s in (_norm_song(x, i) for i, x in enumerate(songs)) if s][:limit]
 
     # ──────────── 评论 / MV ────────────
+    @staticmethod
+    def _norm_comment(c, i: int, hot: bool) -> dict | None:
+        """评论条目 → 统一结构。index 用原始枚举序：跳过空内容时序号不重排。"""
+        content = (getattr(c, "content", "") or "").strip()
+        if not content:
+            return None
+        return {
+            "index": i + 1,
+            "nick": getattr(c, "nick", "") or "QQ音乐用户",
+            "avatar": getattr(c, "avatar", "") or "",
+            "time": _fmt_pub_time(getattr(c, "pub_time", "")),
+            "likes": int(getattr(c, "praise_num", 0) or 0),
+            "content": content[:300],
+            "hot": hot,
+        }
+
+    @_guard_sdk
     async def comments(self, song_id: str, limit: int = 12, kind: str = "music") -> dict:
         client = await self.get_client()
-        items = await client.comment.get_hot_comments(biz_id=int(song_id or 0)).collect_items(limit)
-        out = []
-        for i, c in enumerate(items):
-            content = (getattr(c, "content", "") or "").strip()
-            if not content:
-                continue
-            out.append(
-                {
-                    "index": i + 1,
-                    "nick": getattr(c, "nick", "") or "QQ音乐用户",
-                    "avatar": getattr(c, "avatar", "") or "",
-                    "time": _fmt_pub_time(getattr(c, "pub_time", "")),
-                    "likes": int(getattr(c, "praise_num", 0) or 0),
-                    "content": content[:300],
-                    "hot": True,
-                }
-            )
+        try:
+            items = await client.comment.get_hot_comments(biz_id=int(song_id or 0)).collect_items(limit)
+        except BaseApiException as e:
+            raise self._map(e) from e
+        out = [d for d in (self._norm_comment(c, i, hot=True) for i, c in enumerate(items)) if d]
         total = len(out)
         try:
             total = int(
@@ -749,33 +863,25 @@ class QQClient:
             pass
         return {"hot": out, "new": [], "total": total}
 
+    @_guard_sdk
     async def new_comments(self, song_id: str, limit: int = 12) -> list[dict]:
         """最新评论（「评论下页」用）。"""
         client = await self.get_client()
-        items = await client.comment.get_new_comments(
-            biz_id=int(song_id or 0), page_size=limit
-        ).collect_items(limit)
-        out = []
-        for i, c in enumerate(items):
-            content = (getattr(c, "content", "") or "").strip()
-            if not content:
-                continue
-            out.append(
-                {
-                    "index": i + 1,
-                    "nick": getattr(c, "nick", "") or "QQ音乐用户",
-                    "avatar": getattr(c, "avatar", "") or "",
-                    "time": _fmt_pub_time(getattr(c, "pub_time", "")),
-                    "likes": int(getattr(c, "praise_num", 0) or 0),
-                    "content": content[:300],
-                    "hot": False,
-                }
-            )
-        return out
+        try:
+            items = await client.comment.get_new_comments(
+                biz_id=int(song_id or 0), page_size=limit
+            ).collect_items(limit)
+        except BaseApiException as e:
+            raise self._map(e) from e
+        return [d for d in (self._norm_comment(c, i, hot=False) for i, c in enumerate(items)) if d]
 
+    @_guard_sdk
     async def mv_urls(self, vid: str) -> dict:
         client = await self.get_client()
-        res = await client.mv.get_mv_urls([vid])
+        try:
+            res = await client.mv.get_mv_urls([vid])
+        except BaseApiException as e:
+            raise self._map(e) from e
         data = getattr(res, "data", None) or {}
         node = data.get(vid) if isinstance(data, dict) else None
         url = ""
@@ -819,6 +925,7 @@ class QQClient:
             "avatar": "",
         }
 
+    @_guard_sdk
     async def vip_info(self) -> dict:
         client = await self.get_client()
         if self._credential() is None:
@@ -854,19 +961,26 @@ class QQClient:
         cred = self._credential()
         return str(getattr(cred, "encrypt_uin", "") or "") if cred else ""
 
-    async def fav_songs(self, limit: int = 30) -> list[dict]:
-        """「我喜欢」红心列表（dirid=201）。"""
-        client = await self.get_client()
+    def _require_euin(self) -> str:
+        """收藏/关注列表接口共用的前置：未登录或凭证缺加密 uin 都在发请求前拦下。"""
         self._require_login()
         euin = self._euin()
         if not euin:
             raise ApiError("凭证缺少加密 uin，请退出后重新扫码登录", source="qq")
+        return euin
+
+    @_guard_sdk
+    async def fav_songs(self, limit: int = 30) -> list[dict]:
+        """「我喜欢」红心列表（dirid=201）。"""
+        client = await self.get_client()
+        euin = self._require_euin()
         try:
             songs = await client.user.get_fav_song(euin, num=min(limit, 50)).collect_items(limit)
             return [s for s in (_norm_song(x, i) for i, x in enumerate(songs)) if s]
         except BaseApiException as e:
             raise self._map(e) from e
 
+    @_guard_sdk
     async def created_songlists(self) -> list[dict]:
         client = await self.get_client()
         cred = self._require_login()
@@ -881,25 +995,21 @@ class QQClient:
         except BaseApiException as e:
             raise self._map(e) from e
 
+    @_guard_sdk
     async def fav_songlists(self, limit: int = 30) -> list[dict]:
         """收藏的外部歌单。"""
         client = await self.get_client()
-        self._require_login()
-        euin = self._euin()
-        if not euin:
-            raise ApiError("凭证缺少加密 uin，请退出后重新扫码登录", source="qq")
+        euin = self._require_euin()
         try:
             pls = await client.user.get_fav_songlist(euin, num=min(limit, 50)).collect_items(limit)
             return [p for p in (_norm_songlist(x, i) for i, x in enumerate(pls)) if p]
         except BaseApiException as e:
             raise self._map(e) from e
 
+    @_guard_sdk
     async def follow_singers(self, limit: int = 30) -> list[dict]:
         client = await self.get_client()
-        self._require_login()
-        euin = self._euin()
-        if not euin:
-            raise ApiError("凭证缺少加密 uin，请退出后重新扫码登录", source="qq")
+        euin = self._require_euin()
         try:
             users = await client.user.get_follow_singers(euin, num=min(limit, 50)).collect_items(limit)
             return [
@@ -916,6 +1026,7 @@ class QQClient:
         except BaseApiException as e:
             raise self._map(e) from e
 
+    @_guard_sdk
     async def like_toggle(self, song: dict, like: bool) -> str:
         """红心 / 取消红心（写「我喜欢」歌单，dirid=201）。"""
         client = await self.get_client()
@@ -934,6 +1045,7 @@ class QQClient:
         except BaseApiException as e:
             raise self._map(e) from e
 
+    @_guard_sdk
     async def refresh_credential(self) -> bool:
         client = await self.get_client()
         cred = self._credential()
@@ -948,6 +1060,10 @@ class QQClient:
             saved = await self._config.save_async()
             # 刷新后的 musickey 已变，必须让缓存失效，否则 5 秒内仍用旧凭证
             self.invalidate_credential()
+            # 库的 refresh 只在「不传 credential」时才回写 client（None 分支），插件恒传
+            # 显式 cred → 永不回写；不补这一行，保活写进配置的新 key 到不了活客户端
+            if self._client is not None:
+                self._client.credential = new_cred
             return saved
         except BaseApiException:
             return False
@@ -961,6 +1077,7 @@ class QQClient:
         await self._config.save_async()
 
     # ---- 扫码登录（供 WebUI / 聊天指令共用）----
+    @_guard_sdk
     async def qr_start(self, login_type: str = "qq") -> dict:
         """创建扫码会话。返回 {session, qrB64}；session 由 LoginFlows 持有并后台消费。"""
         if not available():
@@ -1001,6 +1118,10 @@ class QQClient:
                         return
                     data = credential.model_dump(by_alias=True)
                     self._cred_cache = (time.monotonic(), credential)
+                    # QQ/微信/MOBILE 三条扫码授权路径库都不回写 client.credential（仅
+                    # 手机验证码 phone_authorize 会）；不显式回写，换号重扫后取流仍走旧账号
+                    if self._client is not None:
+                        self._client.credential = credential
                     await on_event("done", json.dumps(data, ensure_ascii=False))
                     return
                 elif ev == QRCodeLoginEvents.TIMEOUT:
@@ -1043,6 +1164,4 @@ class QQClient:
 
 
 if available():  # 依赖缺失时不注册：create() 不会拿到一个必然失败的实例
-    register(
-        "qq", lambda config, device_path=None, cred_path=None, **kw: QQClient(config, device_path, cred_path)
-    )
+    register("qq", lambda config, qq_device_path=None, **kw: QQClient(config, qq_device_path))

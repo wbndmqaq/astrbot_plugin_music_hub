@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import time
 from pathlib import Path
 
@@ -48,11 +49,19 @@ class SessionStore:
 
     # ──────────── 仲裁 ────────────
     def _claim_owner(self, scope: str) -> None:
-        """同步实现（线程池里跑）：标记本插件为该 scope 的最近音乐插件（老约定，供裸 #听N 仲裁）。"""
+        """同步实现（线程池里跑）：标记本插件为该 scope 的最近音乐插件（老约定，供裸 #听N 仲裁）。
+
+        并发 claim（多群同时出列表）的读改写竞态是已知问题：两个写者可能互相
+        覆盖对方的 scope 记录。影响可接受——只是仲裁文件的即时快照短暂缺一条，
+        该会话的下一条消息会重新 claim 收敛，不值得为此加锁。"""
         try:
             data = {}
             if self._owner_path.exists():
                 data = json.loads(self._owner_path.read_text("utf-8"))
+            # 仲裁文件由多个插件共写，schema 不可控：根是 list/str 时 .get 直接
+            # AttributeError，不在下方 except 捕获面里，会炸出 claim_owner
+            if not isinstance(data, dict):
+                data = {}
             scopes = data.get("scopes", {}) if isinstance(data.get("scopes"), dict) else {}
             scopes[scope] = {"plugin": PLUGIN_NAME, "ts": int(time.time())}
             if len(scopes) > OWNER_FILE_MAX_SCOPES:
@@ -63,7 +72,9 @@ class SessionStore:
                 )
             data["version"] = 2
             data["scopes"] = scopes
-            tmp = self._owner_path.with_suffix(f".{PLUGIN_NAME}.tmp")
+            # tmp 名带随机后缀：固定名在并发 claim（多群同时出列表）时
+            # 两个写入者互踩同一个 tmp 文件，先完成的 replace 会被后写的破坏
+            tmp = self._owner_path.with_suffix(f".{PLUGIN_NAME}.{os.urandom(4).hex()}.tmp")
             tmp.write_text(json.dumps(data, ensure_ascii=False), "utf-8")
             tmp.replace(self._owner_path)
         except (OSError, ValueError):
@@ -79,7 +90,10 @@ class SessionStore:
             if not self._owner_path.exists():
                 return True
             data = json.loads(self._owner_path.read_text("utf-8"))
-            entry = (data.get("scopes", {}) or {}).get(scope)
+            if not isinstance(data, dict):
+                return True
+            scopes = data.get("scopes", {})
+            entry = scopes.get(scope) if isinstance(scopes, dict) else None
             if not isinstance(entry, dict) or not entry.get("plugin"):
                 return True
             if time.time() - float(entry.get("ts", 0)) > TTL:
@@ -119,16 +133,27 @@ class SessionStore:
             entry = self._cache.get(scope)
             if entry and time.time() - entry.get("updatedAt", 0) < TTL:
                 if refresh:
+                    # refresh 只续内存 TTL：KV 里的 updatedAt 不回写。跨重载（内存
+                    # 缓存清空）后以落盘时间为准，活跃会话的剩余 TTL 会偏短——
+                    # 属有意为之的近似，避免活跃会话频繁回写 KV
                     entry["updatedAt"] = time.time()
                 return dict(entry)
         stored = await self._kv_get(f"{self._kv_prefix}:sess:{scope}")
         if isinstance(stored, dict) and stored.get("kind"):
-            if time.time() - float(stored.get("updatedAt", 0)) < TTL:
+            try:
+                stored_ts = float(stored.get("updatedAt", 0))
+            except (TypeError, ValueError):
+                # 脏 KV（手改 JSON / 旧版本写坏 updatedAt，含数字字符串）：按「缓存
+                # 过期」处理走重取而不冒泡——与 _owns_scope_impl 对落盘数据的防御一致
+                stored_ts = 0.0
+            fresh = time.time() - stored_ts < TTL
+            if fresh:
                 async with self._lock:
                     # 二次检查：等 KV 期间可能已有别的协程写入了更新的 entry，
-                    # 无条件覆盖会让新数据被旧值顶掉。
+                    # 无条件覆盖会让新数据被旧值顶掉。比较用归一后的 float：
+                    # 裸 stored["updatedAt"] 是字符串时 float >= str 会 TypeError
                     current = self._cache.get(scope)
-                    if current is not None and current.get("updatedAt", 0) >= stored.get("updatedAt", 0):
+                    if current is not None and current.get("updatedAt", 0) >= stored_ts:
                         return dict(current)
                     self._cache[scope] = stored
                 return dict(stored)
@@ -144,14 +169,6 @@ class SessionStore:
         entry = await self.get(scope)
         if entry and entry.get("action"):
             await self.set(scope, entry["kind"], entry.get("data", {}), action="")
-
-    async def clear(self, scope: str) -> None:
-        async with self._lock:
-            self._cache.pop(scope, None)
-        try:
-            await self._plugin.delete_kv_data(f"{self._kv_prefix}:sess:{scope}")
-        except Exception:
-            pass
 
     async def songs_of(self, scope: str) -> list[dict]:
         entry = await self.get(scope)

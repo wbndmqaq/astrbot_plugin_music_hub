@@ -5,12 +5,12 @@ target-version = "py310"
 select = ["E", "F", "W", "I", "UP", "B"]
 ignore = [
     "E501",  # 行长由 formatter 管理，中文注释普遍偏长
-    "B008",  # FastAPI/路由默认参数风格
 ]
 
 [lint.per-file-ignores]
 "_probe_*.py" = ["E402", "F401"]
 "main.py" = ["E402"]
+"tests/conftest.py" = ["E402"]
 
 [format]
 quote-style = "double"

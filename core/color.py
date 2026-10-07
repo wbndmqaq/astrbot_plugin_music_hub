@@ -96,6 +96,21 @@ async def palette_for(cover_url: str, session: aiohttp.ClientSession) -> dict | 
     return await asyncio.shield(fut)
 
 
+async def close() -> None:
+    """取消在途取色任务（插件重载/停用时调用）。
+
+    在途任务挂在模块级 _INFLIGHT 上、不经 service.spawn，terminate 拿不到引用；
+    不取消的话旧任务会拿着已关闭的 aiohttp 会话继续跑（异常被吞、无害但白耗）。
+    """
+    async with _LOCK:
+        tasks = [f for f in _INFLIGHT.values() if isinstance(f, asyncio.Task) and not f.done()]
+        _INFLIGHT.clear()
+    for task in tasks:
+        task.cancel()
+    if tasks:
+        await asyncio.gather(*tasks, return_exceptions=True)
+
+
 async def _compute_tracked(url: str, session: aiohttp.ClientSession) -> dict | None:
     """执行取色并负责 in-flight 登记的清理与结果缓存。"""
     try:
@@ -118,7 +133,8 @@ async def _compute(url: str, session: aiohttp.ClientSession) -> dict | None:
         async with session.get(url, timeout=_DOWNLOAD_TIMEOUT) as resp:
             if resp.status != 200:
                 return None
-            raw = await resp.read()
+            # 先限长再读：全量 resp.read() 要把整张图拉进内存才能判超限
+            raw = await resp.content.read(_MAX_BYTES + 1)
         if not raw or len(raw) > _MAX_BYTES:
             return None
     except Exception:  # noqa: BLE001 — 封面下载失败只回退品牌色

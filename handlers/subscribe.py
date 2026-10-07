@@ -20,6 +20,14 @@ _RE_SUB_LIST = r"^\s*#?\s*(?:我的订阅|订阅列表)\s*$"
 _SUB_TIP = "（推送需要平台支持主动消息；群聊/私聊均可订阅）"
 
 
+def _scheduler_tip(service) -> str:
+    """定时任务开关关闭时订阅仍可写入，但推送永远不会执行——必须当面说明，
+    不能让用户以为「每天定时推送」还在生效。"""
+    if service.config.scheduler_enable:
+        return ""
+    return "\n注意：定时任务已关闭（scheduler.enable），订阅推送不会执行"
+
+
 def _umo(service, event) -> str:
     umo = getattr(event, "unified_msg_origin", "")
     if not umo:
@@ -37,13 +45,13 @@ async def run_sub_daily(service, event):
         await service.reply(event, "日推需要网易云登录态，请先发送「ncm登录」扫码后再订阅")
         return
     await service.subs.set_daily(umo, service.scope(event), True)
-    await service.reply(event, "已订阅每日推荐，每天定时推送到本会话\n" + _SUB_TIP)
+    await service.reply(event, "已订阅每日推荐，每天定时推送到本会话\n" + _SUB_TIP + _scheduler_tip(service))
 
 
 async def run_unsub_daily(service, event):
     umo = _umo(service, event)
     await service.subs.set_daily(umo, service.scope(event), False)
-    await service.reply(event, "已退订每日推荐")
+    await service.reply(event, "已退订每日推荐" + _scheduler_tip(service))
 
 
 async def run_sub_artist(service, event):
@@ -65,14 +73,22 @@ async def run_sub_artist(service, event):
         await service.reply(event, f"没有找到歌手「{name}」")
         return
     artist = cands[0]
-    await service.kg.follow_artist(artist["id"], True)
+    try:
+        # 与其它音源调用一致走 service.call 记账；关注失败就不写订阅，
+        # 避免酷狗侧没关注、本地却每天去拉新歌的状态不一致
+        await service.call(SOURCE_KG, "explore", service.kg.follow_artist(artist["id"], True))
+    except ApiError as e:
+        await service.reply(event, f"酷狗关注「{artist['name']}」失败：{e.user_msg()}，未写入订阅")
+        return
     added = await service.subs.add_artist(
         umo, service.scope(event), {"id": artist["id"], "name": artist["name"]}
     )
     if added:
         await service.reply(
             event,
-            f"已订阅「{artist['name']}」的新歌（已在酷狗账号关注），每天检查一次更新\n" + _SUB_TIP,
+            f"已订阅「{artist['name']}」的新歌（已在酷狗账号关注），每天检查一次更新\n"
+            + _SUB_TIP
+            + _scheduler_tip(service),
         )
     else:
         await service.reply(event, f"「{artist['name']}」已经在订阅列表里啦")
@@ -91,7 +107,7 @@ async def run_unsub_artist(service, event):
             await service.kg.follow_artist(removed.get("id", ""), False)
         except Exception:  # noqa: BLE001 - 取关失败不影响退订
             pass
-        await service.reply(event, f"已退订「{removed.get('name', name)}」的新歌")
+        await service.reply(event, f"已退订「{removed.get('name', name)}」的新歌" + _scheduler_tip(service))
     else:
         await service.reply(event, f"订阅列表里没有「{name}」")
 
@@ -107,7 +123,7 @@ def routes() -> list[Route]:
         Route(
             re.compile(_RE_SUB_DAILY, re.IGNORECASE),
             "mh_sub_daily",
-            "订阅每日推荐",
+            "订阅每日推荐（管理员）",
             run_sub_daily,
             admin=True,
             priority=6,
@@ -115,7 +131,7 @@ def routes() -> list[Route]:
         Route(
             re.compile(_RE_UNSUB_DAILY, re.IGNORECASE),
             "mh_unsub_daily",
-            "退订每日推荐",
+            "退订每日推荐（管理员）",
             run_unsub_daily,
             admin=True,
             priority=6,
@@ -123,7 +139,7 @@ def routes() -> list[Route]:
         Route(
             re.compile(_RE_SUB_ARTIST, re.IGNORECASE),
             "mh_sub_artist",
-            "订阅歌手新歌",
+            "订阅歌手新歌（管理员）",
             run_sub_artist,
             admin=True,
             priority=6,
@@ -131,7 +147,7 @@ def routes() -> list[Route]:
         Route(
             re.compile(_RE_UNSUB_ARTIST, re.IGNORECASE),
             "mh_unsub_artist",
-            "退订歌手新歌",
+            "退订歌手新歌（管理员）",
             run_unsub_artist,
             admin=True,
             priority=6,

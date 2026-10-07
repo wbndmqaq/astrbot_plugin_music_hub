@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import asyncio
 import copy
+import datetime
 
 from astrbot.api import logger
 
@@ -52,6 +53,9 @@ def _normalize_rows(data) -> dict:
         rows[str(umo)] = {
             "scope": str(row.get("scope", "")),
             "daily": bool(row.get("daily")),
+            # 日推当日已推标记（YYYY-MM-DD）：定时任务失败会当日重试整轮，
+            # 没有它每次重试都会把同一份日推重发给订阅者（最多十几次）
+            "daily_date": str(row.get("daily_date") or ""),
             "artists": artists,
         }
     return rows
@@ -72,7 +76,8 @@ class Subscriptions:
         self._subs = _normalize_rows(data)
 
     async def _save(self) -> None:
-        # 传深拷贝：put_kv 会同步序列化 self._subs，期间并发改动会写出撕裂的 JSON
+        # 快照在调用方持锁时拷出：put_kv（shared_preferences put_async）入队时才
+        # 对传入值做拷贝并异步落盘，若在锁外拷贝，快照可能夹带并发写入的中间态
         await self._service.put_kv(_KV_KEY, copy.deepcopy(self._subs))
 
     def _row(self, umo: str, scope: str) -> dict:
@@ -115,42 +120,73 @@ class Subscriptions:
     def list_of(self, umo: str) -> dict | None:
         return self._subs.get(umo)
 
-    def all_scopes(self) -> list[str]:
-        return list(self._subs.keys())
-
     # ──────────── 每日推送 ────────────
     async def push_all(self) -> None:
         if not self._service.config.enable:
             return  # 总开关关闭时连订阅推送一起静默
+        today = datetime.date.today().isoformat()
+        # 「日推文案」与「关注的歌手新歌」对所有订阅会话是同一份数据：整轮各取一次。
+        # 每个会话各取一次是 N 倍请求，会撞酷狗 20028 风控。
+        daily = None
+        if any(row.get("daily") and row.get("daily_date") != today for row in list(self._subs.values())):
+            daily = await self._push_daily()
+        songs = None
+        if any(row.get("artists") for row in list(self._subs.values())):
+            songs = await self._fetch_followed_songs()
         for umo, row in list(self._subs.items()):
             try:
-                await self._push_one(umo, row)
+                await self._push_one(umo, row, songs, daily, today)
             except Exception as e:  # noqa: BLE001 - 单会话失败不影响其他
                 logger.warning(f"{TAG} 订阅推送失败（{umo}）：{e}")
 
-    async def _push_one(self, umo: str, row: dict) -> None:
+    async def _push_one(
+        self, umo: str, row: dict, songs: list[dict] | None = None, daily: str | None = None, today: str = ""
+    ) -> None:
+        """推送单个会话。songs/daily 是 push_all 整轮各取一次的共享结果，生产路径
+        恒传实参（push_all 对「任一行订阅了对应内容」预检后才取，订阅行必拿到实取值）；
+        留默认 None 仅为测试直调留门——未预取时本调用内自行补取一次。
+
+        日推按 daily_date 当日去重：定时任务失败（签到 403 等）会当日重试整轮，
+        成功发送过一次（含失败占位文案）就不再重发，否则订阅者一天收到十几次重复日推。
+        """
+        if not today:
+            today = datetime.date.today().isoformat()
         parts = []
-        if row.get("daily"):
-            parts.append(await self._push_daily())
+        daily_due = bool(row.get("daily")) and row.get("daily_date") != today
+        if daily_due:
+            if daily is None:
+                daily = await self._push_daily()
+            parts.append(daily)
         artists = list(row.get("artists", []))
+        fresh_sids: list[tuple[dict, list[str]]] = []
         if artists:
-            # 「关注的歌手新歌」对所有订阅歌手是同一份数据，取一次复用
-            songs = await self._fetch_followed_songs()
+            if songs is None:
+                songs = await self._fetch_followed_songs()
             for artist in artists:
-                part = await self._push_artist(artist, songs)
+                part, sids = await self._push_artist(artist, songs)
                 if part:
                     parts.append(part)
-            if parts:
-                # seen 变更在循环内累积，订阅表统一写一次
-                await self._save()
+                    fresh_sids.append((artist, sids))
         if not parts:
             return
         text = "♪ Music Hub 订阅推送\n" + "\n".join(parts) + "\n（退订：退订 日推 / 退订新歌 歌手名）"
-        await self._service.send_to_umo(umo, text)
+        sent = await self._service.send_to_umo(umo, text)
+        if sent is False:
+            return  # 发送失败这批 sid 不记 seen：下轮重推，否则这批歌永远丢失
+        if fresh_sids or daily_due:
+            # 发送成功才把本批 sid / 当日标记并入并落盘；订阅/退订指令的写也在锁内，
+            # 不串行化会丢更新。本段无 await 网络（_save 只入队），锁内循环不阻塞事件循环。
+            async with self._lock:
+                for artist, sids in fresh_sids:
+                    merged = list(dict.fromkeys([*(artist.get("seen") or []), *sids]))
+                    artist["seen"] = merged[-_SEEN_CAP:]
+                if daily_due:
+                    row["daily_date"] = today
+                await self._save()
 
     async def _push_daily(self) -> str:
         try:
-            songs = await self._service.ncm.daily_recommend()
+            songs = await self._service.client_of(SOURCE_NCM).daily_recommend()
         except Exception as e:  # noqa: BLE001
             return f"· 日推：获取失败（{e}）"
         if not songs:
@@ -160,16 +196,17 @@ class Subscriptions:
             lines.append(f"  {i}. {s.get('name')} - {s.get('artist')}")
         return "\n".join(lines)
 
-    async def _push_artist(self, artist: dict, songs: list[dict] | None = None) -> str:
-        """单个歌手的新歌文案。songs 由调用方取一次后复用 ——
-        followed_new_songs 返回的是「我关注的全部歌手的新歌」，每个歌手都请求一次
-        纯属浪费（N 倍请求撞酷狗 20028 风控）。"""
+    async def _push_artist(self, artist: dict, songs: list[dict] | None = None) -> tuple[str, list[str]]:
+        """单个歌手的新歌文案与本批 sid。
+
+        songs 是「我关注的全部歌手的新歌」的共享结果：每个歌手各请求一次纯属浪费
+        （N 倍请求撞酷狗 20028 风控），调用方应取一次后传给所有歌手；传 None 时
+        本调用经 _fetch_followed_songs 补取一次（仅测试直调路径，生产唯一调用方
+        _push_one 恒传实参）。
+
+        只计算不落 seen：sid 由 _push_one 在发送成功后合并入库。"""
         if songs is None:
-            try:
-                songs = await self._service.kg.followed_new_songs(30)
-            except Exception as e:  # noqa: BLE001
-                logger.warning(f"{TAG} 歌手新歌获取失败（{artist.get('name')}）：{e}")
-                return ""
+            songs = await self._fetch_followed_songs()
         name = artist.get("name", "")
         seen = set(artist.get("seen") or [])
         # 歌手名精确匹配（与 remove_artist 一致）：子串匹配会让订阅「周杰伦」
@@ -180,19 +217,21 @@ class Subscriptions:
             if s.get("sid") and s["sid"] not in seen and _same_artist(name, s.get("artist") or "")
         ]
         if not fresh:
-            return ""
-        # seen 取并集后截断：整体覆盖会让重新进入窗口的旧歌被当成新歌重复推送
-        merged = list(dict.fromkeys([*seen, *(s["sid"] for s in songs if s.get("sid"))]))
-        artist["seen"] = merged[-_SEEN_CAP:]
+            return "", []
+        shown = fresh[:_PUSH_LIMIT]
         lines = [f"· 关注歌手新歌（{name}）"]
-        for i, s in enumerate(fresh[:_PUSH_LIMIT], 1):
+        for i, s in enumerate(shown, 1):
             lines.append(f"  {i}. {s.get('name')} - {s.get('artist')}")
-        return "\n".join(lines)
+        # 只并集本歌手命中的 sid，且只记**已推送**的条目：把未推送的第
+        # _PUSH_LIMIT 首之后的歌也记 seen，它们永远不会出现在任何推送里
+        # （seen 上限 200，普通用户挤不掉），等于静默丢歌
+        sids = list(dict.fromkeys(s["sid"] for s in shown))
+        return "\n".join(lines), sids
 
     async def _fetch_followed_songs(self) -> list[dict]:
         """取一次「关注的歌手新歌」，失败返回空列表（各歌手跳过推送）。"""
         try:
-            return await self._service.kg.followed_new_songs(30)
+            return await self._service.client_of(SOURCE_KG).followed_new_songs(30)
         except Exception as e:  # noqa: BLE001
             logger.warning(f"{TAG} 歌手新歌获取失败：{e}")
             return []

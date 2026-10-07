@@ -3,18 +3,22 @@
 from __future__ import annotations
 
 import asyncio
-import contextlib
+import functools
 import os
 import re
 import shutil
 import subprocess
 import time
+from concurrent.futures import ThreadPoolExecutor
 
 import aiohttp
 
-from . import SOURCE_KG, SOURCE_NCM, SOURCE_QQ
+from . import PLUGIN_NAME, SOURCE_KG, SOURCE_NCM, SOURCE_QQ
 
 TAG = "[music_hub]"
+
+# ffmpeg 专用执行器（见 prepare_vocal_file 内注释）
+_FFMPEG_POOL = ThreadPoolExecutor(max_workers=2, thread_name_prefix="mh-ffmpeg")
 
 _DEFAULT_DOWNLOAD_TIMEOUT_MS = 120000
 _DEFAULT_KEEP_FILE_SEC = 60
@@ -99,11 +103,15 @@ async def prepare_vocal_file(
     ``bitrate`` 是用户配置 ``compressBitrate``（kbps 数字）折算出的目标码率，
     为 None 时用内置阶梯。体积越大越降一档，避免大文件压完仍超限。
     """
-    if not file_path or not os.path.exists(file_path):
+    if not file_path:
+        return file_path
+    # exists/getsize 是磁盘 IO：网络盘或容器挂载上可阻塞数百 ms，不能跑在事件循环上
+    # （理由同 download_audio 尾部注释）
+    if not await asyncio.to_thread(os.path.exists, file_path):
         return file_path
     abs_path = os.path.abspath(file_path)
     try:
-        size = os.path.getsize(abs_path)
+        size = await asyncio.to_thread(os.path.getsize, abs_path)
     except OSError:
         return file_path
     ext = os.path.splitext(abs_path)[1].lstrip(".").lower()
@@ -120,7 +128,10 @@ async def prepare_vocal_file(
     out = os.path.join(os.path.dirname(abs_path), f"{stem}{suffix}.mp3")
     if await asyncio.to_thread(_reusable_artifact, out):
         return out
-    # 先写临时文件再原子替换：并发压同一首（点歌台+手动）时两个 ffmpeg 不会互踩半成品
+    # 先写临时文件再原子替换：并发压同一首（点歌台+手动）时两个 ffmpeg 不会互踩半成品。
+    # .part 放源文件同目录是安全的：本函数的全部调用方（delivery._fetch_audio / remote）
+    # 输入路径都来自 download_audio 落在 get_temp_dir() 的产物，startup_sweep 能兜底清理
+    # 孤儿 .part —— 没有 temp 之外的输入路径，故不必改写到别处
     tmp = f"{out}.{os.urandom(3).hex()}.part"
 
     common = ["ffmpeg", "-y", "-i", abs_path, "-vn", "-acodec", "libmp3lame"]
@@ -130,18 +141,28 @@ async def prepare_vocal_file(
         else common + ["-ar", "44100", "-ac", "2", "-b:a", target, tmp]
     )
     try:
-        res = await asyncio.to_thread(
-            subprocess.run, args, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=180
+        # 独立小线程池：单次压制可占线程 3 分钟（timeout=180），与 to_thread 共用
+        # 默认执行器时，并发压制会把统计落盘/模板渲染等短 IO 任务饿在队尾
+        res = await asyncio.get_running_loop().run_in_executor(
+            _FFMPEG_POOL,
+            functools.partial(
+                subprocess.run, args, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=180
+            ),
         )
-        if res.returncode != 0 or not os.path.exists(tmp) or os.path.getsize(tmp) <= _MIN_VALID_BYTES:
-            with contextlib.suppress(OSError):
-                os.remove(tmp)
+        if res.returncode != 0:
+            await asyncio.to_thread(_remove_file, tmp)
             return file_path
-        os.replace(tmp, out)
+        # ffmpeg 之后的校验/落盘/清理同样是磁盘 IO：延续上面的 to_thread 纪律，
+        # 不裸跑在事件循环上（网络盘/容器挂载可阻塞数百 ms 卡住整个插件）
+        if not await asyncio.to_thread(
+            lambda: os.path.exists(tmp) and os.path.getsize(tmp) > _MIN_VALID_BYTES
+        ):
+            await asyncio.to_thread(_remove_file, tmp)
+            return file_path
+        await asyncio.to_thread(os.replace, tmp, out)
         return out
     except Exception:  # noqa: BLE001
-        with contextlib.suppress(OSError):
-            os.remove(tmp)
+        await asyncio.to_thread(_remove_file, tmp)
         return file_path
 
 
@@ -157,7 +178,7 @@ async def get_temp_dir() -> str:
     def _resolve() -> str:
         from astrbot.api.star import StarTools
 
-        d = StarTools.get_data_dir("astrbot_plugin_music_hub") / "temp"
+        d = StarTools.get_data_dir(PLUGIN_NAME) / "temp"
         d.mkdir(parents=True, exist_ok=True)
         return str(d)
 
@@ -272,16 +293,18 @@ def _ext_for_quality(quality_hint: str, url: str, ext_hint: str = "") -> str:
     q = (quality_hint or "").lower()
     if q == "video":
         return ".mp4"
+    # 杜比全景声是 mp4 容器（上游 SongFileType.ATMOS_DB=("D004",".mp4")；ncm 的 dolby 同为
+    # mp4 容器），不是 flac；atmos（ATMOS_51/ATMOS_2）与 master 才是 flac 容器
+    if q in ("atmos_db", "dolby"):
+        return ".mp4"
     if q in (
         "flac",
         "hires",
         "high",
         "master",
         "atmos",
-        "atmos_db",
         "atmos_master",
         "jymaster",
-        "dolby",
         "sky",
         "viper_tape",
         "viper_clear",
@@ -294,13 +317,14 @@ def _ext_for_quality(quality_hint: str, url: str, ext_hint: str = "") -> str:
     for ext in (".ape", ".ogg", ".flac", ".m4a", ".mp3", ".mp4"):
         if ext in u:
             return ext
-    if re.search(r"f000|rs01|rs02|q000|ai00", u):
+    if re.search(r"f000|rs01|q000|ai00", u):
         return ".flac"
     if re.search(r"mgg|og$", u):
         return ".ogg"
     if re.search(r"c400|m4a", u):
         return ".m4a"
-    if re.search(r"m800|m500|mp3", u):
+    # RS02 是 QQ 试听档前缀（SpecialSongFileType.TRY=("RS02",".mp3")），归 mp3 不归 flac
+    if re.search(r"m800|m500|rs02|mp3", u):
         return ".mp3"
     return ".mp3"
 
@@ -334,9 +358,9 @@ async def download_audio(
 
     timeout = aiohttp.ClientTimeout(total=timeout_ms / 1000)
     size = 0
-    if os.path.exists(file_path):
-        with contextlib.suppress(Exception):
-            os.remove(file_path)
+    # 目标名带时间戳 + 随机后缀基本不会已存在，但清理动作仍是磁盘 IO，
+    # 不能跑在事件循环上（网络盘/容器挂载可阻塞数百 ms 卡住整个插件）
+    await asyncio.to_thread(_remove_file, file_path)
     try:
         sess = get_session()
         async with sess.get(url, headers=headers, timeout=timeout, allow_redirects=True) as res:

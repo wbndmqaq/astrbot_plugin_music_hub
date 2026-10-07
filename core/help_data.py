@@ -34,6 +34,7 @@ HELP_SECTIONS = [
             {"name": "专辑评论 / 歌单评论", "desc": "按名定位后看评论", "example": "歌单评论 私藏"},
             {"name": "相似 [关键词]", "desc": "相似歌曲推荐", "example": "相似"},
             {"name": "相似歌单 [关键词]", "desc": "相似歌单（网易云）", "example": "相似歌单"},
+            {"name": "MV [关键词]", "desc": "播放歌曲 MV", "example": "MV"},
             {"name": "版本 [关键词]", "desc": "歌曲其他版本（酷狗/QQ）", "example": "版本"},
             {"name": "AI推荐 [关键词]", "desc": "AI 相似推荐（酷狗）", "example": "AI推荐"},
             {"name": "MV搜 关键词", "desc": "搜索 MV，听N 发送", "example": "MV搜 晴天"},
@@ -123,10 +124,16 @@ HELP_SECTIONS = [
         ],
     },
     {
-        "title": "系统",
-        "tag": "管理员",
+        "title": "帮助",
+        "tag": "全员",
         "items": [
             {"name": "帮助", "desc": "本帮助", "example": "音乐帮助"},
+        ],
+    },
+    {
+        "title": "系统（管理员）",
+        "tag": "管理员",
+        "items": [
             {"name": "设置", "desc": "查看当前配置", "example": "音乐设置"},
             {"name": "音质 [档位]", "desc": "设置最高音质", "example": "音质 lossless"},
             {"name": "开启 / 关闭 功能", "desc": "临时开关 点歌/解析/卡片/语音/文件", "example": "关闭 语音"},

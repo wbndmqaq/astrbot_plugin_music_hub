@@ -58,8 +58,16 @@ class SongSearch:
         self._enabled = enabled_sources or (lambda: [s for s in SOURCES if config.src_enabled(s)])
 
     # ──────────── 单源 / 聚合 ────────────
-    async def search_full(self, keyword: str, source: str = "auto", limit: int | None = None) -> SearchResult:
-        """搜索歌曲。source=auto 时三源并行聚合混排。"""
+    async def search_full(
+        self, keyword: str, source: str = "auto", limit: int | None = None, *, per_source: int | None = None
+    ) -> SearchResult:
+        """搜索歌曲。source=auto 时三源并行聚合混排。
+
+        per_source：聚合路径各源取数条数。默认 None 保持既有行为（每源取
+        AGGREGATE_PER_SOURCE 条，并在分组前整体截断到 limit）；versions() 传
+        limit 进来——每源多取、整体截断改由调用方分组后再做，否则交错序下
+        limit 条只够拼出两三个分组。
+        """
         limit = limit or self._cfg.max_list
         src, kw = parse_source_hint(keyword)
         if src != "auto":
@@ -75,9 +83,12 @@ class SongSearch:
         enabled = self._enabled()
         if not enabled:
             raise ApiError(_NO_SOURCE_MSG, source="")
-        tasks = [self.one(s, keyword, AGGREGATE_PER_SOURCE) for s in enabled]
+        tasks = [self.one(s, keyword, max(AGGREGATE_PER_SOURCE, per_source or 0)) for s in enabled]
         buckets, notices = await self._gather_sources(enabled, tasks, keyword, "search")
-        return SearchResult(interleave(buckets)[:limit], "auto", notices)
+        merged = interleave(buckets)
+        if per_source is None:
+            merged = merged[:limit]
+        return SearchResult(merged, "auto", notices)
 
     async def _call(self, source: str, action: str, coro, detail: str = ""):
         """执行并记账：失败记 ok=False 并把异常抛回调用方。"""
@@ -120,23 +131,37 @@ class SongSearch:
         return buckets, notices
 
     async def one(self, source: str, keyword: str, limit: int) -> list[dict]:
-        """单源搜索（换源重搜等编排场景直接复用）。"""
-        return await self._clients[source].search(keyword, limit=limit)
+        """单源搜索（换源重搜等编排场景直接复用）。
+
+        源不在 _clients 里（qq 库未装被注册表跳过 / 初始化失败被 create 跳过）时
+        抛 NotEnabledError 而不是裸 KeyError——handler 侧只捕获 ApiError，
+        KeyError 会逃过拦截一路炸到路由兜底，用户看到的不是可操作的提示。
+        """
+        client = self._clients.get(source)
+        if client is None:
+            raise NotEnabledError(
+                f"{SOURCE_NAMES.get(source, source)}音源不可用（未安装依赖或初始化失败）", source=source
+            )
+        return await client.search(keyword, limit=limit)
 
     # ──────────── 同名分组 ────────────
-    async def versions(self, keyword: str, limit: int | None = None) -> tuple[list[dict], str]:
+    async def versions(self, keyword: str, limit: int | None = None) -> tuple[list[dict], str, list[str]]:
         """聚合搜索并按「同名同歌手」分组 → 多音源选择列表。
 
-        返回 (groups, source)。每个 group：
+        返回 (groups, source, notices)。notices 是本次聚合取数收集的可操作提示
+        （如「请扫码登录」），零结果时调用方应优先展示——否则用户只看到「没搜到」，
+        不知道去扫码。每个 group：
         {index, name, artist, album, cover, duration, dtMs,
          versions: [song…按默认音源优先排序], primary: song}
         """
         from .matching import group_versions
 
         limit = limit or self._cfg.max_list
-        res = await self.search_full(keyword, "auto", AGGREGATE_PER_SOURCE)
+        # 每源取 max(AGGREGATE_PER_SOURCE, limit) 条、分组前不整体截断：
+        # 交错序下 limit 条 ≈ 每源 limit/3，同名合并后只剩两三组
+        res = await self.search_full(keyword, "auto", per_source=limit)
         groups = group_versions(res.songs, preferred_first=self._cfg.default_source)
-        return groups[:limit], res.source
+        return groups[:limit], res.source, res.notices
 
     # ──────────── 分类型（WebUI 标签页）────────────
     async def typed(self, keyword: str, type_: str = "song", limit: int = 10) -> list[dict]:
@@ -149,7 +174,9 @@ class SongSearch:
         return interleave(buckets)
 
     async def _one_typed(self, source: str, keyword: str, type_: str, limit: int) -> list[dict]:
-        client = self._clients[source]
+        client = self._clients.get(source)
+        if client is None:  # 与 one() 同因：注册表跳过的源不能裸下标
+            return []
         param = MULTI_TYPE_PARAM.get(type_, {}).get(source)
         if param is None:
             return []

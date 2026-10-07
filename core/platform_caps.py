@@ -28,7 +28,6 @@ class PlatformCaps:
     local_image: bool = True  # 本地图片（渲染卡片）
     native_card: bool = False  # OneBot 原生音乐小程序卡
     passive_limited: bool = False  # 被动回复受限（文本+媒体合并发送省配额）
-    ffmpeg_voice: bool = True  # 语音需要预压缩（协议端不自动转码的走压缩）
     notes: dict = field(default_factory=dict)
 
 

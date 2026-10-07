@@ -10,15 +10,5 @@ SOURCE_KG = "kg"
 SOURCE_QQ = "qq"
 
 SOURCE_NAMES = {SOURCE_NCM: "网易云音乐", SOURCE_KG: "酷狗音乐", SOURCE_QQ: "QQ音乐"}
-# 各音源品牌色（列表卡片音源标签 / WebUI 色板）
-SOURCE_COLORS = {SOURCE_NCM: "#ec4141", SOURCE_KG: "#2ca6e0", SOURCE_QQ: "#31c27c"}
 
 SOURCES = (SOURCE_NCM, SOURCE_KG, SOURCE_QQ)
-
-# 各音源的默认 API 基础地址。ncm/kg 需要外部 HTTP 服务，qq 走进程内内置库。
-# 各项留空时回落到这里，保证开箱即可用（AstrBot 不会给已存在的键改默认值，
-# 所以回落必须同时存在于 schema default 与代码常量两处）。
-DEFAULT_API_BASE = {
-    SOURCE_NCM: "http://120.26.120.184:3000",
-    SOURCE_KG: "http://127.0.0.1:4000",
-}

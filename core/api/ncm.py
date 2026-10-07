@@ -6,25 +6,21 @@ body.code=301 都抛 ApiError。接口缓存 2 分钟，登录/轮询类请求�
 
 from __future__ import annotations
 
-import asyncio
 import re
 import time
-
-import aiohttp
 
 from ..errors import NCM_ERRORS, ApiError, NotEnabledError
 from ..quality import NCM_LABEL, ladder_for
 from .http import (
-    API_TIMEOUT_SEC,
     collect,
     data_of,
-    get_session,
+    format_duration,
     list_of,
     merge_cookie,
     num,
     opt_int,
-    query_safe,
-    safe_url,
+    request_json,
+    with_ts,
 )
 from .registry import register
 
@@ -46,6 +42,12 @@ def _err_msg(code, status: int = 0) -> str:
     return "请求失败"
 
 
+def _pic_url(raw, size: str = "300y300") -> str:
+    """封面地址拼 CDN 尺寸参数；字段缺失返回空串，不产出只有 ?param= 的垃圾地址。"""
+    base = str(raw or "").strip()
+    return f"{base}?param={size}" if base else ""
+
+
 def normalize_song(item: dict, idx: int = 0) -> dict | None:
     if not isinstance(item, dict):
         return None
@@ -64,9 +66,7 @@ def normalize_song(item: dict, idx: int = 0) -> dict | None:
     if priv.get("fee") is not None:
         fee = int(num(priv.get("fee")))
     mvid = item.get("mvid") or item.get("mv") or 0
-    cover = album.get("picUrl") or ""
-    if cover:
-        cover += "?param=300y300"
+    cover = _pic_url(album.get("picUrl"))
     return {
         "index": idx + 1,
         "source": "ncm",
@@ -76,7 +76,7 @@ def normalize_song(item: dict, idx: int = 0) -> dict | None:
         "artist": artist,
         "album": album.get("name") or "",
         "cover": cover,
-        "duration": _dur(dt),
+        "duration": format_duration(dt, "ms"),
         "dtMs": int(dt),
         "pay": fee in (1, 4),
         "trial": fee == 8,
@@ -84,13 +84,6 @@ def normalize_song(item: dict, idx: int = 0) -> dict | None:
         "fee": fee,
         "raw": {},
     }
-
-
-def _dur(dt: float) -> str:
-    if dt <= 0:
-        return ""
-    sec = int(dt / 1000)
-    return f"{sec // 60:02d}:{sec % 60:02d}"
 
 
 def normalize_playlist(item: dict, idx: int = 0) -> dict | None:
@@ -104,7 +97,7 @@ def normalize_playlist(item: dict, idx: int = 0) -> dict | None:
         "index": idx + 1,
         "id": str(item.get("id") or ""),
         "name": str(name),
-        "cover": (item.get("picUrl") or item.get("coverImgUrl") or "") + "?param=300y300",
+        "cover": _pic_url(item.get("picUrl") or item.get("coverImgUrl")),
         "playCount": int(num(item.get("playCount"))),
         "trackCount": int(num(item.get("trackCount"))),
         "creator": creator.get("nickname") or "",
@@ -123,7 +116,7 @@ def normalize_album(item: dict, idx: int = 0) -> dict | None:
         "index": idx + 1,
         "id": str(item.get("id") or ""),
         "name": str(name),
-        "cover": (item.get("picUrl") or item.get("pic") or "") + "?param=300y300",
+        "cover": _pic_url(item.get("picUrl") or item.get("pic")),
         "artist": artist,
         "songCount": int(num(item.get("size") or item.get("songCount"))),
     }
@@ -139,7 +132,7 @@ def normalize_artist(item: dict, idx: int = 0) -> dict | None:
         "index": idx + 1,
         "id": str(item.get("id") or ""),
         "name": str(name),
-        "cover": (item.get("picUrl") or item.get("img1v1Url") or "") + "?param=300y300",
+        "cover": _pic_url(item.get("picUrl") or item.get("img1v1Url")),
         "sub": "",
     }
 
@@ -171,40 +164,18 @@ class NeteaseClient:
         return base
 
     async def request(self, pathname: str, params: dict | None = None, *, with_cookie: bool = True) -> dict:
-        from ..ratelimit import limiter
-
         base = self._require_base()
-        await limiter.acquire("ncm")
         params = dict(params or {})
         if with_cookie:
             extra = params.pop("cookie", "")
             merged = merge_cookie(self.cookie, extra)
             if merged:
                 params["cookie"] = merged
-        url = f"{base}{pathname if pathname.startswith('/') else '/' + pathname}"
-        timeout = aiohttp.ClientTimeout(total=API_TIMEOUT_SEC)
-        try:
-            async with get_session().get(url, params=query_safe(params), timeout=timeout) as res:
-                return await self._handle(res, pathname)
-        except aiohttp.ClientConnectorError as e:
-            raise ApiError(f"无法连接网易云 API（{safe_url(base)}），请确认服务已启动", source="ncm") from e
-        except aiohttp.ServerTimeoutError as e:
-            raise ApiError("请求超时", source="ncm", timeout=True) from e
-        except aiohttp.ClientError as e:
-            raise ApiError(f"网络错误（{type(e).__name__}）：{safe_url(url)}", source="ncm") from e
-        except asyncio.TimeoutError as e:
-            # ClientTimeout(total=...) 到期：3.10 抛 asyncio.TimeoutError，3.11 起与内建 TimeoutError 同一类型
-            raise ApiError("请求超时", source="ncm", timeout=True) from e
+        status, body = await request_json("ncm", "网易云 API", base, pathname, params, net_err_with_url=True)
+        return self._handle(body, status, pathname)
 
-    async def _handle(self, res: aiohttp.ClientResponse, pathname: str) -> dict:
-        status = res.status
-        try:
-            body = await res.json(content_type=None)
-        except Exception:
-            text = (await res.text())[:200]
-            raise ApiError(f"返回非 JSON（HTTP {status}）：{text}", source="ncm") from None
-        if not isinstance(body, dict):
-            raise ApiError(f"返回格式异常（HTTP {status}）", source="ncm")
+    def _handle(self, body: dict, status: int, pathname: str) -> dict:
+        """业务级错误映射。传输/解析层（网络异常、非 JSON）在 http.request_json。"""
         if status >= 400:
             code = body.get("code")
             msg = body.get("msg") or body.get("message") or ""
@@ -213,14 +184,12 @@ class NeteaseClient:
             raise ApiError(NCM_ERRORS[301], code=301, source="ncm", payload=body)
         return body
 
-    @staticmethod
-    def _ts(params: dict) -> dict:
-        """防 api-enhanced 2 分钟 URL 缓存。"""
-        params["timestamp"] = int(time.time() * 1000)
-        return params
+    # with_ts 的语义与旧 _ts 一致（调用点全传新造的字面量 dict），实现收敛到 http 单处
+    _ts = staticmethod(with_ts)
 
     # ──────────── 搜索 ────────────
     async def search(self, keyword: str, limit: int = 10, type_: int = 1, page: int = 0) -> list[dict]:
+        """page 从 0 起（offset = page*limit）——酷狗/QQ 都是 1 起，跨源传值时注意。"""
         body = await self.request(
             "/cloudsearch", {"keywords": keyword, "type": type_, "limit": limit, "offset": page * limit}
         )
@@ -360,7 +329,7 @@ class NeteaseClient:
 
     async def _check_vip_privilege(self) -> bool:
         try:
-            body = await self.request("/vip/info")
+            body = await self.request("/vip/info", self._ts({}))
             data = data_of(body)
             for key in ("redplus", "associator", "musicPackage"):
                 node = data.get(key) if isinstance(data.get(key), dict) else {}
@@ -438,7 +407,7 @@ class NeteaseClient:
                 "id": str(it.get("id") or ""),
                 "name": it.get("name") or "",
                 "sub": f"{it.get('updateFrequency') or ''}",
-                "cover": (it.get("coverImgUrl") or "") + "?param=300y300",
+                "cover": _pic_url(it.get("coverImgUrl")),
                 "tag": "",
             }
             for i, it in enumerate(items)
@@ -473,7 +442,7 @@ class NeteaseClient:
                         "id": str(it.get("id") or ""),
                         "name": it.get("name"),
                         "sub": f"热度 {it.get('score') or ''}".strip(),
-                        "cover": (it.get("picUrl") or it.get("img1v1Url") or "") + "?param=300y300",
+                        "cover": _pic_url(it.get("picUrl") or it.get("img1v1Url")),
                     }
                 )
         return out
@@ -485,7 +454,7 @@ class NeteaseClient:
         return {
             "id": str(node.get("id") or pid),
             "name": node.get("name") or "",
-            "cover": (node.get("coverImgUrl") or "") + "?param=500y500",
+            "cover": _pic_url(node.get("coverImgUrl"), "500y500"),
             "creator": (node.get("creator") or {}).get("nickname")
             if isinstance(node.get("creator"), dict)
             else "",
@@ -533,12 +502,6 @@ class NeteaseClient:
             params["cat"] = cat
         body = await self.request("/top/playlist", params)
         return collect(body.get("playlists"), normalize_playlist, 15)
-
-    async def playlist_hot_tags(self) -> list[str]:
-        body = await self.request("/playlist/hot")
-        return [
-            str(t.get("name")) for t in list_of(body.get("tags")) if isinstance(t, dict) and t.get("name")
-        ][:20]
 
     async def album_detail(self, aid: str) -> dict:
         body = await self.request("/album", {"id": aid})
@@ -599,17 +562,23 @@ class NeteaseClient:
         return collect(songs, normalize_song, 20)
 
     async def daily_recommend(self) -> list[dict]:
-        body = await self.request("/recommend/songs")
+        body = await self.request("/recommend/songs", self._ts({}))
         data = body.get("data") if isinstance(body.get("data"), dict) else {}
         return collect(data.get("dailySongs"), normalize_song, 30)
 
     async def personal_fm(self) -> list[dict]:
-        body = await self.request("/personal_fm")
-        # 实测 data 本身就是歌曲数组（不是 {song_list|songs} 字典）
-        return collect(list_of(body.get("data")), normalize_song, 10)
+        body = await self.request("/personal_fm", self._ts({}))
+        # /api/v1/radio/get 的 data[] 元素是电台节目对象，歌曲在 mainSong/mainMusic 里；
+        # 兼容平铺形状（元素本身是歌曲时 or 链原样透传），两种上游形态都不丢数据
+        items = [
+            it.get("mainSong") or it.get("mainMusic") or it
+            for it in list_of(body.get("data"))
+            if isinstance(it, dict)
+        ]
+        return collect(items, normalize_song, 10)
 
     async def recommend_playlists(self) -> list[dict]:
-        body = await self.request("/recommend/resource")
+        body = await self.request("/recommend/resource", self._ts({}))
         return collect(body.get("recommend"), normalize_playlist, 15)
 
     async def banners(self) -> list[dict]:
@@ -619,7 +588,7 @@ class NeteaseClient:
                 "index": i + 1,
                 "name": it.get("typeTitle") or "",
                 "sub": it.get("label") or "",
-                "cover": (it.get("imageUrl") or it.get("bigImageUrl") or "") + "?param=400y160",
+                "cover": _pic_url(it.get("imageUrl") or it.get("bigImageUrl"), "400y160"),
                 "target": it.get("url") or "",
             }
             for i, it in enumerate(list_of(body.get("banners")))
@@ -634,8 +603,8 @@ class NeteaseClient:
                 "id": str(it.get("id") or ""),
                 "name": it.get("name") or "",
                 "artist": it.get("artistName") or "",
-                "cover": (it.get("cover") or "") + "?param=300y180",
-                "duration": _dur(num(it.get("duration"))),
+                "cover": _pic_url(it.get("cover"), "300y180"),
+                "duration": format_duration(num(it.get("duration")), "ms"),
                 "playCount": int(num(it.get("playCount"))),
             }
             for i, it in enumerate(list_of(body.get("data")))
@@ -650,7 +619,7 @@ class NeteaseClient:
                 "id": str(it.get("id") or ""),
                 "name": it.get("name") or "",
                 "sub": f"{it.get('category') or ''} · {int(num(it.get('programCount')))} 期".strip(" ·"),
-                "cover": (it.get("picUrl") or "") + "?param=300y300",
+                "cover": _pic_url(it.get("picUrl")),
                 "playCount": int(num(it.get("playCount"))),
             }
             for i, it in enumerate(list_of(body.get("djRadios")))
@@ -661,13 +630,14 @@ class NeteaseClient:
     async def comments(self, sid: str, limit: int = 12, kind: str = "music") -> dict:
         path = {"music": "/comment/music", "playlist": "/comment/playlist", "album": "/comment/album"}[kind]
         body = await self.request(path, {"id": sid, "limit": limit})
-        hot = collect(body.get("hotComments"), self._norm_comment, limit)
+        # 热评只能按来源打标：hotComments 条目并不带 hotComment 字段（按字段判定恒 False）
+        hot = collect(body.get("hotComments"), lambda it, i: self._norm_comment(it, i, hot=True), limit)
         new = collect(body.get("comments"), self._norm_comment, limit)
         total = int(num(body.get("total")))
         return {"hot": hot, "new": new, "total": total}
 
     @staticmethod
-    def _norm_comment(item: dict, idx: int = 0) -> dict | None:
+    def _norm_comment(item: dict, idx: int = 0, hot: bool = False) -> dict | None:
         if not isinstance(item, dict):
             return None
         user = item.get("user") if isinstance(item.get("user"), dict) else {}
@@ -685,11 +655,11 @@ class NeteaseClient:
         return {
             "index": idx + 1,
             "nick": user.get("nickname") or "匿名",
-            "avatar": (user.get("avatarUrl") or "") + "?param=80y80",
+            "avatar": _pic_url(user.get("avatarUrl"), "80y80"),
             "time": time_str,
             "likes": int(num(item.get("likedCount"))),
             "content": content[:300],
-            "hot": bool(item.get("hotComment")),
+            "hot": hot,
         }
 
     async def mv_url(self, mvid: str, r: int = 1080) -> dict:
@@ -722,8 +692,8 @@ class NeteaseClient:
                     "id": str(mv.get("id") or ""),
                     "name": mv.get("name"),
                     "artist": " / ".join(a.get("name") or "" for a in artists if isinstance(a, dict)),
-                    "cover": (mv.get("cover") or "") + "?param=300y180",
-                    "duration": _dur(num(mv.get("duration"))),
+                    "cover": _pic_url(mv.get("cover"), "300y180"),
+                    "duration": format_duration(num(mv.get("duration")), "ms"),
                     "playCount": int(num(mv.get("playCount"))),
                 }
             )
@@ -731,7 +701,7 @@ class NeteaseClient:
 
     # ---- 用户（需登录）----
     async def login_status(self) -> dict:
-        body = await self.request("/login/status")
+        body = await self.request("/login/status", self._ts({}))
         node = data_of(body)
         profile = node.get("profile") if isinstance(node.get("profile"), dict) else {}
         uid = str(profile.get("userId") or node.get("userId") or "")
@@ -739,22 +709,22 @@ class NeteaseClient:
             "loggedIn": bool(profile.get("userId")),
             "uid": uid,
             "nickname": profile.get("nickname") or "",
-            "avatar": (profile.get("avatarUrl") or "") + "?param=100y100",
+            "avatar": _pic_url(profile.get("avatarUrl"), "100y100"),
         }
 
     async def vip_info(self) -> dict:
-        body = await self.request("/vip/info")
+        body = await self.request("/vip/info", self._ts({}))
         data = data_of(body)
         red = data.get("redVipLevel") if isinstance(data.get("redVipLevel"), (int, float)) else 0
         return {"vipLevel": int(num(red)), "vipType": int(num(data.get("redVipType")))}
 
     async def like_list(self, uid: str) -> list[str]:
-        body = await self.request("/likelist", {"uid": uid})
+        body = await self.request("/likelist", self._ts({"uid": uid}))
         ids = body.get("ids") or []
         return [str(i) for i in ids if i]
 
     async def user_record(self, uid: str) -> list[dict]:
-        body = await self.request("/user/record", {"uid": uid, "type": 1})
+        body = await self.request("/user/record", self._ts({"uid": uid, "type": 1}))
         week = body.get("weekData") if isinstance(body.get("weekData"), list) else []
         out = []
         for i, it in enumerate(week[:20]):
@@ -769,7 +739,8 @@ class NeteaseClient:
 
     async def daily_signin(self) -> str:
         try:
-            body = await self.request("/daily_signin", {"type": 0})
+            # 签到是写操作，api-enhanced 对所有 200 响应缓存 2 分钟，必须带 timestamp 穿透
+            body = await self.request("/daily_signin", self._ts({"type": 0}))
             # 响应是嵌套结构 {android:{code}, web:{code}}（module 注释），顶层 code 兼容
             code = opt_int(body.get("code"))
             if code is None:
@@ -781,13 +752,16 @@ class NeteaseClient:
                 return "今天已经签到过啦"
             return f"签到返回 {code}"
         except ApiError as e:
-            # 重复签到上游以 HTTP 400 + code=-2 返回
-            if opt_int(e.code) == -2:
+            # 重复签到上游以 HTTP 400 + 嵌套 code=-2 返回（{android:{code},web:{code}}，
+            # 无顶层 code），而 _handle 在 ≥400 时只提取顶层 code —— e.code 恒为 None，
+            # 必须从 payload 里解嵌套
+            nested = e.payload.get("android") or e.payload.get("web") or {}
+            if opt_int(nested.get("code")) == -2:
                 return "今天已经签到过啦"
             return e.user_msg()
 
     async def user_cloud(self, limit: int = 30) -> list[dict]:
-        body = await self.request("/user/cloud", {"limit": limit})
+        body = await self.request("/user/cloud", self._ts({"limit": limit}))
         items = list_of((body.get("data") or {}).get("list") if isinstance(body.get("data"), dict) else [])
         out = []
         for i, it in enumerate(items):
@@ -800,13 +774,13 @@ class NeteaseClient:
                     "name": it.get("songName") or it.get("fileName") or "",
                     "artist": it.get("artist") or "",
                     "album": it.get("album") or "",
-                    "size": f"{int(num(it.get('fileSize')) / 1024 / 1024):.1f}MB",
+                    "size": f"{num(it.get('fileSize')) / 1048576:.1f}MB",
                 }
             )
         return out
 
     async def recent_songs(self, limit: int = 30) -> list[dict]:
-        body = await self.request("/record/recent/song", {"limit": 100})
+        body = await self.request("/record/recent/song", self._ts({"limit": 100}))
         data = body.get("data") if isinstance(body.get("data"), dict) else {}
         items = list_of(data.get("list"))
         out = []
@@ -814,8 +788,12 @@ class NeteaseClient:
             node = it.get("data") if isinstance(it.get("data"), dict) else {}
             if not node:
                 continue
+            # 上游层级随版本漂移：list[].data.resourceList.songInfo 之外，
+            # 也存在 data 直接是歌曲对象的返回。resourceList 取不到就按歌曲字段探测 node 本身
             res = node.get("resourceList") if isinstance(node.get("resourceList"), dict) else {}
             song = res.get("songInfo") if isinstance(res.get("songInfo"), dict) else {}
+            if not song and (node.get("name") or node.get("songName")):
+                song = node
             norm = normalize_song(song)
             if norm:
                 ts = num(it.get("playTime")) / 1000
@@ -824,7 +802,7 @@ class NeteaseClient:
         return out[:limit]
 
     async def user_playlists(self, uid: str) -> list[dict]:
-        body = await self.request("/user/playlist", {"uid": uid})
+        body = await self.request("/user/playlist", self._ts({"uid": uid}))
         return collect(body.get("playlist"), normalize_playlist, 30)
 
     async def like_song(self, sid: str, like: bool) -> str:
@@ -839,7 +817,7 @@ class NeteaseClient:
         raise ApiError("红心操作失败", source="ncm")
 
     async def history_recommend(self) -> list[dict]:
-        body = await self.request("/history/recommend/songs")
+        body = await self.request("/history/recommend/songs", self._ts({}))
         data = body.get("data") if isinstance(body.get("data"), dict) else {}
         songs = list_of(data.get("songs"))
         # 不走 /history/recommend/songs/detail 兜底：该接口 date 必选且服务端无 dates

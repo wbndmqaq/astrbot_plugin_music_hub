@@ -61,7 +61,7 @@
         "description": "api-enhanced 服务地址",
         "type": "string",
         "default": "http://120.26.120.184:3000",
-        "hint": "网易云音乐 API 服务地址（api-enhanced，默认端口 3000），默认已填好公共实例 http://120.26.120.184:3000，开箱即用。自建请改为自己的地址，如 http://127.0.0.1:3000（注意这是网易云的 3000 端口，酷狗用4000，两者不要冲突）。"
+        "hint": "网易云 API 服务地址（api-enhanced），默认公共实例 http://120.26.120.184:3000 开箱即用；自建改为自己的地址，如 http://127.0.0.1:3000。留空则停用网易云音源。"
       },
       "cookie": {
         "description": "登录 Cookie",
@@ -100,14 +100,14 @@
         "description": "KuGouMusicApi 服务地址",
         "type": "string",
         "default": "http://127.0.0.1:4000",
-        "hint": "酷狗音乐 API 服务地址，默认已填好本机自建服务 http://127.0.0.1:4000（KuGouMusicApi 的默认端口为 4000）。服务在别处时请改成实际地址。"
+        "hint": "酷狗 API 服务地址（KuGouMusicApi，默认端口 4000），默认已填本机自建 http://127.0.0.1:4000；服务在别处时改成实际地址。留空则停用酷狗音源。"
       },
       "cookie": {
         "description": "登录 Cookie",
         "type": "string",
         "default": "",
         "secret": true,
-        "hint": "扫码登录后自动写入（token=...;userid=...）。留空为匿名：搜索与免费歌可用、VIP 歌只有 60 秒试听；部分部署环境下匿名搜索可能被上游风控拦截，异常时请扫码登录。"
+        "hint": "扫码登录后自动写入（token=...;userid=...）。留空为匿名：免费歌可试播、VIP 歌只有 60 秒试听；酷狗已限制匿名搜索（错误码 152），请扫码登录后使用。"
       },
       "uid": {
         "description": "用户 ID",
@@ -121,7 +121,7 @@
         "options": ["auto", "128", "320", "flac"],
         "labels": ["自动", "标准", "HQ", "无损"],
         "default": "auto",
-        "hint": "蝰蛇/Super/Hi-Res 属新版取流端点，旧版 /song/url 不支持，已从选项移除。"
+        "hint": "取不到时自动按阶梯向下降级；无损上限为 flac。"
       },
       "trialFallback": {
         "description": "VIP 歌发试听片段",
@@ -184,7 +184,7 @@
     "description": "失败时压缩重试",
     "type": "bool",
     "default": true,
-    "hint": "无损/大文件发送失败时用 ffmpeg 压成 mp3 重试（需系统安装 ffmpeg）。"
+    "hint": "OneBot 文件通道发送 >5MB 文件时将直接发送压缩版（文件名带 _压缩版），并非发送失败后才重试；需系统安装 ffmpeg。"
   },
   "compressBitrate": {
     "description": "压缩码率 (kbps)",
@@ -195,7 +195,7 @@
       "max": 320,
       "step": 32
     },
-    "hint": "32-320，发送失败压缩重试时的 mp3 码率。"
+    "hint": "32-320，压缩版 mp3 的码率（OneBot 文件通道 >5MB 文件的压缩版与语音压制共用）。"
   },
   "downloadTimeout": {
     "description": "下载超时 (ms)",
@@ -211,7 +211,8 @@
   "keepFileSec": {
     "description": "临时文件保留 (秒)",
     "type": "int",
-    "default": 60
+    "default": 60,
+    "hint": "5-3600。下载/转码完成后开始计时的保留时长，到点自动清理临时音频/文件。"
   },
   "sendNativeCard": {
     "description": "发送原生音乐卡片",
@@ -250,7 +251,8 @@
       "enable": {
         "description": "启用定时任务",
         "type": "bool",
-        "default": true
+        "default": true,
+        "hint": "关闭后每日签到、QQ 凭证保活与订阅推送（日推/歌手新歌）都不会执行；订阅指令仍可操作，但到点不会有任何推送。"
       },
       "signinHour": {
         "description": "每日执行时刻 (小时)",
@@ -315,7 +317,7 @@
         "description": "域名访问白名单",
         "type": "list",
         "default": [],
-        "hint": "用域名（而非 IP）访问面板时在此登记，如 panel.example.com，子域名自动放行；留空则只允许 IP / localhost 访问。"
+        "hint": "用域名（而非 IP）访问面板时在此登记，如 panel.example.com，子域名自动放行；留空则只允许 IP / localhost 访问。面板仅支持 http 直连访问（未做 TLS/反向代理适配，https 反代下写请求会被拒）。"
       },
       "port": {
         "description": "端口",
@@ -328,7 +330,7 @@
         "default": "",
         "secret": true,
         "obvious_hint": true,
-        "hint": "WebUI 登录密码（≥6 位）。留空则首次启动自动生成随机密码并写回此处。会话有效期 12 小时。"
+        "hint": "WebUI 登录密码（≥6 位，建议 12 位以上随机串——面板可改全部插件配置与投递消息）。留空则首次启动自动生成随机密码并写回此处。会话有效期 12 小时。"
       }
     }
   },

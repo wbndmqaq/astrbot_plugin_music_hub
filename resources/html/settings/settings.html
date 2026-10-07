@@ -4,16 +4,6 @@
 <head>
 <meta charset="UTF-8" />
 <style>
-  *{margin:0;padding:0;box-sizing:border-box}
-  :root{
-    --mh-nm:#ec4141;--mh-nm-deep:#c62f2f;--mh-hero-a:#ef4e44;--mh-hero-b:#d0362c;
-    --mh-card-a:#fdf8f7;--mh-card-b:#f9e9e6;--mh-soft:#fbeeea;--mh-muted:#8a5a52;
-    --mh-text:#3a1d18;--mh-chip:rgba(236,65,65,.09);--mh-line:rgba(236,65,65,.16);
-  }
-  html{width:fit-content}
-  body{font-family:"MiSans","HarmonyOS Sans SC","Microsoft YaHei UI","PingFang SC",sans-serif;
-    background:var(--mh-soft);color:var(--mh-text);-webkit-font-smoothing:antialiased}
-  .page{width:640px;padding:26px 22px}
   .hero{position:relative;overflow:hidden;border-radius:26px 26px 22px 22px;padding:26px 26px 22px;
     background:linear-gradient(135deg,var(--mh-hero-a),var(--mh-hero-b));color:#fff;isolation:isolate}
   .hero::before{content:"";position:absolute;inset:0;z-index:-1;
@@ -48,8 +38,10 @@
 <body>
 <div class="page">
   <div class="hero">
+    {# defaultSource 存的是英文枚举，直接吐给用户看不懂，这里映射成中文名 #}
+    {% set src_names = {'auto':'聚合','ncm':'网易云','kg':'酷狗','qq':'QQ 音乐'} %}
     <div class="hero-title">{{ data.title }}</div>
-    <div class="hero-sub">默认音源：{{ data.defaultSource }} · 列表数 {{ data.maxList }} · WebUI 端口 {{ data.webui.port }}{{ '（启用）' if data.webui.enabled else '（未启用）' }}</div>
+    <div class="hero-sub">默认音源：{{ src_names.get(data.defaultSource, data.defaultSource) }} · 列表数 {{ data.maxList }} · WebUI 端口 {{ data.webui.port }}{{ '（启用）' if data.webui.enabled else '（未启用）' }}</div>
   </div>
   <div class="body-card">
     <div class="sec-title">音源</div>
@@ -63,7 +55,7 @@
     {% endfor %}
     <div class="sec-title">开关</div>
     <div class="toggles">
-      {% for t in data.toggles %}
+      {% for t in data.toggles or [] %}
       <div class="tg"><span>{{ t.name }}</span><span class="st {{ 'on' if t.on else 'off' }}">{{ '开' if t.on else '关' }}</span></div>
       {% endfor %}
     </div>

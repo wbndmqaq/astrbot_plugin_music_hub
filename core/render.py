@@ -5,6 +5,9 @@
 - 浏览器运行时收敛为 :class:`Renderer` 实例，随 service 创建/销毁。
   启动失败的状态在 close() 时归位，插件重载后可重新尝试启动，
   不会因一次失败永久短路（模块级失败标记就无法恢复）。
+  运行期崩溃（Chromium 进程被系统杀掉）同样可自愈：_ensure_browser 的
+  is_connected() 预检与 render() 捕获「已关闭」类异常后归位实例，
+  下次渲染自动走完整重启，无需重载插件。
 - 模板编译缓存仍为模块级（跨实例复用，模板内容不变时无需重编译）。
 - 截图 ``animations="disabled"``：入场动画直接跳到末态，不会截到半程。
 - 渲染环境缺失属稳定状态，失败后即时回退纯文本，不影响点歌。
@@ -52,8 +55,44 @@ def _log_env_hint(reason: str) -> None:
     logger.error(f"{TAG} 卡片渲染不可用（{reason}）。\n{_RENDER_TUTORIAL}")
 
 
+# Chromium 进程死亡时 playwright 抛出的错误特征：各版本措辞不一，按消息宽匹配；
+# 新版另有专用异常类型 TargetClosedError（消息可能为空），按类型补一刀。
+# 命中即认为浏览器实例已死、归位走完整重启；其余异常不归位，维持原语义上抛。
+_BROWSER_DEAD_MARKERS = (
+    "target closed",
+    "target page, context or browser has been closed",
+    "browser has been closed",
+    "connection closed",
+)
+
+
+def _browser_dead(e: BaseException) -> bool:
+    msg = str(e).lower()
+    if any(m in msg for m in _BROWSER_DEAD_MARKERS):
+        return True
+    cls = type(e)
+    return cls.__name__ == "TargetClosedError" and cls.__module__.startswith("playwright")
+
+
 # ──────────── 模板（跨实例共享，模板内容不变时无需重编译） ────────────
 _compiled_templates: dict[str, object] = {}
+
+# 9 个渲染模板共用的基础样式（:root 调色板 / 字体栈 / 页宽），由渲染通道在
+# 编译时统一注入首个 </style> 前 —— 曾因逐模板复制粘贴发生 :root 漂移。
+# 各模板的 hero 渐变 / 噪点参数并不一致，不能一并抽上来，仍留在各自模板里。
+_BASE_CSS = """\
+*{margin:0;padding:0;box-sizing:border-box}
+:root{
+  --mh-nm:#ec4141;--mh-nm-deep:#c62f2f;--mh-hero-a:#ef4e44;--mh-hero-b:#d0362c;
+  --mh-card-a:#fdf8f7;--mh-card-b:#f9e9e6;--mh-soft:#fbeeea;--mh-muted:#8a5a52;
+  --mh-text:#3a1d18;--mh-chip:rgba(236,65,65,.09);--mh-line:rgba(236,65,65,.16);
+  --src-ncm:#ec4141;--src-kg:#2ca6e0;--src-qq:#31c27c;
+}
+html{width:fit-content}
+body{font-family:"MiSans","HarmonyOS Sans SC","Microsoft YaHei UI","PingFang SC",sans-serif;
+  background:var(--mh-soft);color:var(--mh-text);-webkit-font-smoothing:antialiased}
+.page{width:640px;padding:26px 22px}
+"""
 
 
 def _compile_template(tmpl_path: str):
@@ -61,6 +100,10 @@ def _compile_template(tmpl_path: str):
 
     with open(tmpl_path, encoding="utf-8") as f:
         src = f.read()
+    # 基础样式统一注入：选择器（*、html、body、:root、.page）与模板特有规则
+    # 无重叠，注入位置（同一样式块末尾）不影响最终视觉
+    if "</style>" in src:
+        src = src.replace("</style>", _BASE_CSS + "</style>", 1)
     # ChainableUndefined：缺失键返回自身（falsy），任意属性/索引访问都不报错。
     # 卡片模板大量使用 {{ a.b.c }} 形式的可选字段，直接用 Jinja 原生能力兜底。
     return jinja2.Template(
@@ -95,7 +138,13 @@ class Renderer:
 
     async def _ensure_browser(self):
         if self._browser is not None:
-            return self._browser
+            # 廉价预检：is_connected() 只读本地连接状态，不发 IO。Chromium 进程
+            # 被系统杀掉后实例仍在但已死，不归位的话每次渲染都撞同一处 new_page
+            # 异常，一路回退文本直到重载插件
+            if self._browser.is_connected():
+                return self._browser
+            await self._discard_browser()
+            # 归位后落到下方完整重启
         if self._disabled:
             return None
         try:
@@ -127,12 +176,34 @@ class Renderer:
                 return None
         return self._browser
 
+    async def _discard_browser(self) -> None:
+        """把疑似已死的浏览器实例归位（关闭动作全部 suppress），下次调用走完整重启。
+
+        与 close() 的区别：不复位 _disabled——缺依赖属稳定状态，不因一次进程
+        崩溃翻转。先摘引用再 stop：并发重载可能在我们 await 期间装上新实例，
+        await 回来后只许动捕获的旧 pw，不能把新实例的字段清掉。"""
+        pw = self._pw
+        self._pw = None
+        self._browser = None
+        if pw is not None:
+            with contextlib.suppress(Exception):
+                await pw.stop()
+
     async def render(self, html: str, out_path: str, bg: str) -> bool:
         """渲染 HTML → PNG。成功返回 True，失败返回 False（调用方回退纯文本）。"""
         browser = await self._ensure_browser()
         if browser is None:
             return False
-        page = await browser.new_page(viewport={"width": 640, "height": 2200}, device_scale_factor=3)
+        try:
+            page = await browser.new_page(viewport={"width": 640, "height": 2200}, device_scale_factor=3)
+        except Exception as e:  # noqa: BLE001
+            if not _browser_dead(e):
+                raise
+            # 预检与取用之间的窗口期里进程死亡：归位后下次调用走完整重启，
+            # 而不是在这个坏实例上永久失败、渲染一路静默回退文本
+            logger.error(f"{TAG} Chromium 已崩溃，渲染器将自动重启: {e}")
+            await self._discard_browser()
+            return False
         try:
             try:
                 await page.set_content(html, wait_until="networkidle", timeout=12000)
@@ -170,10 +241,14 @@ class Renderer:
             return True
         except Exception as e:  # noqa: BLE001
             logger.error(f"{TAG} 渲染失败: {e}")
-            _remove_output(out_path)
+            if _browser_dead(e):
+                # 渲染中途进程死亡同样归位：否则实例永远占着位子，
+                # 后续每次渲染都在坏实例上失败，直到重载插件
+                await self._discard_browser()
+            await asyncio.to_thread(_remove_output, out_path)
             return False
         except BaseException:
-            _remove_output(out_path)
+            await asyncio.to_thread(_remove_output, out_path)
             raise
         finally:
             with contextlib.suppress(Exception):

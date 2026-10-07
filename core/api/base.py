@@ -74,7 +74,7 @@ class SourceClient(Protocol):
         ...
 
     async def login_status(self) -> dict:
-        """当前登录态 {logged, uid, nickname}。"""
+        """当前登录态 {loggedIn, uid, nickname}。"""
         ...
 
     async def vip_info(self) -> dict:
@@ -101,4 +101,8 @@ def missing_methods(client: Any) -> list[str]:
     启动期自检用：缺方法在这里暴露，而不是等用户点歌时的 AttributeError。
     """
     required = _TRACK_METHODS + _ACCOUNT_METHODS + ("ready",)
-    return [m for m in required if not callable(getattr(client, m, None))]
+    missing = [m for m in required if not callable(getattr(client, m, None))]
+    # source 是属性不是方法，单独查：缺了它错误文案的 with_source 会拿到空前缀
+    if not getattr(client, "source", None):
+        missing.append("source")
+    return missing

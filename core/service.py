@@ -18,18 +18,18 @@ from pathlib import Path
 from astrbot.api import logger
 from astrbot.api.message_components import Image, Plain
 
-from . import PLUGIN_NAME, SOURCE_KG, SOURCE_NAMES, SOURCES
+from . import PLUGIN_NAME, SOURCE_KG, SOURCE_NAMES, SOURCE_NCM, SOURCES
+from . import color as mh_color
 from .acl import Acl
-from .api import close_session
+from .api import close_session, missing_methods
 from .api import create as create_clients
-from .api import verify as verify_contracts
 from .cards import (
     build_detail_card_data,
     build_help_data,
     build_list_card_data,
     build_settings_data,
 )
-from .config import Config
+from .config import Config, as_int
 from .delivery import deliver_song, schedule_cleanup
 from .errors import ApiError, NotEnabledError, TooManyTasks
 from .formatters import format_detail_text, format_list_text
@@ -75,16 +75,19 @@ class MusicService:
 
         # 音源实例来自注册表：新增平台只要在 core/api 下实现 SourceClient 并 register，
         # 这里与 handlers 都不需要改。契约不完整的音源在启动日志里点名，不留到点歌时。
-        problems = verify_contracts(
-            config, device_path=data_dir / "device_cookies.json", cred_path=data_dir / "qq_credential.json"
-        )
-        for src, missing in problems.items():
-            logger.warning(f"{TAG} 音源 {src} 未实现协议方法：{missing}")
+        # 契约检查直接复用 create 出的实例，不再为自检重复实例化一遍。
         clients = create_clients(
             config,
-            device_path=data_dir / "device_cookies.json",
-            cred_path=data_dir / "qq_credential.json",
+            # registry.create 把全部 kwargs 原样转发给每个工厂，参数名必须与各工厂
+            # 声明的一一对应：酷狗与 QQ 的设备持久化格式互不兼容（酷狗是 dfid cookie，
+            # QQ 是 qqmusic_api 指纹），共用一个文件会在每次重启时互相覆盖。
+            kg_device_path=data_dir / "device_cookies.json",
+            qq_device_path=data_dir / "qq_device.json",
         )
+        for src, client in clients.items():
+            missing = missing_methods(client)
+            if missing:
+                logger.warning(f"{TAG} 音源 {src} 未实现协议方法：{missing}")
         self.ncm = clients.get("ncm")
         self.kg = clients.get("kg")
         self.qq = clients.get("qq")
@@ -109,7 +112,10 @@ class MusicService:
 
     # ──────────── 生命周期 ────────────
     async def initialize(self) -> None:
-        await asyncio.to_thread(self.kg.load_device)
+        # kg 工厂失败时 self.kg 为 None（registry 会跳过并告警）：这里若裸调会把
+        # 初始化失败放大成整个插件激活失败，违背单音源故障不拖垮其余音源的设计
+        if self.kg is not None:
+            await asyncio.to_thread(self.kg.load_device)
         limiter.update_interval(self.config.rate_limit_ms)
         await self.stats.start()
         await self.scheduler.start()
@@ -144,7 +150,11 @@ class MusicService:
         await _safe("登录会话", self.login.gc())
         await _safe("播放历史", self.sessions.close())
         await _safe("统计", self.stats.close())
-        await _safe("QQ 客户端", self.qq.close())
+        # QQ 库未安装时 self.qq 为 None：_safe 的 coro 参数先求值，裸调 .close()
+        # 会在兜底之外炸出 AttributeError，导致后面的 HTTP 会话与 Chromium 泄漏
+        if self.qq is not None:
+            await _safe("QQ 客户端", self.qq.close())
+        await _safe("封面取色", mh_color.close())
         await _safe("HTTP 会话", close_session())
         await _safe("渲染器", self.renderer.close())
         logger.info(f"{TAG} 已退出")
@@ -186,7 +196,15 @@ class MusicService:
         return self.plugin.context
 
     def client_of(self, source: str):
-        return self._clients[source]
+        """按音源取客户端。查无此源（依赖缺失 / 初始化失败 / source 为空）时抛
+        NotEnabledError 而不是裸 KeyError——后者会逃过 handler 侧的 ApiError
+        拦截一路炸到路由兜底，用户看到的不是可操作的提示。"""
+        client = self._clients.get(source)
+        if client is None:
+            raise NotEnabledError(
+                f"{SOURCE_NAMES.get(source, source)}音源不可用（未安装依赖或初始化失败）", source=source
+            )
+        return client
 
     # ---- KV 轻封装（订阅表 / umo 持久化）----
     async def get_kv(self, key: str, default=None):
@@ -198,8 +216,10 @@ class MusicService:
     async def put_kv(self, key: str, value) -> None:
         try:
             await self.plugin.put_kv_data(key, value)
-        except Exception:  # noqa: BLE001
-            pass
+        except Exception as e:  # noqa: BLE001
+            # 吞掉但不无声：订阅表 / 注册表 / 调度标记落盘失败若无痕，
+            # 表现为「数据莫名没存上」且排查无据
+            self.log_warn(f"KV 写入失败（{key}）：{e}")
 
     # ---- 会话注册表（scope → umo，远程投递 / 点歌台 / 订阅推送的前置）----
     def note_umo(self, event) -> None:
@@ -224,10 +244,11 @@ class MusicService:
         if umo:
             await self.send_to_umo(umo, text)
 
-    async def send_to_umo(self, umo: str, text: str) -> None:
-        from .remote import _send_text
+    async def send_to_umo(self, umo: str, text: str) -> bool:
+        """无事件向指定会话发文本，返回是否送达（订阅推送据它决定 seen 是否落盘）。"""
+        from .remote import send_text
 
-        await _send_text(self, umo, text)
+        return await send_text(self, umo, text)
 
     async def send_audio(self, scope: str, song: dict, play: dict | None = None, *, note: str = "") -> dict:
         umo = self.umo_of(scope)
@@ -331,7 +352,7 @@ class MusicService:
             info = await self.client_of(source).vip_info()
         except Exception:  # noqa: BLE001
             return ""
-        level = int((info or {}).get("vipLevel") or 0)
+        level = as_int((info or {}).get("vipLevel"), 0)
         if level <= 0:
             return ""
         expire = str((info or {}).get("expire") or "")
@@ -342,10 +363,10 @@ class MusicService:
         if source != SOURCE_KG:
             return ""
         try:
-            g = await self.kg.user_grade()
+            g = await self.client_of(SOURCE_KG).user_grade()
         except Exception:  # noqa: BLE001
             return ""
-        p = int((g or {}).get("p_grade") or 0)
+        p = as_int((g or {}).get("p_grade"), 0)
         return f"听歌等级 {p}" if p > 0 else ""
 
     # ──────────── 权限 / 开关 ────────────
@@ -371,9 +392,11 @@ class MusicService:
             return "点歌功能已关闭"
         return None
 
-    async def check_cooldown(self, event) -> str | None:
+    def check_cooldown(self, event) -> str | None:
         """同群点歌冷却；返回剩余提示或 None。通过时立即盖章（防同群并发连点），
-        没播出任何内容的场景（零结果 / 取流失败）由 :meth:`release_cooldown` 退还。"""
+        没播出任何内容的场景（零结果 / 取流失败）由 :meth:`release_cooldown` 退还。
+
+        纯内存查表无 await 点，保持同步：调用方少一层 await，语义也更直白。"""
         sec = self.config.cooldown_sec
         if sec <= 0:
             return None
@@ -385,7 +408,10 @@ class MusicService:
             return f"点歌冷却中，{remain} 秒后再试"
         self._cooldowns[scope] = now
         if len(self._cooldowns) > 256:
-            for k in list(self._cooldowns)[: len(self._cooldowns) - 128]:
+            # 按时间戳淘汰最旧的：dict 插入序 ≠ 最近使用（盖章只更新值不移动键），
+            # 按插入序清会把最早盖章、往往也最活跃的群先清掉
+            over = len(self._cooldowns) - 128
+            for k in sorted(self._cooldowns, key=self._cooldowns.get)[:over]:
                 self._cooldowns.pop(k, None)
         return None
 
@@ -428,8 +454,13 @@ class MusicService:
         res = await self.search.search_full(keyword, source, limit)
         return res.songs, res.source, res.notices
 
-    async def search_versions(self, keyword: str, limit: int | None = None) -> tuple[list[dict], str]:
-        """聚合搜索并按「同名同歌手」分组 → 多音源选择列表。"""
+    async def search_versions(
+        self, keyword: str, limit: int | None = None
+    ) -> tuple[list[dict], str, list[str]]:
+        """聚合搜索并按「同名同歌手」分组 → 多音源选择列表。
+
+        返回 (groups, source, notices)；notices 是聚合取数收集的登录提示，零结果时优先展示。
+        """
         return await self.search.versions(keyword, limit)
 
     async def play_group(self, event, group: dict, *, source: str = "") -> dict:
@@ -590,11 +621,20 @@ class MusicService:
         return result
 
     async def play_all(self, event, songs: list[dict]) -> dict:
-        """串行播放整个列表。"""
+        """串行播放整个列表。
+
+        聚合点歌存进会话的是分组 dict（带 versions 键、无顶层 source/sid），
+        直接喂给 play_song 会在 client_of("") 上炸 KeyError：遍历前先归一化到
+        可播放的版本条目。"""
+        fixed = []
+        for song in songs:
+            if song.get("versions"):
+                song = song.get("primary") or song["versions"][0]
+            fixed.append(song)
         ok, fail = 0, 0
-        total = min(len(songs), PLAY_ALL_LIMIT)
+        total = min(len(fixed), PLAY_ALL_LIMIT)
         await self.reply(event, f"开始连播 {total} 首（最多 {PLAY_ALL_LIMIT} 首）")
-        for i, song in enumerate(songs[:PLAY_ALL_LIMIT]):
+        for i, song in enumerate(fixed[:PLAY_ALL_LIMIT]):
             try:
                 result = await self.play_song(event, song, source_label="连播")
                 if result.get("ok"):
@@ -664,8 +704,10 @@ class MusicService:
         action = entry.get("action", "")
         if action:
             await self.sessions.clear_action(scope)
-        else:
-            await self.sessions.set(scope, entry.get("kind", "songs"), entry.get("data", {}))
+        # 无 action 时不做整包回写：get(refresh=True) 已续过内存 TTL，KV 不回写是
+        # session.py 声明过的可接受近似（跨重载剩余 TTL 偏短）。原先这里的 set 与
+        # 上面 get 之间没有锁，连点「听N」+「点歌 新词」交错时，旧 entry 的回写会
+        # 把刚写入的新列表顶掉（缓存与 KV 双写竞态）。
         return song, action
 
     # ──────────── 渲染 ────────────
@@ -770,8 +812,9 @@ class MusicService:
 
     # ──────────── 网易歌单便捷 ────────────
     async def ncm_playlist_songs(self, pid: str) -> tuple[dict, list[dict]]:
-        pl = await self.ncm.playlist_detail(pid)
-        songs = await self.ncm.playlist_songs(pid, LIST_SHOW_LIMIT)
+        ncm = self.client_of(SOURCE_NCM)
+        pl = await ncm.playlist_detail(pid)
+        songs = await ncm.playlist_songs(pid, LIST_SHOW_LIMIT)
         return pl, songs
 
     # ──────────── 帮助 / 设置数据（展示结构在 core.cards）────────────

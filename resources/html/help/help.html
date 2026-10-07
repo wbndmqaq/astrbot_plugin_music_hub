@@ -4,16 +4,6 @@
 <head>
 <meta charset="UTF-8" />
 <style>
-  *{margin:0;padding:0;box-sizing:border-box}
-  :root{
-    --mh-nm:#ec4141;--mh-nm-deep:#c62f2f;--mh-hero-a:#ef4e44;--mh-hero-b:#d0362c;
-    --mh-card-a:#fdf8f7;--mh-card-b:#f9e9e6;--mh-soft:#fbeeea;--mh-muted:#8a5a52;
-    --mh-text:#3a1d18;--mh-chip:rgba(236,65,65,.09);--mh-line:rgba(236,65,65,.16);
-  }
-  html{width:fit-content}
-  body{font-family:"MiSans","HarmonyOS Sans SC","Microsoft YaHei UI","PingFang SC",sans-serif;
-    background:var(--mh-soft);color:var(--mh-text);-webkit-font-smoothing:antialiased}
-  .page{width:640px;padding:26px 22px}
   .hero{position:relative;overflow:hidden;border-radius:26px 26px 22px 22px;padding:28px 26px 24px;
     background:linear-gradient(135deg,var(--mh-hero-a),var(--mh-hero-b));color:#fff;isolation:isolate}
   .hero::before{content:"";position:absolute;inset:0;z-index:-1;
@@ -70,10 +60,10 @@
   </div>
 
   <div class="body-card">
-    {% for sec in data.sections %}
+    {% for sec in data.sections or [] %}
     <div class="sec">
       <div class="sec-head"><span class="sec-dot"></span><span class="sec-title">{{ sec.title }}</span><span class="sec-tag">{{ sec.tag }}</span></div>
-      {% for it in sec.items %}
+      {% for it in sec.get("items") or [] %}
       <div class="cmd">
         <span class="cmd-name">{{ it.name }}</span>
         <div class="cmd-main">

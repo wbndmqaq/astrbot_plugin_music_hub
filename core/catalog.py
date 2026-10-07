@@ -68,7 +68,7 @@ class Resolution(NamedTuple):
 
     @property
     def found(self) -> bool:
-        """是否已定位到唯一目标（决定直接展开还是让用户二次选择）。"""
+        """是否已有曲目可展示。"""
         return bool(self.songs)
 
     def title_or(self, fallback: str) -> str:

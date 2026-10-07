@@ -89,7 +89,7 @@
 
   <!-- 多音源搜索 -->
   <section class="panel" id="panel-search" aria-label="多音源搜索">
-    <div class="hint-bar">输入关键词，<b>三平台并行搜索</b>并按「同名同歌手」聚合 —— 每首歌展示全部可用音源版本；切「歌单/专辑/歌手」看更多内容。</div>
+    <div class="hint-bar">三平台同时搜，同名同歌手的版本会合并到一起；切上方标签可搜歌单、专辑和歌手。</div>
     <div class="search-bar">
       <label class="sr-only" for="searchInput">搜索关键词</label>
       <input id="searchInput" class="input" placeholder="试着搜：晴天 / 海阔天空 / 周杰伦…" autocomplete="off" />
@@ -102,7 +102,7 @@
       <button class="stab" data-t="artist" aria-pressed="false">歌手</button>
     </div>
     <div class="remote-bar" id="remoteBar" hidden>
-      <label class="rb-label" for="remoteScope">投递到群</label>
+      <label class="rb-label" for="remoteScope">投递到会话</label>
       <select id="remoteScope" class="input sel-narrow"></select>
       <button class="btn btn-ghost btn-sm" data-act="remote-refresh">刷新会话</button>
     </div>
@@ -231,7 +231,7 @@
 
   <!-- 插件配置 -->
   <section class="panel" id="panel-config" aria-label="插件配置">
-    <div class="hint-bar">改动即时保存到插件配置；<b>WebUI 端口改动需重载插件</b>生效。</div>
+    <div class="hint-bar">改完点下方「保存全部」才会生效；WebUI 端口改动还需重载插件。</div>
     <div id="configBody"></div>
     <div class="config-foot"><button class="btn" data-act="cfg-save">保存全部</button></div>
   </section>
@@ -245,7 +245,7 @@
       <textarea id="resolveInput" class="input" rows="4" style="min-height:96px" placeholder="例如：https://music.163.com/song?id=186016  或  【周杰伦】晴天 https://c6.y.qq.com/..."></textarea>
       <div class="form-row">
         <button class="btn btn-blue" data-act="do-resolve">解析链接</button>
-        <span class="muted small">支持：网易云(163cn.tv 短链) · 酷狗(hash) · QQ音乐(c6 短链/JSON卡片)</span>
+        <span class="muted small">支持：网易云短链 · 酷狗分享链接 · QQ音乐短链和JSON卡片</span>
       </div>
       <div class="resolve-result" id="resolveResult" role="status" aria-live="polite" hidden></div>
     </div>

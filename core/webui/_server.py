@@ -36,7 +36,6 @@ PUBLIC_PATHS = {
     "/webui/logos/qq.png",
     "/api/meta",
     "/api/auth/login",
-    "/api/auth/check",
 }
 
 # 安全响应头：严格 CSP，脚本只允许本站
@@ -93,15 +92,23 @@ class WebUIServer:
 
     # ──────────── 中间件 ────────────
     async def _guard(self, request: web.Request, handler):
-        # Host 校验（防 DNS rebinding：非 IP / localhost / 白名单的域名一律拒绝）
-        if not await self._host_ok(request.headers.get("Host", "")):
+        host = request.headers.get("Host", "")
+        # 空 Host 一律 403：HTTP/1.1 客户端必须发送 Host 头，浏览器与 HTTP 库从不缺席，
+        # 能触发空 Host 的只有手工构造的原始报文 —— 拦在调用侧，不会误伤正常访问
+        if not host or not await self._host_ok(host):
             return _json({"error": "非法 Host：用域名访问面板需在插件配置 webui.hostAllowlist 登记"}, 403)
         # 非 GET 的 Origin 同源校验（防 CSRF）
         if request.method not in ("GET", "HEAD", "OPTIONS"):
             origin = request.headers.get("Origin", "")
             if origin:
-                if not self._origin_ok(origin, request.headers.get("Host", "")):
+                if not self._origin_ok(origin, host):
                     return _json({"error": "跨站请求被拒绝"}, 403)
+            # 第三层 CSRF：Sec-Fetch-Site 由浏览器自动附加且禁止脚本伪造，
+            # 值非同站直接拒绝（即使 Origin 被剥掉也拦得住）。该头只有现代浏览器才发，
+            # 缺席（老客户端/非浏览器工具）放行，仍由 Origin 同源 + SameSite cookie 兜底
+            site = request.headers.get("Sec-Fetch-Site", "")
+            if site and site not in ("same-origin", "same-site", "none"):
+                return _json({"error": "跨站请求被拒绝"}, 403)
         # 鉴权（default-deny）
         if request.path not in PUBLIC_PATHS and not self._authed(request):
             return _json({"error": "未登录或会话已过期"}, 401)
@@ -116,6 +123,8 @@ class WebUIServer:
         Origin 同源 + SameSite cookie 双层防线，这里只做严格白名单。
         """
         if not host:
+            # 空 Host 已在 _guard 统一 403（HTTP/1.1 必带 Host）；这里放行
+            # 只为兼容直调本方法的既有测试契约
             return True
         h = host.strip()
         if "@" in h:
@@ -163,13 +172,6 @@ class WebUIServer:
             request["jti"] = payload.get("jti", "")
             request["user"] = payload.get("sub", "")
             return True
-        # 也接受 Authorization: Bearer（SSE/下载便利）
-        auth_header = request.headers.get("Authorization", "")
-        if auth_header.startswith("Bearer "):
-            payload = self.auth.verify(auth_header[7:])
-            if payload:
-                request["jti"] = payload.get("jti", "")
-                return True
         return False
 
     async def _handle_errors(self, request: web.Request, handler):
@@ -204,8 +206,9 @@ class WebUIServer:
             resp.headers.setdefault("Referrer-Policy", "no-referrer")
             return resp
 
-        app = web.Application(middlewares=[security_headers_mw, errors_mw, guard_mw])
-        app["server"] = self
+        # client_max_size 显式钉在与 aiohttp 默认一致的 1MB：body_json 的 413 语义、
+        # /api/resolve 的文本量级都建立在这条契约上，隐式依赖默认值容易被无意改掉
+        app = web.Application(middlewares=[security_headers_mw, errors_mw, guard_mw], client_max_size=1024**2)
         r = app.router
         # 静态
         r.add_get("/", self._index)
@@ -221,7 +224,6 @@ class WebUIServer:
         r.add_get("/api/meta", self._meta)
         r.add_post("/api/auth/login", _api.make_login(self))
         r.add_post("/api/auth/logout", _api.make_logout(self))
-        r.add_get("/api/auth/check", _api.make_check(self))
         r.add_post("/api/auth/change-password", _api.make_change_password(self))
         r.add_get("/api/auth/sessions", _api.make_sessions(self))
         r.add_post("/api/auth/sessions/revoke", _api.make_revoke(self))
@@ -264,14 +266,22 @@ class WebUIServer:
         self._runner = web.AppRunner(
             app, access_log=None, shutdown_timeout=SHUTDOWN_TIMEOUT, keepalive_timeout=15
         )
-        await self._runner.setup()
-        site = web.TCPSite(self._runner, self.host, self.port)
+        # setup/start 的任何异常路径都必须清理 _runner 并置回 None：
+        # 残留会让重试在入口「已启动」分支静默短路，面板看似在跑实则没起，
+        # 只能靠重载插件自救
         try:
+            await self._runner.setup()
+            site = web.TCPSite(self._runner, self.host, self.port)
             await site.start()
         except OSError as e:
             await self._runner.cleanup()
             self._runner = None
             raise RuntimeError(f"WebUI 端口 {self.port} 启动失败：{e}") from e
+        except BaseException:
+            # 非 OSError（含 CancelledError）同样清理后再抛，保证可重试
+            await self._runner.cleanup()
+            self._runner = None
+            raise
         self.log.info(f"[music_hub] WebUI 已启动：http://{self.host}:{self.port}")
 
     async def stop(self) -> None:

@@ -13,19 +13,18 @@ import json
 import time
 from pathlib import Path
 
-import aiohttp
-
 from ..errors import KG_ERRORS, ApiError, NotEnabledError
 from ..quality import KG_LABEL, first, kg_hash_for, ladder_for
 from .http import (
-    API_TIMEOUT_SEC,
     collect,
     data_of,
+    format_duration,
     get_session,
     list_of,
     num,
     opt_int,
-    query_safe,
+    request_json,
+    with_ts,
 )
 from .registry import register
 
@@ -71,6 +70,8 @@ def normalize_song(item: dict, idx: int = 0) -> dict | None:
         cover = str(alinfo.get("cover") or "").replace("{size}", "300")
     h128 = str(ainfo.get("hash") or item.get("hash_128") or item.get("hash") or item.get("FileHash") or "")
     timelength = ainfo.get("timelength") or item.get("timelength") or item.get("time_length") or 0
+    # timelength 单位可静态确定为毫秒（见 _dur），显式传 "ms" 修复 <10s 音频被格式化成
+    # 150:00 的问题；Duration/duration 单位未知，退回 "auto" 猜测
     return {
         "index": idx + 1,
         "source": "kg",
@@ -80,7 +81,7 @@ def normalize_song(item: dict, idx: int = 0) -> dict | None:
         "artist": artist,
         "album": str(base.get("album_name") or item.get("AlbumName") or item.get("album_name") or ""),
         "cover": cover,
-        "duration": _dur(num(timelength) or num(item.get("Duration") or item.get("duration"))),
+        "duration": _dur(num(timelength), "ms") or _dur(num(item.get("Duration") or item.get("duration"))),
         "dtMs": int(num(timelength)),
         "pay": _paid(item),
         "trial": False,
@@ -91,11 +92,7 @@ def normalize_song(item: dict, idx: int = 0) -> dict | None:
             ainfo.get("hash_flac") or item.get("hash_flac") or _sub(item, "SQ").get("Hash") or ""
         ),
         "hash_high": str(
-            ainfo.get("hash_high")
-            or item.get("hash_high")
-            or _sub(item, "Res").get("Hash")
-            or item.get("hash_flac")
-            or ""
+            ainfo.get("hash_high") or item.get("hash_high") or _sub(item, "Res").get("Hash") or ""
         ),
         "raw": {},
     }
@@ -162,10 +159,18 @@ def _paid(item: dict) -> bool:
     return False
 
 
-def _dur(ms_or_sec: float) -> str:
-    if ms_or_sec <= 0:
+def _dur(value: float, unit: str = "auto") -> str:
+    """时长 → mm:ss。unit="ms" 恒按毫秒；"auto" 是兼容未知单位的阈值猜测：≥10000
+    视为毫秒、否则视为秒。猜测的边界（已知局限）：小于 10s 的音频（如 9000ms 试听）
+    会被当成 9000 秒格式化成 150:00；超过 10000s（约 2h47m）的秒值会被当成毫秒。
+    单位依据：timelength 系字段恒为毫秒（上游 audio_match 页 formatDuration 按 ms
+    处理、插件 dtMs 亦按 ms 消费），可显式传 "ms"；搜索结果的 Duration/duration
+    系字段单位在上游代理源码中无从核实，只能保留 "auto"。"""
+    if value <= 0:
         return ""
-    sec = int(ms_or_sec / 1000) if ms_or_sec >= 10000 else int(ms_or_sec)
+    if unit == "ms" or (unit == "auto" and value >= 10000):
+        value /= 1000
+    sec = int(value)
     return f"{sec // 60:02d}:{sec % 60:02d}"
 
 
@@ -350,44 +355,19 @@ class KugouClient:
         *,
         inject_cookie: bool = True,
     ) -> dict:
-        from ..ratelimit import limiter
-
         base = self._require_base()
-        await limiter.acquire("kg")
         params = dict(params or {})
-        url = f"{base}{pathname if pathname.startswith('/') else '/' + pathname}"
         if inject_cookie:
             caller = str(params.pop("cookie", "") or "")
             composed = self._compose_cookie(caller)
             if composed:
                 params["cookie"] = composed
-        timeout = aiohttp.ClientTimeout(total=API_TIMEOUT_SEC)
-        try:
-            sess = get_session()
-            if method == "get":
-                async with sess.get(url, params=query_safe(params), timeout=timeout) as res:
-                    return await self._handle(res, pathname)
-            async with sess.post(url, data=query_safe(params), timeout=timeout) as res:
-                return await self._handle(res, pathname)
-        except aiohttp.ClientConnectorError as e:
-            raise ApiError(f"无法连接酷狗 API（{base}），请确认 KuGouMusicApi 服务已启动", source="kg") from e
-        except aiohttp.ServerTimeoutError as e:
-            raise ApiError("请求超时", source="kg", timeout=True) from e
-        except aiohttp.ClientError as e:
-            raise ApiError(f"网络错误（{type(e).__name__}）", source="kg") from e
-        except asyncio.TimeoutError as e:
-            # ClientTimeout 到期：3.10 抛 asyncio.TimeoutError，3.11 起与内建 TimeoutError 同一类型
-            raise ApiError("请求超时", source="kg", timeout=True) from e
+        status, body = await request_json("kg", "酷狗 API", base, pathname, params, method=method)
+        return self._handle(body, status)
 
-    async def _handle(self, res: aiohttp.ClientResponse, pathname: str) -> dict:
-        status = res.status
-        try:
-            body = await res.json(content_type=None)
-        except Exception:
-            text = (await res.text())[:200]
-            raise ApiError(f"返回非 JSON（HTTP {status}，{pathname}）：{text}", source="kg") from None
-        if not isinstance(body, dict):
-            raise ApiError(f"返回格式异常（HTTP {status}）", source="kg")
+    def _handle(self, body: dict, status: int) -> dict:
+        """业务级错误映射。传输/解析层（网络异常、非 JSON）在 http.request_json；
+        status==0 是 KuGouMusicApi 的上游故障约定（HTTP 可能仍是 502/200）。"""
         if status >= 400 or body.get("status") == 0:
             code = body.get("error_code") or body.get("errcode") or body.get("err_code")
             msg = _upstream_msg(body)
@@ -396,11 +376,10 @@ class KugouClient:
             raise ApiError(err_msg, code=c, source="kg", payload=body)
         return body
 
-    @staticmethod
-    def _ts(params: dict | None = None) -> dict:
-        out = dict(params or {})
-        out["timestamp"] = int(time.time() * 1000)
-        return out
+    # 实现收敛到 http（with_ts / format_duration）；保留旧名以维持内部调用点与
+    # tests/test_v3_api 对 kg._dur 的引用不漂移
+    _ts = staticmethod(with_ts)
+    _dur = staticmethod(format_duration)
 
     # ──────────── 搜索 ────────────
     def require_login(self) -> None:
@@ -409,9 +388,11 @@ class KugouClient:
         未登录时提前拦截，避免发出注定失败的请求，也让上层能给出扫码引导。
         """
         if not self.cookie:
-            raise ApiError("酷狗搜索需登录，请先发送「kg登录」扫码", code=20010, source="kg")
+            # 不带 code：错误码表里 20010 是泛化文案，会盖掉这里的扫码引导（errors.user_msg 优先查表）
+            raise ApiError("酷狗搜索需登录，请先发送「kg登录」扫码", source="kg")
 
     async def search(self, keyword: str, limit: int = 10, type_: str = "song", page: int = 1) -> list[dict]:
+        """page 从 1 起（ncm 是 0 起）——三源 page 语义不统一，调用方传值时注意。"""
         self.require_login()
         await self.ensure_device()
         body = await self.request(
@@ -424,7 +405,8 @@ class KugouClient:
             return collect(lists, normalize_playlist, limit)
         if type_ == "album":
             return collect(lists, normalize_album, limit)
-        if type_ == "artist":
+        # 酷狗搜索类型白名单是 special/lyric/song/album/author/mv：歌手搜索的 type 是 author
+        if type_ == "author":
             return collect(lists, normalize_artist, limit)
         return []
 
@@ -527,7 +509,9 @@ class KugouClient:
         if last_err is not None and opt_int(last_err.code) in (20010, 20017, 20028, 20040):
             raise last_err
         if last_paid:
-            raise ApiError("该歌曲为付费/VIP，未登录无法获取完整播放链接", code=20017, source="kg")
+            # 不带 code=20017：那在 KG_ERRORS 表里会被 user_msg() 覆盖成
+            # 「需要登录或 Token 失效」，这里语义是付费/VIP，落原始 message
+            raise ApiError("该歌曲为付费/VIP，未登录无法获取完整播放链接", source="kg")
         if last_err is not None:
             raise last_err
         raise ApiError("无法获取播放链接（可能已下架或无版权）", source="kg")
@@ -594,8 +578,12 @@ class KugouClient:
         return {"lrc": "", "tlyric": "", "yrc": ""}
 
     async def song_comments(self, song: dict, limit: int = 12) -> dict:
-        """song 协议：歌曲评论。mixsongid 用 album_audio_id 优先、hash 兜底。"""
-        return await self.comments(song.get("sid2") or song.get("sid", ""), limit)
+        """song 协议：歌曲评论。/comment/music 只认 mixsongid（album_audio_id），
+        缺 sid2 时返回空结果，不拿 hash 硬凑参数（语义不符只会静默取不到评论）。"""
+        sid2 = song.get("sid2", "")
+        if not sid2:
+            return {"hot": [], "new": [], "total": 0}
+        return await self.comments(sid2, limit)
 
     # ──────────── 歌曲 / 增强 ────────────
     async def song_climax(self, hash_: str) -> dict:
@@ -705,7 +693,8 @@ class KugouClient:
         """乐库推荐歌（/yueku）：info.song 只有 1 首，把 vip_music.list 一并合并。"""
         await self.ensure_device()
         body = await self.request("/yueku", {})
-        info = data_of(body).get("info") if isinstance(data_of(body).get("info"), dict) else {}
+        data = data_of(body)
+        info = data.get("info") if isinstance(data.get("info"), dict) else {}
         items = list_of(info.get("song"))
         vip = info.get("vip_music") if isinstance(info.get("vip_music"), dict) else {}
         items += list_of(vip.get("list"))
@@ -786,9 +775,8 @@ class KugouClient:
     async def everyday_recommend(self) -> list[dict]:
         await self.ensure_device()
         body = await self.request("/everyday/recommend", self._ts({}))
-        return collect(
-            list_of(data_of(body).get("song_list") or data_of(body).get("songs")), normalize_song, 30
-        )
+        data = data_of(body)
+        return collect(list_of(data.get("song_list") or data.get("songs")), normalize_song, 30)
 
     async def personal_fm(self) -> list[dict]:
         await self.ensure_device()
@@ -925,9 +913,8 @@ class KugouClient:
     async def history_recommend(self) -> list[dict]:
         await self.ensure_device()
         body = await self.request("/everyday/history", self._ts({"mode": "song"}))
-        return collect(
-            list_of(data_of(body).get("song_list") or data_of(body).get("songs")), normalize_song, 30
-        )
+        data = data_of(body)
+        return collect(list_of(data.get("song_list") or data.get("songs")), normalize_song, 30)
 
     async def daily_recommend(self) -> list[dict]:
         """日推（与 ncm/qq 客户端同名；酷狗对应 /everyday/recommend）。"""
@@ -973,7 +960,8 @@ class KugouClient:
     # ──────────── 登录 ────────────
     async def qr_key(self) -> str:
         body = await self.request("/login/qr/key", self._ts({}))
-        key = data_of(body).get("qr_key") or data_of(body).get("key") or ""
+        data = data_of(body)
+        key = data.get("qr_key") or data.get("key") or ""
         if not key:
             raise ApiError("获取二维码 Key 失败", source="kg")
         return str(key)
@@ -1014,12 +1002,5 @@ class KugouClient:
             out["nickname"] = str(data.get("nickname") or "")
         return out
 
-    async def refresh_login(self) -> bool:
-        try:
-            await self.request("/login/token", self._ts({}))
-            return True
-        except ApiError:
-            return False
 
-
-register("kg", lambda config, device_path=None, **kw: KugouClient(config, device_path))
+register("kg", lambda config, kg_device_path=None, **kw: KugouClient(config, kg_device_path))

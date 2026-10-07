@@ -117,6 +117,7 @@ async def run_api(service, event):
 
     url = normalize_base(url)
     node = dict(service.config.src_node(src))
+    old_base = node.get("apiBase", "")
     node["apiBase"] = url
     service.config.set(src, node)
     saved = await service.config.save_async()
@@ -128,7 +129,16 @@ async def run_api(service, event):
         await service.client_of(src).request(path, params)
         await service.reply(event, "连通性 OK ✓" + ("" if saved else "（保存失败，重启后失效）"))
     except ApiError as e:
-        await service.reply(event, f"连通性失败：{e.user_msg()}")
+        # 探针走的就是配置里的新地址，只能先保存再探测；失败回滚旧值，别让坏地址留在
+        # 配置里（客户端按 config 现读 base，set 即生效，回滚无需重建客户端）。
+        node["apiBase"] = old_base
+        service.config.set(src, node)
+        restored = await service.config.save_async()
+        await service.reply(
+            event,
+            f"新地址连通性失败：{e.user_msg()}，已还原为原地址"
+            + ("" if restored else "（保存失败，重启后失效）"),
+        )
 
 
 async def run_stats(service, event):
@@ -154,8 +164,11 @@ async def run_test(service, event):
             lines.append(f"· QQ音乐：内置库 ✓（{'已登录' if status.get('loggedIn') else '匿名'}）")
         else:
             lines.append("· QQ音乐：✗ 未安装 qqmusic-api-python")
+    except ApiError as e:
+        lines.append(f"· QQ音乐：✗ {e.user_msg()}")
     except Exception as e:  # noqa: BLE001
-        lines.append(f"· QQ音乐：✗ {e}")
+        service.log_warn(f"连通性测试(QQ)失败: {e}")
+        lines.append(f"· QQ音乐：✗ {type(e).__name__}")
     # 走 HTTP API 的平台：探针调用因平台而异，按 CONNECTIVITY_PROBES 查表后统一遍历，
     # 新增平台只需加一行探针，无需再复制一段 ncm/kg 分支。
     # label 用各平台惯用短名（不是 SOURCE_NAMES 的「网易云音乐」），与既有输出一致。
@@ -168,8 +181,12 @@ async def run_test(service, event):
         try:
             await fetch(service.client_of(src))
             lines.append(f"· {label}：✓（{base}）")
+        except ApiError as e:
+            lines.append(f"· {label}：✗ {e.user_msg()}")
         except Exception as e:  # noqa: BLE001
-            lines.append(f"· {label}：✗ {e}")
+            # 原始异常可能带 host:port 等部署细节，只落日志；用户侧给错误类别
+            service.log_warn(f"连通性测试({label})失败: {e}")
+            lines.append(f"· {label}：✗ {type(e).__name__}")
     await service.reply(event, "\n".join(lines))
 
 
@@ -204,7 +221,8 @@ async def run_webui(service, event):
 
 
 async def run_toggle(service, event):
-    m = re.search(_RE_TOGGLE, event.message_str)
+    # 与路由 filter 同 flag：大写前缀（如「MH 开启 点歌」）过路由后体内也要能匹配上
+    m = re.search(_RE_TOGGLE, event.message_str, re.IGNORECASE)
     on = (m.group(1) if m else "") == "开启"
     target = m.group(2) if m else ""
     key = {
@@ -226,20 +244,62 @@ async def run_toggle(service, event):
 def routes() -> list[Route]:
     return [
         Route(re.compile(_RE_HELP, re.IGNORECASE), "mh_help", "帮助", run_help, priority=6),
-        Route(re.compile(_RE_SETTINGS, re.IGNORECASE), "mh_settings", "查看设置", run_settings, priority=6),
+        # 设置 / 统计 / WebUI 三条会输出 apiBase、端口等部署与账号信息，
+        # 与 auth.py「状态」同门槛（同 mh_status 的 admin 理由）
+        Route(
+            re.compile(_RE_SETTINGS, re.IGNORECASE),
+            "mh_settings",
+            "查看设置（管理员）",
+            run_settings,
+            admin=True,
+            priority=6,
+        ),
         Route(
             re.compile(_RE_QUALITY, re.IGNORECASE),
             "mh_quality",
-            "设置音质",
+            "设置音质（管理员）",
             run_quality,
             admin=True,
             priority=6,
         ),
-        Route(re.compile(_RE_API, re.IGNORECASE), "mh_api", "设置 API 地址", run_api, admin=True, priority=6),
-        Route(re.compile(_RE_STATS, re.IGNORECASE), "mh_stats", "调用统计", run_stats, priority=6),
-        Route(re.compile(_RE_TEST, re.IGNORECASE), "mh_test", "连通性测试", run_test, admin=True, priority=6),
-        Route(re.compile(_RE_WEBUI, re.IGNORECASE), "mh_webui", "WebUI 地址", run_webui, priority=6),
         Route(
-            re.compile(_RE_TOGGLE, re.IGNORECASE), "mh_toggle", "功能开关", run_toggle, admin=True, priority=6
+            re.compile(_RE_API, re.IGNORECASE),
+            "mh_api",
+            "设置 API 地址（管理员）",
+            run_api,
+            admin=True,
+            priority=6,
+        ),
+        Route(
+            re.compile(_RE_STATS, re.IGNORECASE),
+            "mh_stats",
+            "调用统计（管理员）",
+            run_stats,
+            admin=True,
+            priority=6,
+        ),
+        Route(
+            re.compile(_RE_TEST, re.IGNORECASE),
+            "mh_test",
+            "连通性测试（管理员）",
+            run_test,
+            admin=True,
+            priority=6,
+        ),
+        Route(
+            re.compile(_RE_WEBUI, re.IGNORECASE),
+            "mh_webui",
+            "WebUI 地址（管理员）",
+            run_webui,
+            admin=True,
+            priority=6,
+        ),
+        Route(
+            re.compile(_RE_TOGGLE, re.IGNORECASE),
+            "mh_toggle",
+            "功能开关（管理员）",
+            run_toggle,
+            admin=True,
+            priority=6,
         ),
     ]

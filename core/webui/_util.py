@@ -18,9 +18,15 @@ def json_response(obj, status: int = 200) -> web.Response:
 
 
 async def body_json(request: web.Request) -> dict:
-    """POST body 解析成 dict；非 JSON / 非 dict 一律空 dict（调用方按缺参处理）。"""
+    """POST body 解析成 dict；非 JSON / 非 dict 一律空 dict（调用方按缺参处理）。
+
+    HTTPException 必须原样 re-raise：body 超限的 413 也是 HTTPException，
+    吞成空 dict 会让登录等接口把「请求过大」误报成「密码错误」（401）。
+    """
     try:
         data = await request.json()
-        return data if isinstance(data, dict) else {}
+    except web.HTTPException:
+        raise
     except Exception:  # noqa: BLE001
         return {}
+    return data if isinstance(data, dict) else {}

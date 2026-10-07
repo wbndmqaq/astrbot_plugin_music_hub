@@ -50,8 +50,10 @@ async def _act_lyric(service, event, song):
     shown = lines[:LYRIC_PAGE_SIZE]
     tip = f"第 1/{total} 页 · 回复「歌词下页」继续" if total > 1 else ""
     data = build_lyric_card_data(song, lyric, shown, page=1, page_total=total, tip=tip)
+    # 文本兜底也只发第一页：翻页缓存按 LYRIC_PAGE_SIZE 切页，兜底发全量的话
+    # 纯文本平台用户看到的 1-50 行与「歌词下页」翻出的 37-72 行会重叠
     await service.reply_card_or_text(
-        event, data, "lyric", song.get("source", ""), lambda d: format_lyric_text(song, lines)
+        event, data, "lyric", song.get("source", ""), lambda d: format_lyric_text(song, shown)
     )
 
 
@@ -81,8 +83,9 @@ async def _act_lyric_word(service, event, song):
     shown = lines[:LYRIC_PAGE_SIZE]
     tip = "逐字歌词" + (f" · 第 1/{total} 页 · 回复「歌词下页」继续" if total > 1 else "")
     data = build_lyric_card_data(song, lyric, shown, page=1, page_total=total, tip=tip)
+    # 与 _act_lyric 同理：文本兜底只发第一页，避免与「歌词下页」的内容重叠
     await service.reply_card_or_text(
-        event, data, "lyric", song.get("source", ""), lambda d: format_lyric_text(song, lines)
+        event, data, "lyric", song.get("source", ""), lambda d: format_lyric_text(song, shown)
     )
 
 
@@ -176,12 +179,13 @@ async def _act_mv(service, event, song):
 
 
 async def _act_climax(service, event, song):
-    client = service.client_of("kg")
     # 平台独占能力：高潮片段只有酷狗提供（/song/climax），另两家无此接口。
-    # 必须按平台拒绝，否则会对不存在的客户端调方法抛 AttributeError。
+    # 先按平台拒绝再取客户端：顺序反了的话，未配置酷狗时用户看到的是
+    # 「音源不可用」而不是「仅支持酷狗」这条更可操作的提示。
     if song.get("source") != "kg":
         await service.reply(event, "高潮片段仅支持酷狗音源（可用 kg: 前缀点歌）")
         return
+    client = service.client_of("kg")
     info = await service.call("kg", "explore", client.song_climax(song.get("sid", "")))
     if not info:
         await service.reply(event, "未找到该歌的高潮片段信息")
@@ -222,11 +226,12 @@ async def _act_versions(service, event, song):
 
 async def _act_ai_recommend(service, event, song):
     """酷狗 AI 相似推荐（/ai/recommend，参数是 album_audio_id）。"""
-    client = service.client_of("kg")
     # 平台独占能力：AI 推荐只有酷狗提供，另两家无此接口，故按平台拒绝。
+    # 先拒绝再取客户端，理由同 _act_climax。
     if song.get("source") != "kg":
         await service.reply(event, "AI 推荐仅支持酷狗音源（可用 kg: 前缀点歌）")
         return
+    client = service.client_of("kg")
     songs = await service.call("kg", "explore", client.ai_recommend(song.get("sid2") or song.get("sid", "")))
     if not songs:
         await service.reply(event, "没有拿到 AI 推荐")
@@ -238,11 +243,12 @@ async def _act_ai_recommend(service, event, song):
 
 async def _act_simi_playlist(service, event, song):
     """网易云相似歌单：参数必须是歌曲 id。"""
-    client = service.client_of(SOURCE_NCM)
     # 平台独占能力：相似歌单只有网易云提供（/simi/playlist），另两家无此接口。
+    # 先拒绝再取客户端，理由同 _act_climax。
     if song.get("source") != SOURCE_NCM:
         await service.reply(event, "相似歌单仅支持网易云音源（可用 ncm: 前缀点歌）")
         return
+    client = service.client_of(SOURCE_NCM)
     pls = await service.call(SOURCE_NCM, "explore", client.simi_playlists(song.get("sid", "")))
     if not pls:
         await service.reply(event, "没有找到相似歌单")

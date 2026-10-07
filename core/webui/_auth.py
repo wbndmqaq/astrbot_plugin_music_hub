@@ -3,7 +3,8 @@
 - 密码来自插件配置 ``webui.password``，constant-time 比较
 - 令牌 = base64(payload).base64(hmac-sha256)，payload 含会话 ID 与过期时间
 - 会话表（内存）：jti → {user, created, last_seen}，支持按会话吊销
-- 登录限速：单 IP 5 次失败 / 5 分钟 → 锁 5 分钟
+- 登录限速：单 IP 5 次失败 / 5 分钟 → 锁 5 分钟；全局窗口失败总数超限 → 全局锁
+  （防攻击者轮换源 IP 各试 4 次绕过单 IP 上限；正确密码始终放行，不误伤正常登录）
 """
 
 from __future__ import annotations
@@ -43,6 +44,7 @@ class AuthManager:
         self.sessions: dict[str, dict] = {}
         self._fails: dict[str, list[float]] = {}
         self._blocked: dict[str, float] = {}
+        self._global_block_until: float = 0.0
 
     def _load_secret(self) -> bytes:
         path = self._data_dir / _SECRET_PATH
@@ -98,8 +100,10 @@ class AuthManager:
 
     def login_blocked(self, ip: str) -> int:
         self._gc_fails()
-        until = self._blocked.get(ip, 0)
-        return int(until - time.time()) if until > time.time() else 0
+        now = time.time()
+        # 单 IP 锁与全局锁取较晚者：轮换 IP 的攻击者绕得过前者，绕不过后者
+        until = max(self._blocked.get(ip, 0), self._global_block_until)
+        return int(until - now) if until > now else 0
 
     def record_fail(self, ip: str) -> None:
         now = time.time()
@@ -107,9 +111,12 @@ class AuthManager:
         fails.append(now)
         self._fails[ip] = fails
         total = sum(len(v) for v in self._fails.values())
-        if len(fails) >= RATE_MAX_FAILS or total >= self.RATE_MAX_FAILS_TOTAL:
+        if len(fails) >= RATE_MAX_FAILS:
             self._blocked[ip] = now + RATE_BLOCK
             self._fails.pop(ip, None)
+        if total >= self.RATE_MAX_FAILS_TOTAL:
+            # 只拦错误试探（登录接口先验密码再看锁，正确密码始终放行）
+            self._global_block_until = now + RATE_BLOCK
 
     def record_success(self, ip: str) -> None:
         self._fails.pop(ip, None)

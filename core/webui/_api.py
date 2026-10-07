@@ -13,7 +13,6 @@ from ._api_admin import (  # noqa: F401
 )
 from ._api_auth import (  # noqa: F401
     make_change_password,
-    make_check,
     make_login,
     make_logout,
     make_revoke,

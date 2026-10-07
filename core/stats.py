@@ -9,6 +9,7 @@ from __future__ import annotations
 import asyncio
 import copy
 import json
+import os
 import time
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -154,12 +155,15 @@ class Stats:
         self._flush_task = asyncio.create_task(self._flush_loop())
 
     async def _flush_loop(self) -> None:
-        try:
-            while True:
+        while True:
+            try:
                 await asyncio.sleep(FLUSH_INTERVAL)
                 await self.flush()
-        except asyncio.CancelledError:
-            pass
+            except asyncio.CancelledError:
+                return
+            except Exception as e:  # noqa: BLE001 - 循环体任何一环异常都只记日志，
+                # 循环本身不能死：死掉后统计只进内存，重载全部丢失且无告警
+                logger.warning(f"{_TAG} 统计刷写循环异常（继续）: {e}")
 
     async def flush(self) -> None:
         """落盘（脏标记防抖）。锁内先深拷贝快照再放线程池写——record() 会在
@@ -183,7 +187,9 @@ class Stats:
             logger.warning(f"{_TAG} 统计落盘失败: {e}")
 
     def _write_payload(self, payload: dict) -> None:
-        tmp = self._path.with_suffix(".tmp")
+        # tmp 名带随机后缀（同 session.py 的做法）：固定名会被并发的孤儿写盘
+        # 互踩——线程池里上一轮还没 replace，下一轮已经覆盖写同一个 tmp
+        tmp = self._path.with_suffix(f".{os.urandom(4).hex()}.tmp")
         tmp.write_text(json.dumps(payload, ensure_ascii=False), "utf-8")
         tmp.replace(self._path)
 

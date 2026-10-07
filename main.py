@@ -15,7 +15,7 @@ from astrbot.api.star import Context, Star, StarTools
 
 from .core import PLUGIN_NAME
 from .core.config import Config
-from .core.errors import AclDeniedError
+from .core.errors import AclDeniedError, ApiError
 from .core.logs import LogBuffer
 from .core.service import MusicService
 from .handlers import all_routes, install
@@ -103,7 +103,7 @@ class MusicHubPlugin(Star):
         """
         if err := self._llm_guard(event, song_request=True):
             return err
-        if reason := await self.service.check_cooldown(event):
+        if reason := self.service.check_cooldown(event):
             return reason
         try:
             src = source if source in ("ncm", "kg", "qq") else "auto"
@@ -120,9 +120,16 @@ class MusicHubPlugin(Star):
                     f"（{real_src} 音源，已发到当前会话）"
                 )
             err = result.get("error") or result.get("reason") or ""
-            return f"「{songs[0].get('name')}」播放失败：{err}"
+            # NotEnabledError 路径 result 没有 error 文案（play_song 已当面回复），别留悬空冒号
+            return f"「{songs[0].get('name')}」播放失败" + (f"：{err}" if err else "")
         except Exception as e:  # noqa: BLE001
-            return f"点歌失败：{e}"
+            # 工具入口盖了冷却章但没播出任何内容：无论异常类型都退章（对齐聊天路由的退章纪律）
+            self.service.release_cooldown(event)
+            if isinstance(e, ApiError):
+                return e.user_msg()
+            # 非 ApiError 原文可能带内部路径/URL，不交由模型转述给用户
+            logger.warning(f"[music_hub] LLM 点歌异常: {e}")
+            return "执行失败，详情见运行日志"
 
     @filter.llm_tool(name="music_hub_lyric")
     async def llm_lyric(self, event: AstrMessageEvent, keyword: str) -> str:
@@ -147,7 +154,11 @@ class MusicHubPlugin(Star):
                 lines
             )
         except Exception as e:  # noqa: BLE001
-            return f"歌词查询失败：{e}"
+            # 工具没盖冷却章，无需退章；ApiError 给友好文案，其余异常细节只落日志
+            if isinstance(e, ApiError):
+                return e.user_msg()
+            logger.warning(f"[music_hub] LLM 歌词查询异常: {e}")
+            return "执行失败，详情见运行日志"
 
     @filter.llm_tool(name="music_hub_search")
     async def llm_search(self, event: AstrMessageEvent, keyword: str) -> str:
@@ -167,7 +178,10 @@ class MusicHubPlugin(Star):
             ]
             return f"「{keyword}」搜索结果（{src}）：\n" + "\n".join(rows)
         except Exception as e:  # noqa: BLE001
-            return f"搜索失败：{e}"
+            if isinstance(e, ApiError):
+                return e.user_msg()
+            logger.warning(f"[music_hub] LLM 搜索异常: {e}")
+            return "执行失败，详情见运行日志"
 
     async def terminate(self):
         if getattr(self, "_webui", None):

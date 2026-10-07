@@ -14,7 +14,7 @@ author: wbndm
 repo: https://github.com/wbndmqaq/astrbot_plugin_music_hub
 display_name: Music Hub 聚合点歌
 short_desc: QQ/酷狗/网易云三平台聚合点歌，LLM 函数工具点歌，WebUI 扫码登录与统计管理。
-astrbot_version: ">=4.17.0"
+astrbot_version: ">=4.27.3"
 support_platforms:
   - aiocqhttp
   - qq_official

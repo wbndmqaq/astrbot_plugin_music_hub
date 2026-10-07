@@ -60,11 +60,20 @@ class LoginSession:
             "age": int(time.time() - self.created),
         }
 
-    def set_state(self, state: str, msg: str = "") -> None:
+    def set_state(self, state: str, msg: str = "") -> bool:
+        """单向状态机：已是终态（done/timeout/refuse/cancel）时拒绝被覆盖，返回是否生效。
+
+        cancel 指令与驱动协程的完成判定之间没有别的同步手段：
+        不设终态护栏的话，cancel 会把刚扫成的 done 抹成 cancel，
+        _drive 的 finally 见 state != done 跳过 _finish，凭证被白白丢弃。
+        """
+        if self.state in ("done", "timeout", "refuse", "cancel"):
+            return False
         self.state = state if state in STATES else "wait"
         self.msg = msg or _STATE_TEXT.get(self.state, "")
-        if state in ("done", "timeout", "refuse", "cancel"):
+        if self.state in ("done", "timeout", "refuse", "cancel"):
             self.done_evt.set()
+        return True
 
 
 class LoginFlows:
@@ -88,9 +97,17 @@ class LoginFlows:
         else:
             raise ApiError(f"未知音源 {source}", source=source)
         self.sessions[session.ticket] = session
-        # 走 service.spawn 纳入统一生命周期：terminate 的 cancel-all 才能收到它，
-        # 否则插件卸载后这个轮询器还会继续打上游登录接口直到自身超时
-        session.task = self._service.spawn(self._drive(session))
+        try:
+            # 走 service.spawn 纳入统一生命周期：terminate 的 cancel-all 才能收到它，
+            # 否则插件卸载后这个轮询器还会继续打上游登录接口直到自身超时
+            session.task = self._service.spawn(self._drive(session))
+        except Exception as e:
+            # spawn 失败（如 TooManyTasks）时不能留下 task=None 的僵尸会话：
+            # 二维码挂 600 秒无人回收、等待者永远等不到结果。置终态唤醒、
+            # 撤掉登记，再以 ApiError 抛出（聊天端 handler 只接 ApiError）
+            session.set_state("refuse", "登录服务繁忙，请稍后再试")
+            self.sessions.pop(session.ticket, None)
+            raise ApiError(f"登录服务繁忙，请稍后再试（{e}）", source=source) from e
         return session
 
     def get(self, ticket: str) -> LoginSession | None:
@@ -102,19 +119,26 @@ class LoginFlows:
 
     async def cancel(self, ticket: str) -> None:
         s = self.sessions.get(ticket)
-        # 已完成的会话不能动 task：_drive 的 finally 里 _finish 负责写配置，
-        # 取消它会让 cookie 丢失而状态仍显示 done。
-        if s is None or s.state not in ("wait", "scanned"):
+        if s is None:
             return
-        s.set_state("cancel")
+        # 竞态由 set_state 的单向状态机裁决：返回 False 说明驱动已判终态
+        # （如扫码刚成功置 done），此时绝不能动 task——
+        # _drive 的 finally 里 _finish 负责写配置，取消它会让凭证丢失
+        if not s.set_state("cancel"):
+            return
         if s.task:
             s.task.cancel()
 
-    async def wait_done(self, session: LoginSession, timeout: float = MAX_WAIT) -> LoginSession:
+    async def wait_done(self, session: LoginSession, timeout: float = MAX_WAIT) -> LoginSession | bool:
+        """等待登录出结果；超时返回 False 且**不改状态**。
+
+        超时若在此置终态 timeout，会抢在 _drive 之前盖死状态机：_drive 稍后
+        拿到 cookie 的 set_state("done") 被拒绝，凭证到手却被丢弃。状态只能由
+        _drive 判定。返回 session 时状态必为终态（done_evt 只在终态置位）。"""
         try:
             await asyncio.wait_for(session.done_evt.wait(), timeout=timeout)
         except asyncio.TimeoutError:  # 3.10 兼容：asyncio.TimeoutError 3.11 起才是内建 TimeoutError
-            session.set_state("timeout")
+            return False
         return session
 
     async def gc(self) -> None:
@@ -139,10 +163,20 @@ class LoginFlows:
             await asyncio.gather(*tasks, return_exceptions=True)
 
     async def cancel_source(self, source: str) -> None:
-        """同一音源只保留一个活跃会话：先取消旧的再让调用方新建。"""
+        """同一音源只保留一个活跃会话：先取消旧的再让调用方新建。
+
+        与 gc 同一纪律：cancel 只投递信号，不等旧轮询任务落地就返回的话，
+        旧 _drive 仍会继续每 2 秒打上游登录接口。"""
+        tasks: list[asyncio.Task] = []
         for st in list(self.sessions.values()):
             if st.source == source and st.state in ("wait", "scanned"):
                 await self.cancel(st.ticket)
+                # cancel 只在状态机接受（置成 cancel）时才真的取消了任务；
+                # 已终态的任务要么已停要么在自旋收尾，不纳入等待
+                if st.state == "cancel" and st.task and not st.task.done():
+                    tasks.append(st.task)
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
 
     def active_of(self, source: str) -> LoginSession | None:
         for s in self.sessions.values():
@@ -233,24 +267,25 @@ class LoginFlows:
         return s
 
     async def _start_ncm(self) -> LoginSession:
-        client = self._service.client_of("ncm")
-        key = await client.qr_key()
-        qr = await client.qr_create(key)
-        img = str(qr.get("qrimg") or "")
-        if img.startswith("data:image"):
-            img = img.split(",", 1)[-1]
-        s = LoginSession("ncm", qr_b64=img, qr_url=str(qr.get("qrurl") or ""))
-        s.extra = key
-        return s
+        return await self._start_poll("ncm", "qrurl")
 
     async def _start_kg(self) -> LoginSession:
-        client = self._service.client_of("kg")
+        return await self._start_poll("kg", "qrcode")
+
+    async def _start_poll(self, source: str, url_field: str) -> LoginSession:
+        """ncm/kg 共用的扫码会话创建：两者流程逐行相同，差异只在 qr_create 返回的
+        二维码 URL 字段名（ncm=qrurl / kg=qrcode）。
+
+        _start_ncm/_start_kg 保留为一行委托而非删除：它们是按音源命名的入口，
+        也是测试的补丁点（test_consistency 以 _start_ncm 拦截真实客户端访问）。
+        """
+        client = self._service.client_of(source)
         key = await client.qr_key()
         qr = await client.qr_create(key)
         img = str(qr.get("qrimg") or "")
         if img.startswith("data:image"):
             img = img.split(",", 1)[-1]
-        s = LoginSession("kg", qr_b64=img, qr_url=str(qr.get("qrcode") or ""))
+        s = LoginSession(source, qr_b64=img, qr_url=str(qr.get(url_field) or ""))
         s.extra = key
         return s
 
@@ -259,7 +294,9 @@ class LoginFlows:
         source = session.source
         cookie = session.cookie
         if not cookie:
-            session.set_state("refuse", "登录成功但未取到凭证")
+            # 能走到这里 state 必是终态 done（_drive 的 finally 判定过），
+            # 单向状态机拒绝再改写，只能直接改文案提示异常
+            session.msg = "登录成功但未取到凭证"
             return
         uid = session.uid
         nickname = session.nickname

@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from astrbot.api.event import filter
 
-from ..core.resolve import HINTS, collect_text, handle_resolve, is_plugin_command
+from ..core.resolve import HINTS, _looks_like_share, collect_text, handle_resolve, is_plugin_command
 from .base import Route
 
 
@@ -24,6 +24,11 @@ async def run_resolve(service, event):
         or HINTS["qq"].search(text)
         or "qqmusic://" in text
     ):
+        return
+    # HINTS 只认平台名：闲聊里提一句「酷狗」也能命中预过滤。ACL 校验必须与
+    # 冷却/回复一样盖在确认「这真的是一条分享」之后，否则黑名单用户的普通聊天
+    # （提到平台名）会被回「无权使用」并吞掉事件
+    if not _looks_like_share(text):
         return
     # 本路由常驻监听所有消息，ACL 不能在包装器里查（否则黑名单用户每条消息都被
     # 回复拒绝）；确认消息确实是分享内容、本插件要接管之后才校验

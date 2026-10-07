@@ -4,16 +4,6 @@
 <head>
 <meta charset="UTF-8" />
 <style>
-  *{margin:0;padding:0;box-sizing:border-box}
-  :root{
-    --mh-nm:#ec4141;--mh-soft:#fbeeea;--mh-muted:#8a5a52;--mh-text:#3a1d18;
-    --mh-card-a:#fdf8f7;--mh-card-b:#f9e9e6;--mh-line:rgba(236,65,65,.16);
-    --src-ncm:#ec4141;--src-kg:#2ca6e0;--src-qq:#31c27c;
-  }
-  html{width:fit-content}
-  body{font-family:"MiSans","HarmonyOS Sans SC","Microsoft YaHei UI","PingFang SC",sans-serif;
-    background:var(--mh-soft);color:var(--mh-text);-webkit-font-smoothing:antialiased}
-  .page{width:640px;padding:26px 22px}
   .head{display:flex;align-items:center;gap:12px;padding:4px 6px 14px}
   .head-icon{width:40px;height:40px;border-radius:13px;display:grid;place-items:center;color:#fff;
     background:linear-gradient(135deg,var(--mh-nm),#c62f2f);box-shadow:0 6px 18px rgba(236,65,65,.35)}
@@ -53,7 +43,7 @@
     <div class="head-ver">v{{ data.version }}</div>
   </div>
   <div class="cards">
-    {% for s in data.sources %}
+    {% for s in data.sources or [] %}
     <div class="acct" style="--sc:var(--src-{{ s.source }})">
       <div class="ava{% if not s.loggedIn %} guest{% endif %}">
         {% if s.loggedIn and s.avatar %}<img src="{{ s.avatar }}" referrerpolicy="no-referrer" />{% else %}{{ s.name[0] }}{% endif %}

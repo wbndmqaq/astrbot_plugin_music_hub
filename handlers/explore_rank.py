@@ -31,7 +31,7 @@ from .explore_common import (
 
 async def run_rank(service, event):
     m = re.search(_RE_RANK, event.message_str, re.IGNORECASE)
-    src = await _pick_source(service, event, m.group(1) if m else "")
+    src = _pick_source(service, event, m.group(1) if m else "")
     name = (m.group(2) if m else "").strip()
     client = service.client_of(src)
     # 两条分支都要榜单列表，只拉一次 —— ncm 的 /toplist 是 460/403 高发区，
@@ -66,7 +66,7 @@ async def run_rank(service, event):
 
 async def run_new_songs(service, event):
     m = re.search(_RE_NEW, event.message_str, re.IGNORECASE)
-    src = await _pick_source(service, event, m.group(1) if m else "")
+    src = _pick_source(service, event, m.group(1) if m else "")
     area = (m.group(2) if m else "").strip()
     client = service.client_of(src)
     songs = await service.call(src, "explore", NEW_SONG_FETCHERS[src](client, area))
@@ -78,7 +78,7 @@ async def run_new_songs(service, event):
 
 async def run_artist(service, event):
     m = re.search(_RE_ARTIST, event.message_str, re.IGNORECASE)
-    src = await _pick_source(service, event, m.group(1) if m else "")
+    src = _pick_source(service, event, m.group(1) if m else "")
     kw = (m.group(2) if m else "").strip()
     if not kw:
         await service.reply(event, "用法：歌手 歌手名")
@@ -92,7 +92,7 @@ async def run_artist(service, event):
 
 async def run_top_artists(service, event):
     m = re.search(_RE_TOP_ARTISTS, event.message_str, re.IGNORECASE)
-    src = await _pick_source(service, event, m.group(1) if m else "")
+    src = _pick_source(service, event, m.group(1) if m else "")
     client = service.client_of(src)
     fetch = TOP_ARTIST_FETCHERS[src](client)
     # 仅 ncm/kg 计入调用统计（与改动前一致，见 TOP_ARTIST_COUNTED_SOURCES 注释）
@@ -139,7 +139,7 @@ async def run_hot_artists(service, event):
 async def run_mv_search(service, event):
     """MV 搜索：结果入会话，回复 听N 发送对应 MV。"""
     m = re.search(_RE_MV_SEARCH, event.message_str, re.IGNORECASE)
-    src = await _pick_source(service, event, m.group(1) if m else "")
+    src = _pick_source(service, event, m.group(1) if m else "")
     kw = (m.group(2) if m else "").strip()
     if not kw:
         await service.reply(event, "用法：MV搜 关键词")

@@ -9,6 +9,7 @@ deliver_song 只做编排，取流/投递/压缩/清理各自独立成函数，
 
 from __future__ import annotations
 
+import asyncio
 import os
 import re
 
@@ -96,8 +97,11 @@ async def _send_voice(service, event, caps, *, path: str, pending: _Pending) -> 
             return True
         logger.warning(f"{TAG} OneBot 语音直发失败（{reason}），退回 Record 组件")
     try:
-        caption = service.plain(pending.take()) if pending.text else None
+        # caption 留在 pending 里等发送成功才 take：失败路径（退压缩版/最终 flush）
+        # 还要靠它补发说明，先 take 后发会让失败后的裸文件没有歌名说明
+        caption = service.plain(pending.text) if pending.text else None
         await service.send_chain(event, Record.fromFileSystem(path), caption)
+        pending.take()
         return True
     except Exception as e:  # noqa: BLE001
         logger.warning(f"{TAG} 语音发送失败: {e}")
@@ -115,7 +119,8 @@ async def _send_file(
     qq_large_file = False
     if is_limited:
         try:
-            qq_large_file = os.path.getsize(local_path) > QQ_CHUNKED_UPLOAD_THRESHOLD
+            # getsize 是磁盘 IO，走线程池（同 media.download_audio 尾部注释的理由）
+            qq_large_file = await asyncio.to_thread(os.path.getsize, local_path) > QQ_CHUNKED_UPLOAD_THRESHOLD
         except OSError:
             qq_large_file = False
     qq_chunk = is_limited and cfg.qq_official_chunked and qq_large_file and _chunked_available()
@@ -123,18 +128,23 @@ async def _send_file(
 
     if caps.native_card:
         try:
+            # 传 pending.text 只读：aiocq_send_file 抛错时文案还在，组件通道重发不丢；
+            # 成功（文案已随文件发出）才 take 清空 —— 与 _send_voice 同一纪律
             await aiocq_send_file(
-                event, pending.take(), comp_display if has_compressed else display, vocal_path or local_path
+                event, pending.text, comp_display if has_compressed else display, vocal_path or local_path
             )
+            pending.take()
             return True
         except Exception as e:  # noqa: BLE001
             logger.warning(f"{TAG} OneBot 文件直发失败: {e}")
 
-    caption = service.plain(pending.take()) if pending.text else None
+    # caption 同 _send_voice：发送成功才 take 清空，失败后由压缩重试或最终 flush 补发
+    caption = service.plain(pending.text) if pending.text else None
     try:
         target = vocal_path if use_compressed else local_path
         name = comp_display if use_compressed else display
         await service.send_chain(event, File(name, file=target), caption)
+        pending.take()
         return True
     except Exception as e:  # noqa: BLE001
         logger.warning(f"{TAG} 文件发送失败: {e}")
@@ -142,6 +152,7 @@ async def _send_file(
     if not use_compressed and has_compressed and cfg.ffmpeg_compress:
         try:
             await service.send_chain(event, File(comp_display, file=vocal_path), caption)
+            pending.take()
             return True
         except Exception as e2:  # noqa: BLE001
             logger.warning(f"{TAG} 压缩版文件重试仍失败: {e2}")
@@ -204,6 +215,9 @@ async def deliver_song(service, event, song: dict, play: dict, *, options: dict 
 
     local_path, last_err = await _fetch_audio(service, song, play)
     if not local_path:
+        # 受限平台的 pending 文案还没发过：先补发歌名说明再报错，别让用户只看到
+        # 一句「下载失败」却不知道刚才点的是哪首
+        await pending.flush(service, event)
         await service.send_chain(event, service.plain(f"下载音频失败：{last_err}\n可稍后重试，或换一首歌"))
         return {"ok": False, "reason": "download_fail", "error": str(last_err)}
 
@@ -228,11 +242,14 @@ async def deliver_song(service, event, song: dict, play: dict, *, options: dict 
         if not caps.vocal:
             if not want_file:
                 await service.send_chain(event, service.plain("当前平台不支持语音，且未开启文件发送"))
+            elif not caps.file:
+                # 平台语音/文件都不支持（如飞书、钉钉）：按平台矩阵只发文本说明，不白发注定失败的 File
+                await service.send_chain(event, service.plain("当前平台不支持语音与文件发送"))
         else:
             sent_media = await _send_voice(
                 service, event, caps, path=vocal_path or local_path, pending=pending
             )
-    if want_file:
+    if want_file and caps.file:
         sent_media = (
             await _send_file(
                 service,
@@ -278,6 +295,18 @@ async def deliver_video(
             local_path = await _download()
         except Exception as err:  # noqa: BLE001
             logger.warning(f"{TAG} MV 下载失败: {err}")
+            # 下载失败不能静默（原实现直接 ok=False 且什么都不发）：
+            # 先退 Video.fromURL 直发，再退直链文本，与 send_audio_to 的降级链对齐。
+            # 受限平台本就走不了 URL 直发，直接落文本
+            if not passive_limited:
+                try:
+                    await service.send_chain(event, *extra, Video.fromURL(url))
+                    return {"ok": True, "reason": "url", "url": url}
+                except Exception as err2:  # noqa: BLE001
+                    logger.warning(f"{TAG} MV 直发 URL 失败，退直链文本: {err2}")
+            await service.send_chain(event, *extra, service.plain(f"MV「{title}」：{url}"))
+            # 文本兜底用户实际收到了直链，按成功记，调用方不再追发失败提示
+            return {"ok": True, "reason": "text_fallback", "url": url, "filePath": ""}
 
     if not local_path and not download and not passive_limited:
         try:

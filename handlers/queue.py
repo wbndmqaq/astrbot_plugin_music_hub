@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import re
 
+from ..core.errors import ApiError
 from .base import Route
 
 _RE_ENQUEUE = r"^\s*#?\s*(?:排队|加入队列|点歌台)\s+(.+?)\s*$"
@@ -26,10 +27,17 @@ async def run_enqueue(service, event):
         await service.reply(event, f"点歌不可用：{reason}")
         return
     if service.config.cooldown_sec > 0:
-        if reason := await service.check_cooldown(event):
+        if reason := service.check_cooldown(event):
             await service.reply(event, f"⏳ {reason}")
             return
-    songs, _src = await service.search_songs(keyword, limit=3)
+    try:
+        songs, _src = await service.search_songs(keyword, limit=3)
+    except ApiError as e:
+        # 对齐 play.py _song_request 的退章纪律：搜索没播出任何内容就退冷却，
+        # 不让一个报错的关键词（酷狗未登录 152 是常态错误）占住整群点歌间隔
+        service.release_cooldown(event)
+        await service.reply(event, e.with_source())
+        return
     if not songs:
         service.release_cooldown(event)
         await service.reply(event, f"没有搜到「{keyword}」相关的歌曲")
@@ -39,15 +47,14 @@ async def run_enqueue(service, event):
     requester = event.get_sender_name() or "有人"
     pos = await service.queue.add(scope, song, requester)
     if pos == -1:
+        service.release_cooldown(event)
         from ..core.queue import MAX_QUEUE
 
         await service.reply(event, f"队列已满（上限 {MAX_QUEUE} 首），稍后再试")
         return
-    if pos == -2:
-        await service.reply(event, "点歌台还没有绑定本会话，先在群里发一次「点歌」再排队")
-        return
     if pos == -3:
         # 后台任务已达并发上限，入队已回滚；不提示具体上限，避免误导
+        service.release_cooldown(event)
         await service.reply(event, "系统繁忙，排队没有成功，稍后再试")
         return
     src_name = {"ncm": "网易云", "kg": "酷狗", "qq": "QQ"}.get(song.get("source", ""), "")
@@ -67,7 +74,11 @@ async def run_skip(service, event):
     scope = service.scope(event)
     nxt = await service.queue.skip(scope)
     if nxt is None:
-        await service.reply(event, "已切歌，队列里没有下一首了")
+        # skip 对「没有下一首」与「下一首启动失败」都返回 None，用队列余量区分文案
+        if service.queue.items(scope):
+            await service.reply(event, "已切歌，但下一首播放任务启动失败，回复「切歌」重试")
+        else:
+            await service.reply(event, "已切歌，队列里没有下一首了")
     else:
         song = nxt["song"]
         await service.reply(event, f"⏭ 已切歌，接下来：{song.get('name')} - {song.get('artist')}")

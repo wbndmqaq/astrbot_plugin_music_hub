@@ -132,7 +132,8 @@ def build_comment_card_data(song: dict, comments: dict) -> dict:
                 "content": c.get("content", ""),
                 "hot": bool(c.get("hot")),
             }
-            for i, c in enumerate(comments.get("hot", [])[:12])
+            # 条数与 formatters.format_comment_text 的文本兜底 [:10] 统一
+            for i, c in enumerate(comments.get("hot", [])[:10])
         ],
         "total": comments.get("total", 0),
         "tip": "",

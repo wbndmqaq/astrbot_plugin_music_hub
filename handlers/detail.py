@@ -7,7 +7,7 @@ import re
 from ..core.cards import build_comment_card_data, build_lyric_card_data
 from ..core.errors import ApiError
 from .actions import LYRIC_PAGE_SIZE
-from .base import Route
+from .base import COMMENT_NEXT_HINT, LYRIC_PAGE_HINT, Route
 
 # (pattern, route-name, action, 说明)
 _SRC = r"(?:(ncm|kg|qqm|qq)\s*)?"
@@ -26,12 +26,13 @@ _RE_COMMENT_NEXT = r"^\s*#?\s*(?:ncm|kg|qqm|qq)?\s*评论下页\s*$"
 
 async def run_lyric_page(service, event):
     """歌词翻页：数据来自 service 分页缓存（查看歌词/逐字歌词时写入）。"""
+    # 总开关由路由 gated 静默让路，体内不再重复 check_playable
     m = re.search(_RE_LYRIC_PAGE, event.message_str, re.IGNORECASE)
     delta = 1 if (m.group(1) if m else "") == "下页" else -1
     scope = service.scope(event)
     data = service.get_pager(scope, "lyric")
     if not data:
-        await service.reply(event, "先查看一次歌词（如「歌词 晴天」），再翻页")
+        await service.reply(event, LYRIC_PAGE_HINT)
         return
     page = data.get("page", 1) + delta
     total = max(1, data.get("total", 1))
@@ -66,7 +67,7 @@ async def run_comment_next(service, event):
     scope = service.scope(event)
     data = service.get_pager(scope, "comment")
     if not data:
-        await service.reply(event, "先查看一次评论（如「评论 晴天」），再看最新")
+        await service.reply(event, COMMENT_NEXT_HINT)
         return
     if data.get("page", 1) >= data.get("total", 1):
         await service.reply(event, "没有更多评论啦")
@@ -97,13 +98,11 @@ async def run_comment_next(service, event):
     )
 
 
-def _make_select_runner(action: str, _actor=None):
+def _make_select_runner(action: str):
     """二段式命令 runner：带关键词 → 搜索+记录 action；不带 → 复用当前列表。"""
 
     async def run(service, event):
-        if reason := service.check_playable():
-            await service.reply(event, f"功能不可用：{reason}")
-            return
+        # 总开关由路由 gated 静默让路，体内不再重复 check_playable
         m = re.search(_PATTERN_OF[action], event.message_str, re.IGNORECASE)
         keyword = (m.group(2) if m else "").strip()
         await service.start_select(event, keyword, action, _ACTION_LABELS[action])
@@ -159,8 +158,11 @@ def routes() -> list[Route]:
                 re.compile(pattern, re.IGNORECASE),
                 name,
                 doc,
-                _make_select_runner(action, None),
+                _make_select_runner(action),
                 priority=prio,
             )
         )
+    # 总开关关闭 → 包装器静默让路（体内不再自行 check_playable 回复）
+    for r in out:
+        r.gated = True
     return out

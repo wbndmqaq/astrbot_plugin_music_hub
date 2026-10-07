@@ -4,16 +4,6 @@
 <head>
 <meta charset="UTF-8" />
 <style>
-  *{margin:0;padding:0;box-sizing:border-box}
-  :root{
-    --mh-nm:#ec4141;--mh-nm-deep:#c62f2f;--mh-hero-a:#ef4e44;--mh-hero-b:#d0362c;
-    --mh-card-a:#fdf8f7;--mh-card-b:#f9e9e6;--mh-soft:#fbeeea;--mh-muted:#8a5a52;
-    --mh-text:#3a1d18;--mh-chip:rgba(236,65,65,.09);--mh-line:rgba(236,65,65,.16);
-  }
-  html{width:fit-content}
-  body{font-family:"MiSans","HarmonyOS Sans SC","Microsoft YaHei UI","PingFang SC",sans-serif;
-    background:var(--mh-soft);color:var(--mh-text);-webkit-font-smoothing:antialiased}
-  .page{width:640px;padding:26px 22px}
   .hero{position:relative;overflow:hidden;border-radius:26px 26px 22px 22px;padding:28px 26px 22px;
     background:linear-gradient(135deg,var(--mh-hero-a),var(--mh-hero-b));color:#fff;isolation:isolate}
   .hero::before{content:"";position:absolute;inset:0;z-index:-1;
@@ -63,7 +53,7 @@
   </div>
   <div class="body-card">
     <div class="rows">
-      {% for it in data.items %}
+      {% for it in data.get("items") or [] %}
       <div class="row">
         <div class="row-idx{% if it.index <= 3 %} top{% endif %}">{{ it.index }}</div>
         {% if it.cover %}
@@ -84,7 +74,8 @@
     {% endif %}
     <div class="footer">
       <span>♪ Music Hub 聚合点歌</span>
-      <span>{{ data.items|length }} / {{ data.total }}</span>
+      {# 不能写 data["items"]：键缺失时 Jinja 回退到 getattr，拿到的是 dict.items 方法 #}
+      <span>{{ (data.get("items") or [])|length }} / {{ data.total }}</span>
     </div>
   </div>
 </div>

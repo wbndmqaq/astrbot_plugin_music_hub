@@ -4,16 +4,6 @@
 <head>
 <meta charset="UTF-8" />
 <style>
-  *{margin:0;padding:0;box-sizing:border-box}
-  :root{
-    --mh-nm:#ec4141;--mh-nm-deep:#c62f2f;--mh-hero-a:#ef4e44;--mh-hero-b:#d0362c;
-    --mh-card-a:#fdf8f7;--mh-card-b:#f9e9e6;--mh-soft:#fbeeea;--mh-muted:#8a5a52;
-    --mh-text:#3a1d18;--mh-chip:rgba(236,65,65,.09);--mh-line:rgba(236,65,65,.16);
-  }
-  html{width:fit-content}
-  body{font-family:"MiSans","HarmonyOS Sans SC","Microsoft YaHei UI","PingFang SC",sans-serif;
-    background:var(--mh-soft);color:var(--mh-text);-webkit-font-smoothing:antialiased}
-  .page{width:640px;padding:26px 22px}
   .hero{position:relative;overflow:hidden;border-radius:26px 26px 0 0;padding:22px 24px;color:#fff;
     background:linear-gradient(135deg,var(--mh-hero-a),var(--mh-hero-b));isolation:isolate}
   .hero::before{content:"";position:absolute;inset:0;z-index:-1;
@@ -64,7 +54,7 @@
     </div>
   </div>
   <div class="comments">
-    {% for c in data.comments %}
+    {% for c in data.comments or [] %}
     <div class="cmt">
       {% if c.avatar %}<img class="ava" src="{{ c.avatar }}" referrerpolicy="no-referrer" data-fb="{{ (c.nick or '友')[0:1] }}" onerror="var d=document.createElement('div');d.className='ava-ph';d.textContent=this.dataset.fb;this.replaceWith(d)" />
       {% else %}<div class="ava-ph">{{ (c.nick or '友')[0:1] }}</div>{% endif %}
@@ -83,7 +73,7 @@
     </div>
     {% endfor %}
     <div style="display:flex;justify-content:space-between;color:var(--mh-muted);font-size:11px;font-weight:700;padding:12px 4px 0">
-      <span>♪ Music Hub 聚合点歌</span><span>热评 {{ data.comments|length }} 条</span>
+      <span>♪ Music Hub 聚合点歌</span><span>热评 {{ (data.comments or [])|length }} 条</span>
     </div>
   </div>
 </div>

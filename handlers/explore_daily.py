@@ -39,7 +39,7 @@ from .explore_common import (
 
 async def run_hot_search(service, event):
     m = re.search(_RE_HOT, event.message_str, re.IGNORECASE)
-    src = await _pick_source(service, event, m.group(1) if m else "")
+    src = _pick_source(service, event, m.group(1) if m else "")
     items = await service.call(src, "explore", service.client_of(src).hot_search())
     if not items:
         await service.reply(event, "暂无热搜数据")
@@ -48,11 +48,26 @@ async def run_hot_search(service, event):
 
 
 async def run_random(service, event):
+    # 「来首歌」也是发歌出口：入口补点歌开关与冷却两道闸（此前是唯一无频控的发歌口）。
+    # 两道闸拒绝都静默让路（return False 不吞事件），对齐「听N」类开关处理。
+    if service.check_song_request():
+        return False
+    if service.check_cooldown(event):
+        return False
     m = re.search(_RE_RANDOM, event.message_str, re.IGNORECASE)
-    src = await _pick_source(service, event, m.group(1) if m else "")
-    # 记账由各平台 fetcher 自己决定（QQ 改动前不记账），故把 service.call 注入进去
-    songs = await RANDOM_FETCHERS[src](service.client_of(src), service.call, src)
+    try:
+        src = _pick_source(service, event, m.group(1) if m else "")
+        # 记账由各平台 fetcher 自己决定（QQ 改动前不记账），故把 service.call 注入进去；
+        # _pick_source / client_of 同样可能抛 ApiError（音源未配置），一并纳入退章范围
+        songs = await RANDOM_FETCHERS[src](service.client_of(src), service.call, src)
+    except ApiError as e:
+        # 已盖冷却章但没播出任何内容：退冷却，不让报错占住点歌间隔（对齐 _song_request）。
+        # 走到 play_song 之后的取流失败由 play_song 内部退章，这里不重复退
+        service.release_cooldown(event)
+        await service.reply(event, e.with_source())
+        return
     if not songs:
+        service.release_cooldown(event)
         await service.reply(event, "没有拿到随机歌曲，稍后再试")
         return
     import random as _random
@@ -62,7 +77,7 @@ async def run_random(service, event):
 
 async def run_daily(service, event):
     m = re.search(_RE_DAILY, event.message_str, re.IGNORECASE)
-    src = await _pick_source(service, event, m.group(1) if m else "")
+    src = _pick_source(service, event, m.group(1) if m else "")
     client = service.client_of(src)
     try:
         songs = await service.call(src, "explore", client.daily_recommend())
@@ -77,7 +92,7 @@ async def run_daily(service, event):
 
 async def run_fm(service, event):
     m = re.search(_RE_FM, event.message_str, re.IGNORECASE)
-    src = await _pick_source(service, event, m.group(1) if m else "")
+    src = _pick_source(service, event, m.group(1) if m else "")
     client = service.client_of(src)
     # 私人电台：QQ 侧没有 personal_fm，对应能力是 radar 推荐（返回单曲而非列表）
     result = await service.call(src, "explore", FM_FETCHERS[src](client))
@@ -90,7 +105,7 @@ async def run_fm(service, event):
 
 async def run_recommend(service, event):
     m = re.search(_RE_RECOMMEND, event.message_str, re.IGNORECASE)
-    src = await _pick_source(service, event, m.group(1) if m else "")
+    src = _pick_source(service, event, m.group(1) if m else "")
     cat = (m.group(2) if m else "").strip()
     client = service.client_of(src)
     pls = await service.call(src, "explore", PLAYLIST_RECOMMENDERS[src](client, cat))
@@ -113,7 +128,7 @@ async def run_recommend(service, event):
 
 async def run_new_albums(service, event):
     m = re.search(_RE_NEW_ALBUM, event.message_str, re.IGNORECASE)
-    src = await _pick_source(service, event, m.group(1) if m else "")
+    src = _pick_source(service, event, m.group(1) if m else "")
     area = (m.group(2) if m else "").strip()
     client = service.client_of(src)
     albums = await service.call(src, "explore", NEW_ALBUM_FETCHERS[src](client, area))
@@ -186,7 +201,7 @@ async def run_suggest(service, event):
     if not kw:
         await service.reply(event, "用法：搜索建议 关键词")
         return
-    src = await _pick_source(service, event, m.group(1) if m else "")
+    src = _pick_source(service, event, m.group(1) if m else "")
     client = service.client_of(src)
     out = await service.call(src, "explore", client.suggest(kw))
     if not out:
@@ -202,7 +217,7 @@ async def run_suggest(service, event):
 async def run_history_daily(service, event):
     """历史日推（网易云需要黑胶，酷狗需要登录）。"""
     m = re.search(_RE_HISTORY_DAILY, event.message_str, re.IGNORECASE)
-    src = await _pick_source(service, event, m.group(1) if m else "", prefer=SOURCE_NCM)
+    src = _pick_source(service, event, m.group(1) if m else "", prefer=SOURCE_NCM)
     # 取数客户端与失败提示都按平台查表：改动前是「ncm 走 ncm、其余一律走 kg」，
     # 这里如实保留该行为（含 src 为 qq 时仍取酷狗客户端），见 core/catalog 的说明。
     client_src = HISTORY_DAILY_CLIENT_SOURCE.get(src, HISTORY_DAILY_DEFAULT_CLIENT_SOURCE)

@@ -71,7 +71,11 @@ def make_stats(server):
 def make_stats_reset(server):
     async def handler(request: web.Request) -> web.Response:
         body = await _body(request)
-        keep = bool(body.get("keepTotals", True))
+        # 严格 bool：bool("false") 是 True，宽松强转会把「保留总计」的请求
+        # 反向变成「清空总计」，与 coerce_setting 防的是同一个陷阱
+        keep = body.get("keepTotals", True)
+        if not isinstance(keep, bool):
+            return _json({"error": "keepTotals 必须是布尔值"}, 400)
         server.service.stats.reset(keep_totals=keep)
         await server.service.stats.flush()
         return _json({"ok": True})
@@ -127,9 +131,17 @@ _NESTED_INT_RANGES: dict[str, tuple[int, int]] = {
 def clamp_int(key: str, value):
     """按声明的区间夹取 int 配置值；无区间声明时返回转换结果。
 
-    非法值（无法转 int）抛 ValueError/TypeError，由调用方归入 rejected。
+    非法值统一抛 TypeError/ValueError 由调用方归入 rejected。捕获面必须含
+    OverflowError：JSON 的 1e999 解析成 float('inf')，int() 对它抛 OverflowError，
+    漏掉会穿透成 500 而非 rejected。bool 显式拒绝（bool 是 int 子类，
+    int(True)==1 会把 true/false 混进数值配置），与 coerce_setting 同一严格哲学。
     """
-    result = int(value)
+    if isinstance(value, bool):
+        raise TypeError(f"{key} 需要整数，收到布尔值")
+    try:
+        result = int(value)
+    except (TypeError, ValueError, OverflowError) as e:
+        raise ValueError(f"{key} 不是合法整数") from e
     bounds = _INT_RANGES.get(key) or _NESTED_INT_RANGES.get(key)
     if bounds:
         lo, hi = bounds
@@ -149,7 +161,15 @@ def coerce_setting(key: str, expect: type, value):
         raise TypeError(f"{key} 需要布尔值，收到 {type(value).__name__}")
     if expect is int:
         return clamp_int(key, value)
-    return str(value).strip()
+    text = str(value).strip()
+    if key == "defaultSource" and text not in _DEFAULT_SOURCES:
+        # 读取侧对白名单外的值静默回落 auto，写侧放行会让面板显示值与实际生效值漂移
+        raise ValueError(f"{key} 仅支持 auto/ncm/kg/qq")
+    if key == "identifyPrefix":
+        # 识别前缀原样拼进发送文本：换行/控制字符能伪造消息结构，超长会刷屏
+        if len(text) > 20 or any(ord(c) < 32 or ord(c) == 127 for c in text):
+            raise ValueError(f"{key} 最长 20 字符且不含换行/控制字符")
+    return text
 
 
 def _valid_bind_host(raw: str) -> bool:
@@ -163,6 +183,9 @@ def _valid_bind_host(raw: str) -> bool:
     except ValueError:
         return bool(re.fullmatch(r"[A-Za-z0-9](?:[A-Za-z0-9.-]{0,251}[A-Za-z0-9])?", raw))
 
+
+# defaultSource 值域白名单：集合必须与读取侧 config.default_source 的合法集合一致
+_DEFAULT_SOURCES = {"auto", *SOURCES}
 
 _SRC_QUALITY = {
     "ncm": {
@@ -262,61 +285,84 @@ def make_config_save(server):
             elif key in ("ncm", "kg", "qq") and isinstance(value, dict):
                 src = key
                 node = dict(cfg.src_node(src))
+                changed = False
                 for skey, sval in value.items():
-                    if skey in _EDITABLE_SRC_KEYS:
-                        expect = _EDITABLE_SRC_KEYS[skey]
-                        # 先校验类型：sval 来自 JSON body，传 list 时
-                        # `sval not in set` 会因 list 不可哈希抛 TypeError，
-                        # 穿透到 _handle_errors 变成 500 而非 400
-                        if skey == "quality":
-                            if not isinstance(sval, str) or sval not in _SRC_QUALITY[src]:
-                                rejected.append(f"{src}.{skey}")
-                                continue
-                        try:
-                            node[skey] = coerce_setting(f"{src}.{skey}", expect, sval)
-                            applied.append(f"{src}.{skey}")
-                        except (TypeError, ValueError):
+                    # QQ 走内置库直连，apiBase 无任何消费者（src_api_base("qq") 恒返回
+                    # "local"，config_get 也不回显）：写侧放行会造出「面板收下了却永不
+                    # 生效」的假配置，按未知键拒绝而非读侧回显
+                    if skey not in _EDITABLE_SRC_KEYS or (src == "qq" and skey == "apiBase"):
+                        rejected.append(f"{src}.{skey}")
+                        continue
+                    expect = _EDITABLE_SRC_KEYS[skey]
+                    # 先校验类型：sval 来自 JSON body，传 list 时
+                    # `sval not in set` 会因 list 不可哈希抛 TypeError，
+                    # 穿透到 _handle_errors 变成 500 而非 400
+                    if skey == "quality":
+                        if not isinstance(sval, str) or sval not in _SRC_QUALITY[src]:
                             rejected.append(f"{src}.{skey}")
-                if src == "ncm" or src == "kg":
-                    node["apiBase"] = normalize_base(str(node.get("apiBase", "")))
-                cfg.set(src, node)
+                            continue
+                    try:
+                        node[skey] = coerce_setting(f"{src}.{skey}", expect, sval)
+                        applied.append(f"{src}.{skey}")
+                        changed = True
+                    except (TypeError, ValueError):
+                        rejected.append(f"{src}.{skey}")
+                # 仅至少一个字段落盘才 set：全拒 / 全未知时原样回写等于无意义写盘，
+                # 且会让「空保存」也走 save_async、记账与实际写入脱节
+                if changed:
+                    if src == "ncm" or src == "kg":
+                        node["apiBase"] = normalize_base(str(node.get("apiBase", "")))
+                    cfg.set(src, node)
             elif key == "scheduler" and isinstance(value, dict):
                 node = dict(cfg.sched_node())
+                changed = False
                 for skey in ("enable", "ncmSignin", "qqRefresh"):
                     if skey in value:
                         try:
                             node[skey] = coerce_setting(f"scheduler.{skey}", bool, value[skey])
+                            changed = True
                         except (TypeError, ValueError):
                             rejected.append(f"scheduler.{skey}")
                 if "signinHour" in value:
                     try:
                         node["signinHour"] = clamp_int("scheduler.signinHour", value["signinHour"])
+                        changed = True
                     except (TypeError, ValueError):
                         rejected.append("scheduler.signinHour")
-                cfg.set("scheduler", node)
-                applied.append("scheduler")
+                # 与音源节点分支同一记账纪律：一个字段都没改成时不算 applied、不写盘
+                if changed:
+                    cfg.set("scheduler", node)
+                    applied.append("scheduler")
             elif key == "webui" and isinstance(value, dict):
                 node = dict(cfg.webui_node())
+                changed = False
                 if "enable" in value:
                     try:
                         node["enable"] = coerce_setting("webui.enable", bool, value["enable"])
+                        changed = True
                     except (TypeError, ValueError):
                         rejected.append("webui.enable")
                 if "port" in value:
                     try:
                         node["port"] = clamp_int("webui.port", value["port"])
+                        changed = True
                     except (TypeError, ValueError):
                         rejected.append("webui.port")
                 if "host" in value:
                     # 必须校验：host 配错会让 start() 绑定失败，面板起不来，
-                    # 而修复它的唯一入口正是这个面板本身 —— 只能手改配置文件
-                    raw = str(value["host"]).strip() or "0.0.0.0"
+                    # 而修复它的唯一入口正是这个面板本身 —— 只能手改配置文件。
+                    # 空值必须映射 127.0.0.1（与读取侧 config.webui_host 的回落一致）：
+                    # 兜底成 0.0.0.0 会让「清空监听地址」静默绑到全部网卡 —— 面板能改
+                    # 全部配置、导出平台 Cookie，扩大暴露面违背清空者的本意
+                    raw = str(value["host"]).strip() or "127.0.0.1"
                     if _valid_bind_host(raw):
                         node["host"] = raw
+                        changed = True
                     else:
                         rejected.append("webui.host")
-                cfg.set("webui", node)
-                applied.append("webui")
+                if changed:
+                    cfg.set("webui", node)
+                    applied.append("webui")
             else:
                 rejected.append(key)
         saved = await cfg.save_async()
@@ -370,10 +416,17 @@ def make_acl_save(server):
                     out.append(s)
             return out
 
+        # 严格 list：_clean 对非 list 返回 []，宽松路径会把 {"blacklist": "123456"}
+        # 变成「名单抹零」且响应仍 ok —— 宽松强转会反向变形请求（与 keepTotals /
+        # coerce_setting 同一哲学）。None 是「不改该项」的语义，放行交回 set_acl。
+        for kind in ("blacklist", "whitelist"):
+            if kind in body and body[kind] is not None and not isinstance(body[kind], list):
+                return _json({"error": f"{kind} 必须是字符串数组"}, 400)
+
         server.config.set_acl(
             mode=mode,
-            blacklist=_clean(body.get("blacklist")) if "blacklist" in body else None,
-            whitelist=_clean(body.get("whitelist")) if "whitelist" in body else None,
+            blacklist=_clean(body["blacklist"]) if isinstance(body.get("blacklist"), list) else None,
+            whitelist=_clean(body["whitelist"]) if isinstance(body.get("whitelist"), list) else None,
         )
         saved = await server.config.save_async()
         return _json({"ok": True, "saved": saved})

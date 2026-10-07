@@ -33,7 +33,7 @@ NCM_LABEL = {
     "dolby": "杜比全景声",
     "sky": "沉浸环绕声",
     "vivid": "臻音全景声",
-    "jyeffect": "高清环绕声",
+    "jyeffect": "高清臻音",
     "hires": "Hi-Res",
     "lossless": "无损 FLAC",
     "exhigh": "极高",
@@ -111,12 +111,15 @@ def quality_label(source: str, quality: str) -> str:
 
 
 def kg_hash_for(song: dict, quality: str) -> str:
-    """酷狗：取某音质的专属 hash。"""
+    """酷狗：取某音质的专属 hash（每档独立，取不到返回空串让上层跳档）。
+
+    不做跨档兜底：拿高档 hash 去请求低档 quality 语义不符，只会静默失败。
+    """
     q = (quality or "").lower()
     if q == "flac":
-        return first(song.get("hash_flac"), song.get("hash_high"))
+        return first(song.get("hash_flac"))
     if q == "320":
-        return first(song.get("hash_320"), song.get("hash_flac"))
+        return first(song.get("hash_320"))
     return first(song.get("hash_128"), song.get("hash"), song.get("FileHash"))
 
 

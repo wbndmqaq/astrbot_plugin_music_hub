@@ -70,7 +70,7 @@ _PLAYLIST_SPEC = {
 
 async def run_album(service, event):
     m = re.search(_RE_ALBUM, event.message_str, re.IGNORECASE)
-    src = await _pick_source(service, event, m.group(1) if m else "")
+    src = _pick_source(service, event, m.group(1) if m else "")
     kw = (m.group(2) if m else "").strip()
     if not kw:
         await service.reply(event, "用法：专辑 专辑名")
@@ -80,7 +80,7 @@ async def run_album(service, event):
 
 async def run_playlist(service, event):
     m = re.search(_RE_PLAYLIST, event.message_str, re.IGNORECASE)
-    src = await _pick_source(service, event, m.group(1) if m else "")
+    src = _pick_source(service, event, m.group(1) if m else "")
     kw = (m.group(2) if m else "").strip()
     if not kw:
         await service.reply(event, "用法：歌单 歌单名 或 歌单 歌单ID")
@@ -117,7 +117,7 @@ async def run_theme(service, event):
 async def run_playlist_categories(service, event):
     """歌单分类（网易云 catlist / 酷狗 tags），文本列表。"""
     m = re.search(_RE_PLAYLIST_CATS, event.message_str, re.IGNORECASE)
-    src = await _pick_source(service, event, m.group(1) if m else "", prefer=SOURCE_NCM)
+    src = _pick_source(service, event, m.group(1) if m else "", prefer=SOURCE_NCM)
     client = service.client_of(src)
     # 三个客户端方法名不统一（ncm=playlist_categories / kg=playlist_tags），且 QQ 侧
     # 根本没有这个能力 —— 表里查不到方法名就 getattr 探测，

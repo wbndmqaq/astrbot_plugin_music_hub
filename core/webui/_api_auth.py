@@ -13,18 +13,21 @@ from ._util import json_response as _json
 def make_login(server):
     async def handler(request: web.Request) -> web.Response:
         ip = request.remote or ""
+        body = await _body(request)
+        # 先验密码再看锁：锁只拦错误试探，不拦持正确凭据的人。锁定按 peer IP
+        # 计数，反代/共享出口部署下第三方输错就能锁死同出口的正常登录——
+        # 密码正确时始终放行（攻击者不知道密码，此放宽不削弱防爆破）。
+        if server.auth.check_password(str(body.get("password", ""))):
+            server.auth.record_success(ip)
+            token = server.auth.create_session(ip=ip)
+            resp = _json({"ok": True})
+            resp.set_cookie(COOKIE_NAME, token, httponly=True, samesite="Lax", max_age=12 * 3600, path="/")
+            return resp
         blocked = server.auth.login_blocked(ip)
         if blocked:
             return _json({"error": f"失败次数过多，{blocked} 秒后再试"}, 429)
-        body = await _body(request)
-        if not server.auth.check_password(str(body.get("password", ""))):
-            server.auth.record_fail(ip)
-            return _json({"error": "密码错误"}, 401)
-        server.auth.record_success(ip)
-        token = server.auth.create_session(ip=ip)
-        resp = _json({"ok": True})
-        resp.set_cookie(COOKIE_NAME, token, httponly=True, samesite="Lax", max_age=12 * 3600, path="/")
-        return resp
+        server.auth.record_fail(ip)
+        return _json({"error": "密码错误"}, 401)
 
     return handler
 
@@ -37,13 +40,6 @@ def make_logout(server):
         resp = _json({"ok": True})
         resp.del_cookie(COOKIE_NAME, path="/")
         return resp
-
-    return handler
-
-
-def make_check(server):
-    async def handler(request: web.Request) -> web.Response:
-        return _json({"authed": bool(request.get("jti")), "user": request.get("user", "")})
 
     return handler
 

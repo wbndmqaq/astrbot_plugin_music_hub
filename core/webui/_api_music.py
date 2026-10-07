@@ -17,6 +17,16 @@ from ._util import json_response as _json
 TAG = "[music_hub]"
 
 
+def _src_or_none(body: dict) -> str | None:
+    """body.source → 合法音源名；缺失 / 未知返回 None（调用方统一回 400）。
+
+    三处 `src not in SOURCES → 400` 的同一张底稿：校验口径收拢在一处，
+    新路由照抄时不会漏掉未知音源分支。
+    """
+    src = str(body.get("source", ""))
+    return src if src in SOURCES else None
+
+
 def _host_of(url: str) -> str:
     """只回显 URL 的 host 部分。
 
@@ -53,8 +63,19 @@ def make_accounts(server):
         if not row["enabled"]:
             row["nickname"] = "未配置 API"
             return row
+
+        # 求值顺序坑：`service.client_of(src).login_status()` 若直接写进 gather 参数，
+        # client_of 会在参数构造时同步求值 —— QQ 库缺失时 client_of 抛 NotEnabledError，
+        # 发生在 gather 进入之前，_safe 的 try 根本兜不到，一行炸掉整页（500）。
+        # 所以「取 client」这一步必须包进 async 兜底里再交给 gather。
+        async def _status():
+            try:
+                return await service.client_of(src).login_status()
+            except Exception:  # noqa: BLE001 - 依赖缺失 / 上游失败只降级该项
+                return {"loggedIn": False, "nickname": "查询失败"}
+
         status, vip, grade = await asyncio.gather(
-            _safe(service.client_of(src).login_status(), {"loggedIn": False, "nickname": "查询失败"}),
+            _status(),
             _safe(service.vip_summary(src), ""),
             _safe(service.grade_summary(src), ""),
         )
@@ -76,8 +97,8 @@ def make_accounts(server):
 def make_account_logout(server):
     async def handler(request: web.Request) -> web.Response:
         body = await _body(request)
-        src = str(body.get("source", ""))
-        if src not in SOURCES:
+        src = _src_or_none(body)
+        if src is None:
             return _json({"error": "未知音源"}, 400)
         try:
             if src == "qq":
@@ -101,6 +122,10 @@ def make_account_refresh(server):
         src = str(body.get("source", ""))
         if src != "qq":
             return _json({"error": "仅 QQ 音乐支持凭证刷新（其余平台登录态长期有效）"}, 400)
+        # 与同文件 logout / service_check 的缺失处理对齐：库未安装时 self.qq 为 None，
+        # 裸调 refresh_credential 会 AttributeError 穿透成 500
+        if server.service.qq is None:
+            return _json({"error": "未安装 qqmusic-api-python，无法刷新"}, 400)
         ok = await server.service.qq.refresh_credential()
         return _json({"ok": ok, "msg": "刷新成功" if ok else "刷新失败（可能需要重新扫码）"})
 
@@ -112,9 +137,9 @@ def make_account_cookie(server):
 
     async def handler(request: web.Request) -> web.Response:
         body = await _body(request)
-        src = str(body.get("source", ""))
+        src = _src_or_none(body)
         value = str(body.get("value", "")).strip()
-        if src not in ("ncm", "kg", "qq"):
+        if src is None:
             return _json({"error": "未知音源"}, 400)
         if not value:
             return _json({"error": "内容不能为空"}, 400)
@@ -138,12 +163,12 @@ def make_account_cookie(server):
 def make_qr_start(server):
     async def handler(request: web.Request) -> web.Response:
         body = await _body(request)
-        src = str(body.get("source", ""))
+        src = _src_or_none(body)
+        if src is None:
+            return _json({"error": "未知音源"}, 400)
         # login_type 只有 qq 用得上（ncm/kg 是 key-based 扫码），但 LoginFlows.start
         # 对三者都接受该参数，故直接透传，不做按平台的无效三元
         login_type = str(body.get("type", "qq"))
-        if src not in SOURCES:
-            return _json({"error": "未知音源"}, 400)
         # 同源旧会话先取消：active_of + gc 的组合清不掉刚开的待扫码会话，
         # 反复点扫码会累积轮询任务（LoginFlows.start 内部也会做一次，这里是幂等的）
         await server.service.login.cancel_source(src)
@@ -197,7 +222,7 @@ def make_search(server):
             type_ = "song"
         try:
             if type_ == "song":
-                groups, src = await service.search_versions(keyword)
+                groups, src, notices = await service.search_versions(keyword)
                 for g in groups:
                     for v in g.get("versions", []):
                         server.cache_song(v)
@@ -206,6 +231,8 @@ def make_search(server):
                         "keyword": keyword,
                         "type": "song",
                         "source": src,
+                        # 聚合取数收集的登录提示：零结果时前端可提示扫码
+                        "notices": notices,
                         "groups": [
                             {
                                 "index": g.get("index", i + 1),
@@ -402,12 +429,12 @@ def make_resolve(server):
                         result["count"] = len(songs)
                     elif kind == "album":
                         result["type"] = "专辑"
-                        detail = await service.ncm.album_detail(tid)
+                        detail = await service.client_of("ncm").album_detail(tid)
                         result["name"] = (detail.get("album") or {}).get("name", "")
                         result["count"] = len(detail.get("songs") or [])
                     else:
                         result["type"] = "歌曲"
-                        lst = await service.ncm.song_detail([tid])
+                        lst = await service.client_of("ncm").song_detail([tid])
                         if lst:
                             result["name"] = f"{lst[0].get('name')} - {lst[0].get('artist')}"
             elif "kg" in hits:
@@ -415,7 +442,7 @@ def make_resolve(server):
                 target = extract_kg_target(expanded)
                 if target and target[0] == "song":
                     result["type"] = "歌曲"
-                    song = await service.kg.audio_by_hash(target[1])
+                    song = await service.client_of("kg").audio_by_hash(target[1])
                     if song:
                         result["name"] = f"{song.get('name')} - {song.get('artist')}"
             elif "qq" in hits:
@@ -425,11 +452,20 @@ def make_resolve(server):
                     kind, value = target
                     result["type"] = {"song": "歌曲", "album": "专辑", "playlist": "歌单"}[kind]
                     if kind == "song":
-                        song = await service.qq.song_detail(value)
+                        song = await service.client_of("qq").song_detail(value)
                         if song:
                             result["name"] = f"{song.get('name')} - {song.get('artist')}"
         except Exception as e:  # noqa: BLE001
-            result["error"] = e.user_msg() if isinstance(e, ApiError) else "投递失败，请稍后重试"
+            # 对齐全插件的非 2xx 契约：错误不再混进 200 响应体。matched/expanded
+            # 照常随 502 返回，前端 catch 分支可继续展示已识别的平台特征与展开链接
+            return _json(
+                {
+                    "error": e.user_msg() if isinstance(e, ApiError) else "解析失败，请稍后重试",
+                    "matched": hits,
+                    "expanded": result["expanded"],
+                },
+                502,
+            )
         if result.get("name"):
             result["playable"] = True
         return _json(result)
@@ -444,7 +480,7 @@ def make_service_check(server):
 
         async def check_ncm():
             try:
-                await service.ncm.request("/song/url/v1", {"id": 1, "level": "standard"})
+                await service.client_of("ncm").request("/song/url/v1", {"id": 1, "level": "standard"})
                 return {"ok": True, "msg": "可用"}
             except ApiError as e:
                 return {"ok": False, "msg": e.user_msg()}
@@ -454,7 +490,7 @@ def make_service_check(server):
 
         async def check_kg():
             try:
-                await service.kg.request("/search/hot", {})
+                await service.client_of("kg").request("/search/hot", {})
                 return {"ok": True, "msg": "可用"}
             except ApiError as e:
                 return {"ok": False, "msg": e.user_msg()}
@@ -468,7 +504,7 @@ def make_service_check(server):
 
                 if not qq_ok():
                     return {"ok": False, "msg": "未安装 qqmusic-api-python"}
-                status = await service.qq.login_status()
+                status = await service.client_of("qq").login_status()
                 return {"ok": True, "msg": "已登录" if status.get("loggedIn") else "匿名可用"}
             except Exception as e:  # noqa: BLE001
                 logger.warning(f"{TAG} 服务检查 qq 失败: {e}")

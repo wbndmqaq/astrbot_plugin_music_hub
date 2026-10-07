@@ -13,7 +13,7 @@ from collections.abc import Callable
 
 from astrbot.api import logger
 
-from .base import SourceClient, missing_methods
+from .base import SourceClient
 
 ClientFactory = Callable[..., SourceClient]
 
@@ -40,22 +40,3 @@ def create(config, **kwargs) -> dict[str, SourceClient]:
         except Exception as e:  # noqa: BLE001
             logger.warning(f"[music_hub] 音源 {src} 初始化失败：{e}")
     return out
-
-
-def verify(config, **kwargs) -> dict[str, list[str]]:
-    """契约自检：返回 {source: [缺失方法]}，仅含不完整的音源。
-
-    缺方法在这里报出来，而不是等用户点歌时抛 AttributeError。
-    QQ 依赖可选，未安装时不在注册表里（见 api/qq.py 的 register 时机）。
-    """
-    problems: dict[str, list[str]] = {}
-    for src, factory in _FACTORIES.items():
-        try:
-            client = factory(config, **kwargs)
-        except Exception as e:  # noqa: BLE001
-            problems[src] = [f"实例化失败: {e}"]
-            continue
-        missing = missing_methods(client)
-        if missing:
-            problems[src] = missing
-    return problems

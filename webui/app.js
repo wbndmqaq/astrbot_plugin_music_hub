@@ -322,6 +322,9 @@
         toast(e.message, "error");
       });
     }
+    // 文档高度只在 boot/resize 测过：面板渲染后 scrollHeight 可能翻倍，
+    // 旧值会让进度条提前走满。下一帧重测（复用 measureScroll，避免每帧重查节点）
+    requestAnimationFrame(measureScroll);
   }
   function loadSearchExtras() {
     focusSearch();
@@ -436,6 +439,18 @@
       '<br><button class="btn btn-ghost btn-sm" style="margin-top:10px" data-act="panel-retry">重试</button></div>';
   }
   function setLoaded(sel) { busy(sel, false); }
+  // 统计卡 markup 两处共用（总览 / 调用统计）：icon 优先用 c.src 的平台 logo，
+  // 否则取 ICONS[c.ico]；总览的静默轮询不走这里（走 patchNumbers 原地更新）
+  function statCardHtml(cards) {
+    return cards.map(function (c) {
+      return '<div class="stat-card' + (c.tone ? " tone-" + c.tone : "") + '">' +
+        '<div class="icon">' +
+        (c.src ? '<img src="/webui/logos/' + esc(c.src) + '.png" alt="" />' : ICONS[c.ico]) + "</div>" +
+        '<div class="label">' + esc(c.label) + "</div>" +
+        '<div class="num" data-n="' + c.num + '">0</div>' +
+        '<div class="foot">' + esc(c.foot) + "</div></div>";
+    }).join("");
+  }
 
   /* ─────────── 总览 ─────────── */
   var _ovSeq = 0;
@@ -486,14 +501,7 @@
     // 判据用显式标记而非 childElementCount：骨架屏 skeletonRows(4,96) 恰好也是 4，
     // 两者撞车会让重试后的骨架屏永久驻留（patchNumbers 找不到 .num 就什么都不做）。
     if (grid.getAttribute("data-rendered") !== "1" || !grid.querySelector(".stat-card")) {
-      grid.innerHTML = cards.map(function (c) {
-        return '<div class="stat-card' + (c.tone ? " tone-" + c.tone : "") + '">' +
-          '<div class="icon">' +
-          (c.src ? '<img src="/webui/logos/' + esc(c.src) + '.png" alt="" />' : ICONS[c.ico]) + "</div>" +
-          '<div class="label">' + esc(c.label) + "</div>" +
-          '<div class="num" data-n="' + c.num + '">0</div>' +
-          '<div class="foot">' + esc(c.foot) + "</div></div>";
-      }).join("");
+      grid.innerHTML = statCardHtml(cards);
       grid.classList.remove("no-anim");
       grid.setAttribute("data-rendered", "1");
       $$(".num", grid).forEach(function (el) { countUp(el, num(el.dataset.n)); });
@@ -543,8 +551,11 @@
     } else {
       grid.classList.add("no-anim");
     }
-    sources.forEach(function (s) {
-      var card = grid.querySelector('.svc[data-src="' + s.source + '"]');
+    // 按 data-src 拼 querySelector 会对引号/反斜杠敏感，改索引对位：
+    // 上面的重建分支保证 .svc 数量与 sources 一一对应
+    var cards = $$(".svc", grid);
+    sources.forEach(function (s, i) {
+      var card = cards[i];
       if (!card) return;
       var tag = !s.enabled ? "未配置" : s.logged ? "已登录" : s.source === "qq" ? "匿名可用" : "匿名";
       var tagEl = card.querySelector(".svc-tag");
@@ -583,6 +594,8 @@
   var searchItems = [];
   var searchFilter = "all";
   var searchType = "song";
+  // 非 song 类型的中文名：空结果文案与结果徽标共用一份
+  var TYPED_NAMES = { song: "歌曲", playlist: "歌单", album: "专辑", artist: "歌手" };
   var _audio = null;
   var _previewBtn = null;
   var _previewSeq = 0;
@@ -654,18 +667,26 @@
       btn.disabled = false;
     }
   }
+  var _scopeSeq = 0;
   async function loadScopes() {
     var sel = $("#remoteScope");
     if (!sel) return;
+    var seq = ++_scopeSeq;
     try {
       var d = await jget("/api/remote/scopes");
+      if (seq !== _scopeSeq) return;  // 快速切面板时丢弃过期响应
       var cur = sel.value;
       sel.innerHTML = (d.scopes || []).map(function (s) {
         return '<option value="' + esc(s.umo) + '">' + esc(s.scope) + "</option>";
       }).join("") || '<option value="">暂无会话（群里先发一次指令）</option>';
       $("#remoteBar").hidden = false;
       if (cur) sel.value = cur;
-    } catch (e) { $("#remoteBar").hidden = false; }
+    } catch (e) {
+      if (seq !== _scopeSeq || (e && e.aborted)) return;
+      // 失败也要展开投递条：保留手动刷新入口，且不能静默
+      $("#remoteBar").hidden = false;
+      toast(e.message, "error");
+    }
   }
   async function doSearch() {
     clearTimeout(_debounceTimer);
@@ -697,7 +718,7 @@
     updateFilterBar();
     renderSearchResults(true);
     var empty = searchType === "song" ? !searchGroups.length : !searchItems.length;
-    if (empty) box.innerHTML = '<div class="empty-state">没有搜到「' + esc(keyword) + '」相关的歌曲</div>';
+    if (empty) box.innerHTML = '<div class="empty-state">没有搜到「' + esc(keyword) + '」相关的' + esc(TYPED_NAMES[searchType] || "内容") + "</div>";
     else toast("找到 " + (searchType === "song" ? searchGroups.length : searchItems.length) + " 条结果", "ok");
   }
   // 筛选条显隐只认一处判据：歌单 tab 切回单曲且输入为空时，
@@ -738,7 +759,9 @@
       var primary = (g.versions || [])[0] || {};
       var canPlay = primary.sid && !primary.pay;
       return '<div class="result-row"' + (animate === false ? "" : ' style="animation-delay:' + Math.min(i * 45, 240) + 'ms"') + ">" +
-        (g.cover
+        // httpsUrl 可能拒绝非 http(s) 地址返回空串：外层三元必须判净化结果，
+        // 否则输出 src=""（部分浏览器会当当前页 URL 发请求）
+        ((g.cover && httpsUrl(g.cover))
           ? '<img class="result-cover" src="' + esc(httpsUrl(g.cover)) + '" referrerpolicy="no-referrer" alt="" />'
           : '<div class="result-cover-ph" aria-hidden="true">♪</div>') +
         '<div class="result-main"><div class="result-name">' + esc(g.name) + "</div>" +
@@ -753,20 +776,17 @@
     bindCoverFallback(box);
   }
   function renderTypedResults(box, animate) {
-    var kindName = { playlist: "歌单", album: "专辑", artist: "歌手" };
+    // 歌单/专辑/歌手不渲染投递按钮：/api/search 非 song 分支只回 id 无 sid，
+    // 且把整个歌单当音频投递本就无意义，这里只展示来源与类型
     box.innerHTML = searchItems.map(function (it, i) {
-      // 歌单/专辑/歌手结果也要有操作按钮，与单曲 tab 能力一致
       return '<div class="result-row"' + (animate === false ? "" : ' style="animation-delay:' + Math.min(i * 45, 240) + 'ms"') + ">" +
-        (it.cover
+        ((it.cover && httpsUrl(it.cover))
           ? '<img class="result-cover" src="' + esc(httpsUrl(it.cover)) + '" referrerpolicy="no-referrer" alt="" />'
           : '<div class="result-cover-ph" aria-hidden="true">♪</div>') +
         '<div class="result-main"><div class="result-name">' + esc(it.name) + "</div>" +
         '<div class="result-sub">' + esc(it.sub || "") + (it.count ? " · " + esc(it.count) + " 首" : "") + "</div></div>" +
         '<div class="result-vers"><span class="src-dot ' + esc(it.source) + '">' + esc(it.sourceName || it.source) + "</span></div>" +
-        '<div class="row-actions">' +
-        (it.sid ? '<button class="btn btn-blue btn-sm" data-act="deliver" data-source="' + esc(it.source) + '" data-sid="' + esc(it.sid) + '">投递</button>' : "") +
-        "</div>" +
-        '<div class="result-dur"><span class="badge">' + (kindName[searchType] || searchType) + "</span></div></div>";
+        '<div class="result-dur"><span class="badge">' + esc(TYPED_NAMES[searchType] || searchType) + "</span></div></div>";
     }).join("") || '<div class="empty-state">没有搜到相关结果</div>';
     bindCoverFallback(box);
   }
@@ -835,7 +855,9 @@
     var inks = { ncm: "var(--ncm-ink)", kg: "var(--kg-ink)", qq: "var(--qq-ink)" };
     $("#acctGrid").innerHTML = (d.accounts || []).map(function (a, i) {
       var ok = a.loggedIn;
-      var ava = ok && a.avatar
+      // httpsUrl 拒绝非 http(s) 头像时返回空串：判净化结果而非原字段，
+      // 落回平台 logo 占位而不是 src=""
+      var ava = ok && a.avatar && httpsUrl(a.avatar)
         ? '<img src="' + esc(httpsUrl(a.avatar)) + '" alt="" referrerpolicy="no-referrer" />'
         : '<img class="acct-src-logo" src="/webui/logos/' + esc(a.source) + '.png" alt="" />';
       return '<div class="acct" style="--sc:' + (colors[a.source] || "#888") + ';--sci:' + (inks[a.source] || "var(--sub)") + ';animation-delay:' + i * 70 + 'ms">' +
@@ -856,12 +878,17 @@
 
   /* 扫码弹窗 */
   var qrTicket = null, qrTimer = null, qrSource = null;
+  var _qrPollBusy = false;
+  // 连续失败计数：扫码窗口几分钟，一次网络抖动（15s 超时）不该把轮询杀掉。
+  // ≤3 次继续轮，>3 才转终态；任意一轮成功即清零（openQR 开新会话也清零）
+  var qrFailCount = 0;
   var _qrPrevFocus = null;
   // openQR 的 await 期间用户可能已按 Esc 关窗；返回后必须核对 token
   var _qrOpenToken = 0;
   var FOCUSABLE = 'button:not([disabled]),[href],input,select,textarea,[tabindex]:not([tabindex="-1"])';
   async function openQR(source) {
     qrSource = source;
+    qrFailCount = 0;
     var token = ++_qrOpenToken;
     _qrPrevFocus = document.activeElement;   // 关闭后归还焦点，保持键盘动线
     $("#qrMask").hidden = false;
@@ -881,7 +908,11 @@
         return;
       }
       qrTicket = r.ticket;
-      if (r.qr) { $("#qrImg").src = r.qr; setQRState("请使用手机 App 扫码", ""); }
+      // r.qr 是后端自产的 data:image/png;base64（core/login.py 组包），不是外链，
+      // 过不了 httpsUrl 白名单（data: 被刻意丢弃）；这里钉死 data URI 形态——
+      // 形态不对（被劫持/改字段才可能出现）就当没有图，落回 qrUrl 或错误提示
+      var qrData = typeof r.qr === "string" && r.qr.indexOf("data:image/png;base64,") === 0 ? r.qr : "";
+      if (qrData) { $("#qrImg").src = qrData; setQRState("请使用手机 App 扫码", ""); }
       else if (r.qrUrl) {
         // 纯文本 URL 不可点
         setQRStateHTML('<a href="' + esc(httpsUrl(r.qrUrl)) + '" target="_blank" rel="noopener">点此打开二维码页面</a>（或复制链接到浏览器）');
@@ -893,37 +924,51 @@
       setQRState("创建失败：" + e.message, "bad");
     }
   }
-  function pollQR() {
-    clearInterval(qrTimer);
-    qrTimer = setInterval(async function () {
-      if (!qrTicket) { clearInterval(qrTimer); qrTimer = null; return; }
-      try {
-        var s = await jget("/api/qr/status?ticket=" + encodeURIComponent(qrTicket));
-        if (s.state === "wait") { setQRState("等待扫码…", ""); }
-        else if (s.state === "scanned") { setQRState("已扫码，请在手机上确认", ""); }
-        else if (s.state === "done") {
-          clearInterval(qrTimer);
-          qrTimer = null;
-          setQRState("登录成功 " + (s.nickname || ""), "ok");
-          toast(SRC_NAMES[qrSource] + " 登录成功", "ok");
-          setTimeout(closeQR, 900);
-          loadAccounts();
-        } else if (s.state === "timeout") {
-          clearInterval(qrTimer);
-          qrTimer = null;
-          $("#qrImgWrap").classList.add("expired");
-          setQRState("二维码已过期，请刷新", "bad");
-        } else if (s.state === "refuse" || s.state === "cancel") {
-          clearInterval(qrTimer);
-          qrTimer = null;
-          setQRState("已取消：" + (s.msg || ""), "bad");
-        }
-      } catch (e) {
-        clearInterval(qrTimer);
-        qrTimer = null;
-        setQRState("查询失败：" + e.message, "bad");
+  // 递归 setTimeout 而非 setInterval（同 pollLogsOnce 的模式）：interval 会与
+  // 上一次请求重叠，没有 in-flight 守卫时同一张票可能被并发查询两次
+  function pollQR() { scheduleQRPoll(_qrOpenToken); }
+  function scheduleQRPoll(token) {
+    clearTimeout(qrTimer);
+    qrTimer = setTimeout(function () { pollQROnce(token); }, 1500);
+  }
+  async function pollQROnce(token) {
+    qrTimer = null;
+    if (_qrPollBusy || token !== _qrOpenToken || !qrTicket || $("#qrMask").hidden) return;
+    _qrPollBusy = true;
+    try {
+      var s = await jget("/api/qr/status?ticket=" + encodeURIComponent(qrTicket));
+      if (token !== _qrOpenToken) return;  // 等待期间弹窗已关 / 已重新打开
+      qrFailCount = 0;   // 本轮查询成功：连续失败计数清零
+      if (s.state === "wait") { setQRState("等待扫码…", ""); }
+      else if (s.state === "scanned") { setQRState("已扫码，请在手机上确认", ""); }
+      else if (s.state === "done") {
+        setQRState("登录成功 " + (s.nickname || ""), "ok");
+        toast(SRC_NAMES[qrSource] + " 登录成功", "ok");
+        setTimeout(closeQR, 900);
+        loadAccounts();
+        return;
+      } else if (s.state === "timeout") {
+        $("#qrImgWrap").classList.add("expired");
+        setQRState("二维码已过期，请刷新", "bad");
+        return;
+      } else if (s.state === "refuse" || s.state === "cancel") {
+        setQRState("已取消：" + (s.msg || ""), "bad");
+        return;
       }
-    }, 1500);
+    } catch (e) {
+      // 与 pollLogsOnce 的「早退也重排」纪律对齐：一次网络抖动不该停摆整个扫码
+      // 窗口。连续失败 ≤3 次继续轮（文案用中性色，不吓退正在扫码的人），超过才
+      // 转终态 bad；弹窗已关则直接丢弃
+      qrFailCount++;
+      if (token !== _qrOpenToken || qrFailCount > 3) {
+        if (token === _qrOpenToken) setQRState("查询失败：" + e.message, "bad");
+        return;
+      }
+      setQRState("查询失败，重试中…", "");
+    } finally {
+      _qrPollBusy = false;
+    }
+    scheduleQRPoll(token);  // wait / scanned / 瞬时失败继续轮，终态不再排下一轮
   }
   function setQRState(text, cls) {
     var el = $("#qrState");
@@ -937,7 +982,7 @@
   }
   function closeQR() {
     _qrOpenToken++;   // 作废在途的 openQR，其返回后不会再赋值/轮询
-    clearInterval(qrTimer);
+    clearTimeout(qrTimer);
     qrTimer = null;
     // 无条件发 cancel（后端有 ticket 校验，多发无害）：openQR 请求飞行期间关窗时
     // qrTicket 还是 null，漏发会让服务端会话成孤儿。
@@ -980,13 +1025,7 @@
       { label: "QQ 累计", num: num(d.total && d.total.qq), tone: "qq", foot: "今日 " + num(d.today && d.today.qq), ico: "qq" }
     ];
     var grid = $("#statGrid2");
-    grid.innerHTML = cards.map(function (c) {
-      return '<div class="stat-card' + (c.tone ? " tone-" + c.tone : "") + '">' +
-        '<div class="icon">' + ICONS[c.ico] + "</div>" +
-        '<div class="label">' + esc(c.label) + "</div>" +
-        '<div class="num" data-n="' + c.num + '">0</div>' +
-        '<div class="foot">' + esc(c.foot) + "</div></div>";
-    }).join("");
+    grid.innerHTML = statCardHtml(cards);
     $$(".num", grid).forEach(function (el) { countUp(el, num(el.dataset.n)); });
 
     drawTrend(d.days || []);
@@ -1010,10 +1049,22 @@
         '<div class="err-count">× ' + num(t.count) + "</div></div>";
     }).join("");
   }
+  var _histSeq = 0;
   async function loadHistory() {
-    var d = await jget("/api/history");
+    var seq = ++_histSeq;
+    // 骨架屏与错误态互斥（同 loadAcl 等面板）：失败必须 renderError 覆盖掉骨架屏
+    withSkeleton("#historyFeed", skeletonRows(2, 60));
+    var d;
+    try {
+      d = await jget("/api/history");
+    } catch (e) {
+      if (seq !== _histSeq || (e && e.aborted)) return;
+      renderError("#historyFeed", e.message);
+      return;
+    }
+    if (seq !== _histSeq) return;  // 快速切面板时丢弃过期响应
     var feed = $("#historyFeed");
-    var rows = d.history || [];
+    var rows = (d && d.history) || [];
     if (!rows.length) {
       feed.innerHTML = '<div class="empty-state">各会话还没有播放记录</div>';
       return;
@@ -1064,7 +1115,10 @@
     var bw = (W - padL - 8) / Math.max(days.length, 1);
     var scale = function (v) { return (H - padB - padT) * (v / max); };
     var parts = [];
-    parts.push("<title id=\"trendA11y\">近 " + days.length + " 天网易云 / 酷狗 / QQ 音乐调用次数堆叠柱状图，逐日数据见下方数据表</title>");
+    // 空数据时「近 0 天……」读着像故障：标题直接给「暂无数据」
+    parts.push("<title id=\"trendA11y\">" + (days.length
+      ? "近 " + days.length + " 天网易云 / 酷狗 / QQ 音乐调用次数堆叠柱状图，逐日数据见下方数据表"
+      : "暂无数据") + "</title>");
     parts.push("<desc>" + days.map(function (d) {
       return esc(d.label) + " 网易云 " + num(d.ncm) + "、酷狗 " + num(d.kg) + "、QQ " + num(d.qq);
     }).join("；") + "</desc>");
@@ -1204,17 +1258,24 @@
   // handler 必须 return saveAcl(...)：否则 restore() 当场执行、按钮立刻可再点，
   // 连点用同一份旧快照互相覆盖 → 丢条目。
   function saveAcl(patch) {
-    // set_acl 是整体覆盖语义，重入会丢数据
-    if (_aclSaving) { toast("正在保存，请稍候", "warn"); return Promise.resolve(); }
+    // set_acl 是整体覆盖语义，重入会丢数据。
+    // resolve 值约定：true = 已保存成功，false = 失败 / 正在保存中
+    // （aclAdd 靠它决定是否清空输入框；其余调用方忽略该值，行为不变）
+    if (_aclSaving) { toast("正在保存，请稍候", "warn"); return Promise.resolve(false); }
     _aclSaving = true;
-    Object.assign(aclData, patch);
-    return jpost("/api/acl/save", aclData).then(function (r) {
+    // 先发合并副本，成功后才写回 aclData：提前 Object.assign 的话保存失败
+    // 内存里会留下幽灵数据，下一次任意成功保存会把失败过的操作连带提交，
+    // aclCopy 导出的也是没保存成功的脏数据
+    var merged = Object.assign({}, aclData, patch);
+    return jpost("/api/acl/save", merged).then(function (r) {
       _aclSaving = false;
-      if (r.ok) { toast("黑白名单已保存", "ok"); return loadAcl(); }
+      if (r.ok) { aclData = merged; toast("黑白名单已保存", "ok"); return loadAcl().then(function () { return true; }); }
       toast(r.error || "保存失败", "error");
+      return false;
     }, function (e) {
       _aclSaving = false;
       toast(e.message, "error");
+      return false;
     });
   }
   function aclAdd(kind, inputSel) {
@@ -1230,8 +1291,8 @@
     });
     if (!added) { toast("条目都已存在", "warn"); return Promise.resolve(); }
     var patch = {}; patch[kind] = items;
-    input.value = "";
-    return saveAcl(patch);
+    // 保存成功才清输入：失败 / 忙时保留，用户不用重新粘贴长名单
+    return saveAcl(patch).then(function (ok) { if (ok) input.value = ""; });
   }
   function aclDel(key, idx) {
     var items = (aclData[key] || []).slice();
@@ -1245,7 +1306,7 @@
     var text = items.join("\n");
     if (navigator.clipboard && navigator.clipboard.writeText) {
       navigator.clipboard.writeText(text).then(function () { toast("已复制 " + items.length + " 条到剪贴板", "ok"); },
-        function () { toast("复制失败，请手动选择导出", "error"); });
+        function () { toast("复制失败，请在列表里手动选中复制", "error"); });
     } else {
       toast("浏览器不支持剪贴板 API", "warn");
     }
@@ -1267,7 +1328,7 @@
     ["ffmpegCompress", "失败压缩重试", "发送失败时压成 mp3 重试"],
     ["sendNativeCard", "原生音乐卡片", "OneBot 平台官方小程序卡"],
     ["qqofficialAdapt", "QQ 官方适配", "合并消息节省配额"],
-    ["qqofficialChunkedUpload", "官方分片上传", "qq_official >10MB 文件"]
+    ["qqofficialChunkedUpload", "官方分片上传", "QQ 官方通道发送超过 10MB 的文件时启用"]
   ];
   // 面板开关必须与配置 schema 一一对应（总开关等 5 项曾在面板里缺失，
   // 用户会误以为插件没关掉）。改配置分组时对照 _conf_schema.json 核对。
@@ -1313,6 +1374,12 @@
     var c = cfgData;
     var body = $("#configBody");
     if (!c) return;
+    // 分组缺键兜底空对象（同下方 scheduler 的写法）：配置缺某一分组时
+    // c.ncm.apiBase 这类访问会直接抛 TypeError，整个配置面板渲染不出来
+    c.ncm = c.ncm || {};
+    c.kg = c.kg || {};
+    c.qq = c.qq || {};
+    c.webui = c.webui || {};
     var html = "";
 
     // count 由调用处显式传入：按 inner 里 "cfg-item" 出现次数统计，
@@ -1463,9 +1530,16 @@
     if (btn) { btn.disabled = true; btn.textContent = "保存中…"; }
     try {
       var r = await jpost("/api/config/save", { config: patch });
-      if (r.rejected && r.rejected.length) toast("部分项被拒绝：" + r.rejected.join(", "), "warn");
-      else toast("配置已保存" + (r.note ? " " + r.note : ""), "ok");
-      syncConfigView(patch);
+      if (r.rejected && r.rejected.length) {
+        // 有被拒项时本地 patch 不等于实际生效值：原地同步会把「没存进去的值」
+        // 留在面板上误导用户，必须重拉服务端真实配置回填
+        toast("部分项被拒绝：" + r.rejected.join(", "), "warn");
+        var fresh = await jget("/api/config");
+        if (fresh && fresh.config) { cfgData = fresh.config; renderConfig(); }
+      } else {
+        toast("配置已保存" + (r.note ? " " + r.note : ""), "ok");
+        syncConfigView(patch);
+      }
     } catch (e) {
       toast(e.message, "error");
     } finally {
@@ -1537,7 +1611,10 @@
   var _clearedAt = 0;   // 清屏时刻（秒），之后过滤更早条目
   function logLine(e) {
     var cls = e.level === "ERROR" ? "err" : e.level === "WARNING" ? "warn" : "info";
-    return '<div class="log-line log-' + cls + '"><span class="log-lv">' + esc(e.level) + "</span>" + esc(e.msg) + "</div>";
+    // 后端存的是结构化字段：级别徽标 / 时间 / 正文分开渲染，
+    // ts（秒级 unix）同时是「清屏」过滤的判据
+    return '<div class="log-line log-' + cls + '"><span class="log-lv">' + esc(e.level) + "</span>" +
+      '<span class="log-ts">' + fmtTime(e.ts) + "</span>" + esc(e.msg) + "</div>";
   }
   function renderLogEntries(entries) {
     var box = $("#logConsole");
@@ -1551,10 +1628,11 @@
   var LOG_MAX = 400;   // DOM 节点数封顶：面板开久了 insertAdjacentHTML 会累积上万节点
   function appendLogEntries(entries) {
     var box = $("#logConsole");
-    if (box.querySelector(".empty-state")) box.innerHTML = "";
     // 清屏后不立刻被 2.5s 后的新日志覆盖掉「已清屏」提示：过滤更早条目
     entries = entries.filter(function (e) { return num(e.ts) >= _clearedAt; });
+    // 先判空再清理：全被过滤时直接退，否则 empty-state 被抹掉后控制台变无提示黑屏
     if (!entries.length) return;
+    if (box.querySelector(".empty-state")) box.innerHTML = "";
     // 用户上滑查看历史时不要抢滚动
     var atBottom = box.scrollHeight - box.scrollTop - box.clientHeight < 40;
     var wrap = document.createElement("div");
@@ -1585,7 +1663,10 @@
         _logSeq = num(d.seq);
         renderLogEntries(d.entries || []);
       }
-    } catch (e) { /* 面板静默 */ }
+    } catch (e) {
+      // 与其它面板 loader 一致：失败渲染错误态 + 重试按钮，别让骨架屏长亮
+      if (!(e && e.aborted)) renderError("#logConsole", e.message);
+    }
     scheduleLogPoll();
   }
   // 递归 setTimeout 而非 setInterval：interval 会与上一次请求重叠，
@@ -1596,7 +1677,10 @@
   }
   async function pollLogsOnce() {
     _logTimer = null;
-    if (curPanel !== "logs" || document.hidden || !$("#loginMask").hidden || _logBusy) return;
+    // 只有真的离开日志面板才停表。隐藏页签 / 登录遮罩 / 上一轮未完这三个早退
+    // 必须照常排下一轮：直接 return 会杀掉自递归定时器，切回页签后日志永久停更
+    if (curPanel !== "logs") return;
+    if (document.hidden || !$("#loginMask").hidden || _logBusy) { scheduleLogPoll(); return; }
     _logBusy = true;
     try {
       var d2 = await jget("/api/logs?after=" + _logSeq);
@@ -1650,6 +1734,10 @@
   });
 
   /* ─────────── 事件委托 ─────────── */
+  // 统一 busy-restore 的豁免名单（modal-x 走 class 判断，这两类走 action 判断）：
+  // 按钮文案本身就是状态——试听写「⏸ 播放中」，promise 结束后被 restore 覆盖回
+  // 「▶ 试听」会把播放态冲掉；投递有自己的防重锁与结果提示
+  var BUSY_SELF_MANAGED = { preview: true, deliver: true };
   document.addEventListener("click", function (e) {
     var t = e.target.closest("[data-act]");
     if (!t) return;
@@ -1675,18 +1763,20 @@
         hideLogin();
         showLogin();
       },
-      "login": doLogin,
       "svc-check": async function () {
         // 不自己改文案：外层委托已经统一处理 data-busy（文案透明 + 转圈）
         try {
           var r = await jget("/api/service/check");
           var lines = [];
+          var bad = 0;
           ["ncm", "kg", "qq"].forEach(function (s) {
             var item = r[s] || {};
+            // ok 是结构化字段，直接用它计数。渲染后的字符串行首恒是「网易云：」
+            // 这类音源名前缀，拿「✗」做 indexOf 前缀匹配永远打不中，全挂也会弹 ok 色
+            if (!item.ok) bad++;
             lines.push(SRC_NAMES[s] + "：" + (item.ok ? "✓ " : "✗ ") + (item.msg || ""));
           });
           // 合成一条 toast：一次发 3 条会互相挤掉，且读屏连播三段
-          var bad = lines.filter(function (l) { return l.indexOf("✗") === 0; }).length;
           toast(lines.join("；"), bad ? "warn" : "ok");
           loadOverview();
         } catch (err) { toast(err.message, "error"); }
@@ -1708,7 +1798,8 @@
         // 记时刻而不是只清 DOM：不停轮询的话 2.5s 后新日志会立刻覆盖「已清屏」
         _clearedAt = Math.floor(Date.now() / 1000);
         var box = $("#logConsole");
-        if (_logSeq) { jget("/api/logs?after=" + _logSeq).then(function (d) { _logSeq = num(d.seq); }); }
+        // 只同步 seq，失败无碍：本地已清屏，下一轮轮询会照常带回新日志
+        if (_logSeq) { jget("/api/logs?after=" + _logSeq).then(function (d) { _logSeq = num(d.seq); }).catch(function () {}); }
         box.innerHTML = '<div class="empty-state">已清屏（仅本地显示）</div>';
       },
       "acl-copy-black": function () { aclCopy("blacklist"); },
@@ -1784,8 +1875,11 @@
       // （黑白名单 set_acl 是整体覆盖语义），这里做幂等锁 + 转圈反馈
       if (t.dataset.busy) return;
       var restore = null;
-      // 「×」「✕」这类窄图标按钮不能写「处理中…」（会撑破 32~44px 的方块）
-      if (t.tagName === "BUTTON" && t.textContent.trim() && !t.classList.contains("modal-x") && !t.classList.contains("bn-item")) {
+      // 「×」「✕」这类窄图标按钮不能写「处理中…」（会撑破 32~44px 的方块）：
+      // modal-x 关闭钮、bn-item 底栏项、黑白名单 le-item 里的 32px 删除钮
+      // （无 .btn 类，转圈样式不生效；防连点由 saveAcl 的 _aclSaving 锁兜底）
+      if (t.tagName === "BUTTON" && t.textContent.trim() && !t.classList.contains("modal-x") &&
+          !t.classList.contains("bn-item") && !t.closest(".le-item") && !BUSY_SELF_MANAGED[act]) {
         t.dataset.busy = "1";
         t.dataset.busyText = t.textContent;
         t.textContent = "处理中…";
@@ -1890,7 +1984,11 @@
       if (!meta.authed) { showLogin(); return; }
       boot();
     } catch (e) {
+      // 断连与未登录必须可区分。toast 要放在 showLogin 之后入队：showLogin 内部
+      // 会 clearToasts()，先弹的会被自己清掉；toastBox(z:500) 在登录遮罩(z:200)
+      // 之外且层级更高，登录框上能正常看到这条错误
       showLogin();
+      toast("无法连接面板服务：" + e.message, "error");
     }
   }
   window.addEventListener("beforeunload", stopAllPolls);

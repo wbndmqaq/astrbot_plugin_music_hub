@@ -27,7 +27,7 @@ from .explore_common import (
 
 async def run_album_comments(service, event):
     m = re.search(_RE_ALBUM_COMMENT, event.message_str, re.IGNORECASE)
-    src = await _pick_source(service, event, m.group(1) if m else "")
+    src = _pick_source(service, event, m.group(1) if m else "")
     kw = (m.group(2) if m else "").strip()
     if not kw:
         await service.reply(event, "用法：专辑评论 专辑名")
@@ -56,7 +56,7 @@ async def run_album_comments(service, event):
 
 async def run_playlist_comments(service, event):
     m = re.search(_RE_PLAYLIST_COMMENT, event.message_str, re.IGNORECASE)
-    src = await _pick_source(service, event, m.group(1) if m else "")
+    src = _pick_source(service, event, m.group(1) if m else "")
     kw = (m.group(2) if m else "").strip()
     if not kw:
         await service.reply(event, "用法：歌单评论 歌单名")
@@ -86,7 +86,7 @@ async def run_playlist_comments(service, event):
 async def run_artist_albums(service, event):
     """歌手专辑：ncm / kg / qq 三源。"""
     m = re.search(_RE_ARTIST_ALBUM, event.message_str, re.IGNORECASE)
-    src = await _pick_source(service, event, m.group(1) if m else "")
+    src = _pick_source(service, event, m.group(1) if m else "")
     kw = (m.group(2) if m else "").strip()
     if not kw:
         await service.reply(event, "用法：歌手专辑 歌手名")

@@ -13,6 +13,7 @@ import aiohttp
 
 from . import SOURCE_KG, SOURCE_NCM, SOURCE_QQ
 from .api.http import USER_AGENT, get_session
+from .errors import ApiError
 
 # 各平台分享特征（用于判断消息是否归本插件解析）
 HINTS = {
@@ -36,6 +37,14 @@ _REDIRECT_STATUS = (301, 302, 303, 307, 308)
 
 _EXPAND_TIMEOUT = aiohttp.ClientTimeout(total=8)
 
+# 展开护栏。威胁场景：WebUI 解析接口（/api/resolve）把整段请求文本原样送进
+# expand_short_links，body 上限 1MB —— 无上限时一条构造消息可命中数千条短链，
+# 放大成数千次串行出站 GET（每条 8s 超时），单请求即可占死事件循环。
+# 因此只在前 _EXPAND_TEXT_MAX 字符内匹配短链、每次调用最多展开 _EXPAND_MAX 条，
+# 超出部分原样保留（下游已有「短链解析失败，请发完整链接」提示兜底）。
+_EXPAND_MAX = 5
+_EXPAND_TEXT_MAX = 2000
+
 
 def is_allowed_redirect(loc: str) -> bool:
     """重定向目标是否在三平台白名单内。
@@ -55,7 +64,11 @@ def is_allowed_redirect(loc: str) -> bool:
 
 
 async def expand_short_links(text: str) -> str:
-    """163cn.tv / c6.y.qq.com 短链 302 展开（重定向白名单校验）。"""
+    """163cn.tv / c6.y.qq.com 短链 302 展开（重定向白名单校验）。
+
+    只展开前 _EXPAND_MAX 条、只匹配前 _EXPAND_TEXT_MAX 字符（护栏理由见常量注释），
+    超出的短链原样返回，不报错也不拦截。
+    """
 
     async def _expand(url: str) -> str:
         try:
@@ -69,11 +82,12 @@ async def expand_short_links(text: str) -> str:
             pass
         return url
 
-    matches = list(SHORT_LINK_RE.finditer(text or ""))
+    # 匹配窗口限长：1MB 文本先截前 2000 字符再找短链，窗口外的原样保留
+    matches = list(SHORT_LINK_RE.finditer((text or "")[:_EXPAND_TEXT_MAX]))
     if not matches:
         return text or ""
     out = text or ""
-    for m in matches:
+    for m in matches[:_EXPAND_MAX]:
         expanded = await _expand(m.group(0))
         if expanded != m.group(0):
             out = out.replace(m.group(0), expanded)
@@ -106,7 +120,9 @@ def collect_text(event, *, include_json: bool = True) -> str:
         try:
             raw = event.message_obj.raw_message
             if isinstance(raw, str) and raw and raw not in parts:
-                parts.append(raw)
+                # JSON 卡片的 CQ 码里路径分隔符是转义形式（playlist\/123），不还原的话
+                # 后面的路径形正则（playlist/(\d+) 等）会全部漏匹配
+                parts.append(raw.replace("\\/", "/"))
         except Exception:  # noqa: BLE001
             pass
     return "\n".join(parts)
@@ -160,25 +176,37 @@ def extract_qq_target(text: str) -> tuple[str, str] | None:
     return None
 
 
+def _looks_like_share(text: str) -> bool:
+    """能进「冷却 + 解析」流程的最低门槛。
+
+    share.py 的 HINTS 预过滤只认平台名，闲聊里提一句「酷狗」也会命中；冷却章与
+    任何回复都必须盖在确认「这真的是一条分享」之后，否则普通聊天会被回
+    「冷却中」并吞掉事件（stop_event）。判定口径：带链接 /「分享」/《歌名》
+    / 可提取出具体目标 / qqmusic:// 深链。
+    """
+    text = text or ""
+    if "qqmusic://" in text or SHORT_LINK_RE.search(text) or _SHARE_FEATURE_RE.search(text):
+        return True
+    return bool(extract_ncm_target(text) or extract_kg_target(text) or extract_qq_target(text))
+
+
 async def handle_resolve(service, event, text: str) -> bool:
     """解析分享链接/卡片。返回是否已处理。
 
     与点歌共用同一冷却章：连发分享链接会连环触发取流 + 下载 + 发送，必须频控。
     未接管（返回 False）或只回了提示（如短链失败）时退还，不占用接下来的点歌冷却。
+    异常兜底在 _resolve_inner 内部，这里不再包一层（原先的外层 except 是死代码）。
     """
-    try:
-        reason = await service.check_cooldown(event)
-        if reason:
-            await service.reply(event, "操作太频繁，链接解析冷却中，稍后再试")
-            return True
-        handled = await _resolve_inner(service, event, text)
-        if not handled:
-            service.release_cooldown(event)
-        return handled
-    except Exception as e:  # noqa: BLE001 - 解析失败不影响主流程
-        service.release_cooldown(event)
-        service.log_warn(f"链接解析异常: {e}")
+    if not _looks_like_share(text):
         return False
+    reason = service.check_cooldown(event)
+    if reason:
+        await service.reply(event, "操作太频繁，链接解析冷却中，稍后再试")
+        return True
+    handled = await _resolve_inner(service, event, text)
+    if not handled:
+        service.release_cooldown(event)
+    return handled
 
 
 async def _resolve_inner(service, event, text: str) -> bool:
@@ -200,7 +228,7 @@ async def _resolve_inner(service, event, text: str) -> bool:
                         )
                         return True
                 elif kind == "album":
-                    detail = await service.ncm.album_detail(tid)
+                    detail = await service.client_of(SOURCE_NCM).album_detail(tid)
                     if detail.get("songs"):
                         await service.list_to_session(
                             event,
@@ -210,7 +238,7 @@ async def _resolve_inner(service, event, text: str) -> bool:
                         )
                         return True
                 else:
-                    lst = await service.ncm.song_detail([tid])
+                    lst = await service.client_of(SOURCE_NCM).song_detail([tid])
                     if lst:
                         await service.play_song(event, lst[0], source_label="链接解析")
                         return True
@@ -223,12 +251,13 @@ async def _resolve_inner(service, event, text: str) -> bool:
             if target:
                 kind, value = target
                 if kind == "song":
-                    song = await service.kg.audio_by_hash(value)
+                    song = await service.client_of(SOURCE_KG).audio_by_hash(value)
                     if song:
                         await service.play_song(event, song, source_label="链接解析")
                         return True
                 else:
                     await service.reply(event, "酷狗 mixsong 链接暂不支持直接解析，请发送带 hash 的分享链接")
+                    service.release_cooldown(event)  # 只回了提示没有产出，不占冷却
                     return True
             if await _keyword_fallback(service, event, text, SOURCE_KG):
                 return True
@@ -239,17 +268,17 @@ async def _resolve_inner(service, event, text: str) -> bool:
             if target:
                 kind, value = target
                 if kind == "song":
-                    song = await service.qq.song_detail(value)
+                    song = await service.client_of(SOURCE_QQ).song_detail(value)
                     if song:
                         await service.play_song(event, song, source_label="链接解析")
                         return True
                 elif kind == "album":
-                    songs = await service.qq.album_songs(value)
+                    songs = await service.client_of(SOURCE_QQ).album_songs(value)
                     if songs:
                         await service.list_to_session(event, "链接解析 · QQ专辑", songs, source=SOURCE_QQ)
                         return True
                 else:
-                    meta, songs = await service.qq.songlist_songs(value)
+                    meta, songs = await service.client_of(SOURCE_QQ).songlist_songs(value)
                     if songs:
                         await service.list_to_session(
                             event, f"链接解析 · {meta.get('name') or 'QQ歌单'}", songs, source=SOURCE_QQ
@@ -259,6 +288,7 @@ async def _resolve_inner(service, event, text: str) -> bool:
                 await service.reply(
                     event, "检测到 qqmusic:// 链接，请在管理面板导入凭证（聊天端已不解析 deeplink）"
                 )
+                service.release_cooldown(event)  # 只回了提示没有产出，不占冷却
                 return True
             if await _keyword_fallback(service, event, text, SOURCE_QQ):
                 return True
@@ -268,8 +298,17 @@ async def _resolve_inner(service, event, text: str) -> bool:
             service.release_cooldown(event)  # 只回了提示没有产出，不占冷却
             return True
         return False
-    except Exception as e:  # noqa: BLE001 - 解析失败不影响主流程
+    except ApiError as e:
+        # 音源不可用（依赖缺失）/ 需要登录等：给可操作的文案，别落进「稍后重试」
+        await service.reply(event, f"链接解析失败：{e.user_msg()}")
+        return False
+    except Exception as e:  # noqa: BLE001 - 解析失败不影响主流程，但要让用户看见
         service.log_warn(f"链接解析异常: {e}")
+        # 原先只记日志：用户只看到消息石沉大海。回一条可见的失败提示；
+        # 返回 False（未产出内容）由 handle_resolve 退还冷却。
+        # handler 目前只按 bool 消费返回值，无法区分「接管但失败」——
+        # 若要失败也 stop_event（拦住其他插件响应分享链接），share.py 需配合扩展返回类型
+        await service.reply(event, "链接解析失败，请稍后重试")
         return False
 
 

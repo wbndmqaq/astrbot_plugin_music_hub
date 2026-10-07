@@ -25,11 +25,13 @@ async def _login_finish(service, src: str, umo: str, session) -> None:
     """后台等扫码结果并主动推送。cancel 静默：用户重新发起登录时旧会话被
     cancel_source 取消，此时不该给会话里塞一条「登录未完成」的噪音。"""
     done = await service.login.wait_done(session)
+    if done is False:
+        # 等待超时：状态留给 _drive 判定（它自己的超时随后置终态），这里只提示
+        await service.send_to_umo(umo, "扫码确认超时，请重新登录")
+        return
     if done.state == "done":
         who = f"（{done.nickname}）" if done.nickname else ""
         await service.send_to_umo(umo, f"[{SOURCE_NAMES[src]}] 登录成功{who}，已保存登录态")
-    elif done.state == "scanned":
-        await service.send_to_umo(umo, "扫码确认超时，请重新登录")
     elif done.state != "cancel":
         await service.send_to_umo(umo, f"[{SOURCE_NAMES[src]}] 登录未完成：{done.msg}")
 
@@ -41,9 +43,7 @@ async def run_login(service, event):
     if not src:
         await service.reply(event, "用法：ncm登录 / kg登录 / qq登录")
         return
-    if not service.config.enable:
-        await service.reply(event, "插件已关闭")
-        return
+    # 不查总开关：schema 承诺登录类指令不受影响，且路由本就 gated=False
     try:
         session = await service.login.start(src, sub or "qq")
     except ApiError as e:
@@ -59,8 +59,10 @@ async def run_login(service, event):
             path = str(Path(await get_temp_dir()) / f"qr_{session.ticket}.png")
             # 二维码几十 KB，落盘走线程池，不占事件循环
             await asyncio.to_thread(Path(path).write_bytes, base64.b64decode(session.qr_b64))
-            await service.send_chain(event, Image.fromFileSystem(path))
+            # 清理先于发送登记：send_chain 对含媒体链失败会重新抛出，若把登记放在
+            # 发送之后，失败路径这张 PNG 永远不会被清
             service.schedule_unlink(path, 180)
+            await service.send_chain(event, Image.fromFileSystem(path))
         except Exception as e:  # noqa: BLE001
             service.log_warn(f"二维码图片发送失败: {e}")
     if session.qr_url and not session.qr_b64:
@@ -82,17 +84,18 @@ async def run_logout(service, event):
     if not src:
         return
     try:
-        if src != "qq":
-            client = service.client_of(src)
-            if hasattr(client, "logout"):
-                await client.logout()
-        else:
-            await service.qq.logout()
+        client = service.client_of(src)
+        if hasattr(client, "logout"):
+            await client.logout()
         service.config.clear_src_cookie(src)
         await service.config.save_async()
         await service.reply(event, f"[{SOURCE_NAMES[src]}] 已退出登录")
+    except ApiError as e:
+        # user_msg 是面向聊天的文案；原始异常串可能带上游细节，不回群聊
+        await service.reply(event, f"退出登录失败：{e.user_msg()}")
     except Exception as e:  # noqa: BLE001
-        await service.reply(event, f"退出登录失败：{e}")
+        service.log_warn(f"登出({src})失败: {e}")
+        await service.reply(event, f"退出登录失败：{type(e).__name__}")
 
 
 async def _safe(coro, default=""):
@@ -134,9 +137,7 @@ async def _status_row(service, src: str) -> dict:
 
 
 async def run_status(service, event):
-    if not service.config.enable:
-        await service.reply(event, "插件已关闭")
-        return
+    # 不查总开关：与 run_login 同一 schema 承诺（登录类指令不受影响）
     m = re.search(_RE_STATUS, event.message_str, re.IGNORECASE)
     only = token_to_source(m.group(1) if m else "", default="")
     targets = [s for s in SOURCES if not only or s == only]
@@ -160,15 +161,25 @@ def _format_status_text(data: dict) -> str:
 def routes() -> list[Route]:
     return [
         Route(
-            re.compile(_RE_LOGIN, re.IGNORECASE), "mh_login", "扫码登录", run_login, admin=True, priority=7
+            re.compile(_RE_LOGIN, re.IGNORECASE),
+            "mh_login",
+            "扫码登录（管理员）",
+            run_login,
+            admin=True,
+            priority=7,
         ),
         Route(
-            re.compile(_RE_LOGOUT, re.IGNORECASE), "mh_logout", "退出登录", run_logout, admin=True, priority=7
+            re.compile(_RE_LOGOUT, re.IGNORECASE),
+            "mh_logout",
+            "退出登录（管理员）",
+            run_logout,
+            admin=True,
+            priority=7,
         ),
         Route(
             re.compile(_RE_STATUS, re.IGNORECASE),
             "mh_status",
-            "登录状态",
+            "登录状态（管理员）",
             run_status,
             # 登录昵称 / uid / VIP 属账号信息，与管理类指令同门槛
             admin=True,

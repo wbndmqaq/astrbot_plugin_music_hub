@@ -17,6 +17,14 @@ from typing import Any
 
 from ..core.errors import AclDeniedError, ApiError
 
+# ── 统一文案 ──
+# 无列表提示与 core/service.py（start_select 空列表分支）对齐同一句式：
+# 那边写着「当前没有歌曲列表，请先「点歌 关键词」或带关键词使用…」，这边只取前半句。
+NO_LIST_HINT = "当前没有歌曲列表，请先「点歌 关键词」"
+# 翻页/追看的前置提示：还没出过一次内容时先引导查看，例句统一用「晴天」占位
+LYRIC_PAGE_HINT = "先查看一次歌词（如「歌词 晴天」），再翻页"
+COMMENT_NEXT_HINT = "先查看一次评论（如「评论 晴天」），再看最新"
+
 
 @dataclass
 class Route:
@@ -57,7 +65,8 @@ def install(cls, flt, module_path: str, routes: list[Route]) -> int:
                 import traceback
 
                 service.log_warn(f"路由 {_route.name} 异常: {e}\n{traceback.format_exc()}")
-                msg = e.with_source() if isinstance(e, ApiError) else f"执行失败：{e}"
+                # 非 ApiError 的原文可能带内部路径等细节（如 FileNotFoundError），不回群聊
+                msg = e.with_source() if isinstance(e, ApiError) else "执行失败，详情见运行日志"
                 await service.reply(event, msg)
             finally:
                 # run 返回 False 表示路由让路（不属于本插件管的事），保留事件继续传播

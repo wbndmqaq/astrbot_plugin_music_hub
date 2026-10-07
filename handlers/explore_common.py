@@ -2,15 +2,14 @@
 
 from __future__ import annotations
 
-from ..core import SOURCE_NAMES
 from ..core.cards import build_comment_card_data, build_generic_card_data
 from ..core.catalog import EXPAND_KINDS, resolver_for
 from ..core.errors import ApiError, NotEnabledError
 from ..core.sources import token_to_source
 
 
-async def _pick_source(service, event, token: str, *, prefer: str = "") -> str:
-    """确定音源：显式前缀 > 配置默认 > （prefer 优先的）可用音源；不可用时提示。"""
+def _pick_source(service, event, token: str, *, prefer: str = "") -> str:
+    """确定音源：显式前缀 > 配置默认 > （prefer 优先的）可用音源；不可用时提示（纯查表）。"""
     src = token_to_source(token)
     if src == "auto":
         src = service.config.default_source
@@ -24,13 +23,14 @@ async def _pick_source(service, event, token: str, *, prefer: str = "") -> str:
                 # 聚合默认音源顺序：ncm > kg > qq
                 src = "ncm" if "ncm" in enabled else enabled[0]
     if not service.config.src_enabled(src):
-        raise NotEnabledError(f"{SOURCE_NAMES[src]}音源未配置", source=src)
+        # 文案不带音源名：with_source 会加「[酷狗]」前缀，叠加会变成「[酷狗] 酷狗音乐音源未配置」
+        raise NotEnabledError("音源未配置", source=src)
     return src
 
 
 async def _locked_source(service, event, token: str, source: str, hint: str) -> str | None:
     """限定单音源的命令：返回音源 id；不满足时回复 hint 并返回 None（调用方直接 return）。"""
-    src = await _pick_source(service, event, token, prefer=source)
+    src = _pick_source(service, event, token, prefer=source)
     if src != source:
         await service.reply(event, hint)
         return None
@@ -41,7 +41,8 @@ def _to_items(rows: list[dict], kind: str, source: str = "", *, sub_key: str = "
     """通用列表卡条目：从归一化行挑展示字段（run_rank / 歌手榜 / MV 榜等共用）。"""
     return [
         {
-            "index": r.get("index"),
+            # index 兜底 i+1，与其余列表卡构造器一致：上游行可能缺序号字段
+            "index": r.get("index", i + 1),
             "name": r.get("name", ""),
             "sub": r.get(sub_key, "") or "",
             "cover": r.get("cover", ""),
@@ -50,7 +51,7 @@ def _to_items(rows: list[dict], kind: str, source: str = "", *, sub_key: str = "
             "kind": kind,
             "source": source,
         }
-        for r in rows
+        for i, r in enumerate(rows)
     ]
 
 
@@ -162,12 +163,6 @@ async def expand_candidate(service, event, entry: dict, n: int) -> bool:
 
 
 _SRC = r"(?:(ncm|kg|qqm|qq)\s*)?"
-_AREA_NEW = {"华语": 7, "欧美": 96, "日本": 8, "韩国": 16}
-_QQ_AREA_NEW = {"内地": 1, "欧美": 2, "日本": 3, "韩国": 4, "最新": 5, "港台": 6}
-_AREA_NCM_ALBUM = {"华语": "ZH", "欧美": "EA", "日本": "JP", "韩国": "KR"}
-_QQ_AREA_ALBUM = {"内地": 1, "港台": 2, "欧美": 3, "韩国": 4, "日本": 5, "其他": 6}
-_KG_AREA_ALBUM = {"华语": 1, "欧美": 2, "日本": 3, "韩国": 4}
-_TIP_EXPAND = "回复 听N 展开对应条目"
 _RE_RANK = rf"^\s*#?{_SRC}排行榜\s*(.*?)\s*$"
 _RE_RANK_TOP = rf"^\s*#?{_SRC}排行推荐\s*$"
 _RE_NEW = rf"^\s*#?{_SRC}新歌\s*(.*?)\s*$"

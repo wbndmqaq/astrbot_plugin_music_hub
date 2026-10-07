@@ -19,7 +19,7 @@ from .actions import (  # noqa: F401
     _act_similar,
     _act_versions,
 )
-from .base import Route
+from .base import NO_LIST_HINT, Route
 
 # 统一入口
 RE_REQUEST = r"^\s*#?\s*(?:点歌|音乐|music|mh)\s+(.+?)\s*$"
@@ -58,10 +58,10 @@ async def run_switch(service, event):
         await service.reply(event, "用法：换源 ncm / 换源 kg / 换源 qq")
         return
     if not service.config.src_enabled(src):
-        names = {"ncm": "网易云", "kg": "酷狗", "qq": "QQ音乐"}
-        await service.reply(event, f"{names[src]}音源未启用")
+        # 文案不带音源名：用户刚写下前缀，且与其他入口的「音源未配置」口径一致
+        await service.reply(event, "音源未配置")
         return
-    if reason := await service.check_cooldown(event):
+    if reason := service.check_cooldown(event):
         await service.reply(event, f"⏳ {reason}")
         return
     try:
@@ -100,14 +100,20 @@ async def _song_request(service, event, keyword: str, forced_source: str = "auto
     if not keyword:
         await service.reply(event, "用法：点歌 关键词（ncm:/kg:/qq: 前缀可指定音源）")
         return
-    if reason := await service.check_cooldown(event):
+    if reason := service.check_cooldown(event):
         await service.reply(event, f"⏳ {reason}")
         return
     if forced_source == "auto":
         # 配置了具体默认音源就单源搜索；auto 才走三平台聚合
         forced_source = service.config.default_source
     if forced_source != "auto":
-        songs, src, notices = await service.search_with_notices(keyword, forced_source)
+        try:
+            songs, src, notices = await service.search_with_notices(keyword, forced_source)
+        except ApiError as e:
+            # 搜索没播出任何内容：退冷却，不让一个报错的关键词占住点歌间隔
+            service.release_cooldown(event)
+            await service.reply(event, e.with_source())
+            return
         if not songs:
             service.release_cooldown(event)
             await _no_result_hint(service, event, keyword, notices)
@@ -116,10 +122,16 @@ async def _song_request(service, event, keyword: str, forced_source: str = "auto
         await service.list_to_session(event, keyword, songs, source=src, tip=tip)
         return
     # 聚合模式：同名同歌手合并为一行，呈现多音源选择
-    groups, src = await service.search_versions(keyword)
+    try:
+        groups, _src, notices = await service.search_versions(keyword)
+    except ApiError as e:
+        service.release_cooldown(event)
+        await service.reply(event, e.with_source())
+        return
     if not groups:
         service.release_cooldown(event)
-        await _no_result_hint(service, event, keyword)
+        # 零结果时优先展示聚合取数收集的登录提示（kg 禁匿名搜索是常态）
+        await _no_result_hint(service, event, keyword, notices)
         return
     scope = service.scope(event)
     await service.sessions.set(scope, "versions", {"keyword": keyword, "songs": groups})
@@ -148,10 +160,16 @@ async def run_play(service, event):
     keyword = m.group(1).strip() if m else ""
     if not keyword:
         return
-    if reason := await service.check_cooldown(event):
+    if reason := service.check_cooldown(event):
         await service.reply(event, f"⏳ {reason}")
         return
-    songs, _ = await service.search_songs(keyword, service.config.default_source, limit=1)
+    try:
+        songs, _ = await service.search_songs(keyword, service.config.default_source, limit=1)
+    except ApiError as e:
+        # 搜索失败也退冷却：本次没有产出任何播放内容
+        service.release_cooldown(event)
+        await service.reply(event, e.with_source())
+        return
     if not songs:
         service.release_cooldown(event)
         await service.reply(event, f"没有搜到「{keyword}」相关的歌曲")
@@ -160,9 +178,10 @@ async def run_play(service, event):
 
 
 async def run_listen_n(service, event):
-    reason = service.check_song_request()
-    if reason:
-        return False  # 功能关闭：静默让路，不吞事件
+    if reason := service.check_song_request():
+        # 总开关已由路由 gated 静默让路，走到这里只会是点歌开关关闭：与点歌同口径当面提示
+        await service.reply(event, f"点歌不可用：{reason}")
+        return
     m = re.search(RE_LISTEN_N, event.message_str, re.IGNORECASE)
     if not m:
         return
@@ -174,6 +193,13 @@ async def run_listen_n(service, event):
         return False
     song, action = await service.take_action_target(event, n)
     if song is None:
+        # 能走到这里说明 scope 归属本插件（别人的列表在 owns_scope 已让路），
+        # 无列表 / 越界都给反馈，与「听所有」的空列表提示对齐
+        songs = await service.sessions.songs_of(scope)
+        if songs:
+            await service.reply(event, f"列表里没有第 {n} 首（共 {len(songs)} 首）")
+        else:
+            await service.reply(event, NO_LIST_HINT)
         return
     # 多音源分组里指定音源：take_action_target 返回的是分组
     if song.get("versions"):
@@ -224,22 +250,23 @@ async def run_listen_n(service, event):
 
 
 async def run_listen_all(service, event):
-    reason = service.check_song_request()
-    if reason:
-        return False  # 功能关闭：静默让路，与 run_listen_n 一致
+    if reason := service.check_song_request():
+        # 与 run_listen_n 一致：仅点歌开关关闭时当面提示（总开关由路由 gated 静默让路）
+        await service.reply(event, f"点歌不可用：{reason}")
+        return
     scope = service.scope(event)
     if not await service.sessions.owns_scope(scope):
         return False  # 列表是别的音乐插件出的：让路不抢答
     songs = await service.sessions.songs_of(scope)
     if not songs:
-        await service.reply(event, "当前没有歌曲列表，先「点歌 关键词」吧")
+        await service.reply(event, NO_LIST_HINT)
         return
     await service.play_all(event, songs)
 
 
 # ──────────── 路由表 ────────────
 def routes() -> list[Route]:
-    return [
+    rs = [
         # 优先级 6：音源前缀别名先于统一入口（#ncm点歌 不会被统一入口抢走）
         Route(
             re.compile(RE_SRC_REQUEST, re.IGNORECASE),
@@ -278,3 +305,7 @@ def routes() -> list[Route]:
             priority=5,
         ),
     ]
+    # 总开关关闭 → 包装器静默让路；点歌开关关闭 → 体内 check_song_request 当面提示
+    for r in rs:
+        r.gated = True
+    return rs

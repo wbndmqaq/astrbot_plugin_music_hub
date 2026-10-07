@@ -8,7 +8,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from . import DEFAULT_API_BASE, SOURCES
+from . import SOURCES
 
 
 def as_int(value: Any, default: int = 0, lo: int | None = None, hi: int | None = None) -> int:
@@ -98,7 +98,17 @@ class Config:
         return result if isinstance(result, bool) else True
 
     async def save_async(self) -> bool:
-        """事件循环安全的保存：磁盘写在 to_thread（AstrBotConfig.save_config 是同步落盘）。"""
+        """事件循环安全的保存。
+
+        优先走 AstrBotConfig.save_config_async（4.28+ 自带：快照 + revision 防并发
+        覆盖，磁盘写在 to_thread）；低版本没有该属性时退回 to_thread(save)。
+        """
+        raw_async = getattr(self._raw, "save_config_async", None)
+        if callable(raw_async):
+            try:
+                return bool(await raw_async())
+            except Exception:  # noqa: BLE001
+                return False
         import asyncio
 
         return await asyncio.to_thread(self.save)
@@ -168,7 +178,8 @@ class Config:
 
     @property
     def keep_file_sec(self) -> int:
-        return max(5, as_int(self.get("keepFileSec"), 60, lo=0))
+        # hi 与 WebUI 端 _INT_RANGES 对齐（上限 1 小时）
+        return max(5, as_int(self.get("keepFileSec"), 60, lo=0, hi=3600))
 
     @property
     def send_native_card(self) -> bool:
@@ -189,11 +200,14 @@ class Config:
         return node if isinstance(node, dict) else {}
 
     def src_api_base(self, source: str) -> str:
-        """音源 API 地址；未配置时回落到内置默认地址。QQ 不依赖外部服务，恒返回 "local"。"""
+        """音源 API 地址，完全以配置为准（默认值只在 _conf_schema.json 里）。
+
+        留空返回空串 = 该音源停用（这也是 ncm/kg 唯一的单音源开关）；
+        新装时 AstrBot 按 schema default 补齐，开箱即有值。QQ 不依赖外部服务，恒返回 "local"。
+        """
         if source == "qq":
             return "local"
-        configured = normalize_base(as_str(self.src_node(source).get("apiBase")))
-        return configured or DEFAULT_API_BASE.get(source, "")
+        return normalize_base(as_str(self.src_node(source).get("apiBase")))
 
     # 旧版 QQ 节点用 credential/uin，与另两平台的 cookie/uid 不一致；
     # AstrBot 加载时会删掉 Schema 外键，导致扫码登录态每次重载即丢。保留读取别名做迁移。
@@ -243,7 +257,7 @@ class Config:
         )
 
     def src_enabled(self, source: str) -> bool:
-        """音源是否可用：QQ 始终可用（库内置），ncm/kg 需要配置 apiBase。"""
+        """音源是否可用：QQ 始终可用（库内置），ncm/kg 需要配置了非空 apiBase。"""
         if source == "qq":
             return True
         return bool(self.src_api_base(source))
@@ -337,9 +351,9 @@ class Config:
 
     # ──────────── 限速 / 冷却 / 定时 ────────────
     @property
-    def rate_limit_ms(self) -> float:
-        v = self.get("rateLimitMs")
-        return as_int(v, 250, lo=0, hi=5000) if v is not None else 250.0
+    def rate_limit_ms(self) -> int:
+        # 统一返回 int：此前缺键返回 250.0、存在返回 int，类型漂移
+        return as_int(self.get("rateLimitMs"), 250, lo=0, hi=5000)
 
     @property
     def cooldown_sec(self) -> int:

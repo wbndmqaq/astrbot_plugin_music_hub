@@ -165,7 +165,6 @@ html[data-theme-mode="light"] .theme-toggle .ico-sun{opacity:1;transform:none}
 .chip .dot{width:8px;height:8px;border-radius:50%;background:var(--faint);box-shadow:0 0 0 3px rgba(62,207,154,.2)}
 .chip.ok .dot{background:var(--ok-ink);box-shadow:0 0 0 3px rgba(62,207,154,.2)}
 .chip.warn .dot{background:var(--warn-ink);box-shadow:0 0 0 3px rgba(255,184,77,.25)}
-.chip.bad .dot{background:var(--danger-ink);box-shadow:0 0 0 3px rgba(255,107,129,.2)}
 
 /* 欢迎横幅（软糖 hero） */
 .hero-banner{position:relative;overflow:hidden;border-radius:26px;padding:24px 28px;margin-bottom:18px;
@@ -205,7 +204,7 @@ html[data-theme-mode="light"] .theme-toggle .ico-sun{opacity:1;transform:none}
 .stat-card .num{font-size:28px;font-weight:900;margin-top:6px;color:var(--pink-ink)}
 .stat-card .foot{font-size:11px;color:var(--faint);margin-top:4px;font-weight:700}
 .stat-card .icon{position:absolute;right:14px;top:14px;width:34px;height:34px;border-radius:13px;
-  display:grid;place-items:center;font-size:16px;color:var(--pink-ink);
+  display:grid;place-items:center;color:var(--pink-ink);
   background:linear-gradient(135deg,var(--pink-soft),var(--muted));border:2px solid var(--line)}
 .stat-card .icon svg{width:19px;height:19px}
 .stat-card .icon img{width:24px;height:24px;object-fit:contain;display:block;
@@ -329,10 +328,10 @@ html[data-theme="dark"] .modal-mask{background:rgba(10,6,24,.7)}
   color:var(--sub);font-size:19px;line-height:1;font-weight:900;flex:none;
   transition:transform .3s var(--bounce),color .25s}
 .qr-body{text-align:center}
+/* 暗色主题也保持白底：二维码必须白底黑码才能被手机识别，不做主题反色 */
 .qr-img-wrap{width:220px;height:220px;margin:0 auto 14px;border-radius:22px;
   background:#fff;display:grid;place-items:center;padding:10px;position:relative;overflow:hidden;
   border:2.5px dashed var(--line)}
-html[data-theme="dark"] .qr-img-wrap{background:#fff}
 .qr-img-wrap img{width:100%;height:100%;object-fit:contain}
 .qr-img-wrap.expired::after{content:"二维码已过期";position:absolute;inset:0;display:grid;place-items:center;
   background:rgba(74,44,63,.85);color:#fff;font-size:14px;font-weight:900;backdrop-filter:blur(3px)}
@@ -349,13 +348,15 @@ html[data-theme="dark"] .qr-img-wrap{background:#fff}
 .confirm-actions{display:flex;gap:10px;justify-content:flex-end;margin-top:18px}
 
 /* ─────────── 图表 ─────────── */
+/* 手机上 720 宽 viewBox 会把 9px 的轴文字缩到 ~4px：容器横向滚动兜底 */
 .chart-wrap{background:var(--card2);border-radius:var(--r-md);padding:12px;border:2px solid var(--line-soft);
-  position:relative;color:var(--sub)}
+  position:relative;color:var(--sub);overflow-x:auto}
 /* 骨架屏与 svg 同级：SVG 不能容纳 HTML 子节点，塞 <div> 进去不会渲染 */
 .chart-skeleton{position:absolute;inset:12px;z-index:1}
 .chart-wrap.has-state .chart-skeleton{position:static}
-/* 不再 preserveAspectRatio="none"：非等比拉伸会把 rx=3 与 9px 字号压扁 */
-#trendChart{width:100%;height:auto;display:block}
+/* 不再 preserveAspectRatio="none"：非等比拉伸会把 rx=3 与 9px 字号压扁。
+   min-width 保证窄屏下文字不缩放，超出部分由容器的横向滚动承接 */
+#trendChart{width:100%;min-width:520px;height:auto;display:block}
 .legend{display:flex;gap:12px;font-size:11.5px;color:var(--sub);font-weight:800}
 .lg{display:inline-flex;align-items:center;gap:5px}
 /* pastel 色块对底色仅 2.62:1（图形需 ≥3:1），加 ink 描边 */
@@ -377,7 +378,6 @@ html[data-theme="dark"] .qr-img-wrap{background:#fff}
 /* ─────────── 表格 ─────────── */
 .tbl-wrap{max-height:420px;overflow:auto;border-radius:var(--r-md);border:2.5px solid var(--line)}
 .tbl{width:100%;border-collapse:collapse;font-size:12.5px}
-.tbl caption{text-align:left;padding:10px 13px;font-size:11.5px;font-weight:800;color:var(--sub)}
 /* pastel pink-deep 压 --muted 仅 2.98:1 → ink */
 .tbl th{position:sticky;top:0;z-index:2;text-align:left;padding:11px 13px;font-size:11.5px;letter-spacing:1px;
   color:var(--pink-ink);background:var(--muted);border-bottom:2.5px solid var(--line);font-weight:900}
@@ -409,7 +409,6 @@ html[data-theme="dark"] .qr-img-wrap{background:#fff}
 .vchip.ncm{border-color:var(--ncm-ink)}
 .vchip.kg{border-color:var(--kg-ink)}
 .vchip.qq{border-color:var(--qq-ink)}
-.result-vers .vchip{border-width:2px}
 .vchip img{width:18px;height:18px;object-fit:contain;display:block;flex:none;
   background:#fff;border-radius:50%;padding:1px}
 .vchip small{font-size:9.5px;font-weight:900;color:var(--sub);letter-spacing:.3px}
@@ -419,11 +418,12 @@ html[data-theme="dark"] .qr-img-wrap{background:#fff}
 .search-bar .input{flex:1}
 .src-filter{display:flex;gap:8px;margin-bottom:14px;flex-wrap:wrap}
 .sfilter{padding:7px 16px;border-radius:999px;border:2px solid var(--line-strong);background:var(--card);
-  color:var(--sub);font-size:12px;font-weight:900;min-height:36px;
+  color:var(--sub);font-size:12px;font-weight:900;min-height:36px;position:relative;
   transition:transform .25s var(--bounce),background-color .25s,color .25s,border-color .25s}
 .sfilter.on{background:linear-gradient(135deg,var(--pink),var(--pink-deep));color:var(--on-accent);
   border-color:transparent;box-shadow:0 4px 0 rgba(240,79,152,.3)}
-.sfilter::before{content:"";position:absolute}
+/* 视觉尺寸不变，热区扩到 44px（同 .btn-sm::before 的做法） */
+.sfilter::before{content:"";position:absolute;inset:-4px;border-radius:inherit}
 .result-list{display:flex;flex-direction:column;gap:10px}
 .result-row{display:flex;align-items:center;gap:14px;padding:12px 14px;border-radius:var(--r-md);
   background:var(--card2);border:2px solid var(--line-soft);
@@ -528,7 +528,6 @@ html[data-theme="dark"] .qr-img-wrap{background:#fff}
   .brand{padding-bottom:6px}
   .side-list{flex-direction:row;overflow-x:auto;gap:8px;padding-bottom:4px}
   .side-item{padding:8px 13px;white-space:nowrap;font-size:12.5px;min-height:44px}
-  .side-item.on{transform:none}
   /* 主题切换与退出登录在手机上改由底栏「更多」抽屉提供（见 index.html .more-sheet），
      这里必须真正隐藏，避免同一控件出现两次 */
   .side-foot{display:none}
@@ -545,10 +544,8 @@ html[data-theme="dark"] .qr-img-wrap{background:#fff}
   .row-actions{order:4;margin-left:auto}
   .result-dur{order:5;margin-left:auto}
   .row-actions .btn{padding:8px 14px}
-  .chart-skeleton{inset:12px}
   .log-console{font-size:11.5px}
 }
-@media (min-width:769px){.bottom-nav{display:none}}
 .bottom-nav{position:fixed;left:0;right:0;bottom:0;z-index:60;grid-auto-flow:column;
   grid-auto-columns:minmax(0,1fr);
   background:var(--card);border-top:2.5px solid var(--line);
@@ -573,8 +570,11 @@ html[data-theme="dark"] .qr-img-wrap{background:#fff}
 .more-sheet .side-item{min-height:44px;border-color:var(--line)}
 .more-foot{grid-column:1/-1;display:flex;gap:9px;padding-top:9px;border-top:2px dashed var(--line-soft)}
 .more-foot .btn{flex:1}
-/* 抽屉只在窄屏出现（宽屏底栏 display:none，没有入口） */
-@media (min-width:769px){.more-sheet{display:none!important}}
+/* 底栏与「更多」抽屉都只在窄屏出现：宽屏底栏 display:none，抽屉没有入口 */
+@media (min-width:769px){
+  .bottom-nav{display:none}
+  .more-sheet{display:none!important}
+}
 
 /* ─────────── 登录页（二次元） ─────────── */
 .login-mask{position:fixed;inset:0;z-index:200;display:grid;place-items:center;
@@ -612,9 +612,11 @@ html[data-theme="dark"] .login-mask{background:linear-gradient(150deg,rgba(38,22
 .login-hint code{color:var(--violet-ink);font-family:"Consolas",monospace}
 
 .search-tabs{display:flex;gap:8px;margin-bottom:12px;flex-wrap:wrap}
-.stab{padding:8px 18px;min-height:38px;border:none;border-radius:999px;background:rgba(255,255,255,.6);color:var(--sub);
-  font-weight:800;font-size:13px;cursor:pointer;border:1.5px solid transparent;
+.stab{padding:8px 18px;min-height:38px;border-radius:999px;background:rgba(255,255,255,.6);color:var(--sub);
+  font-weight:800;font-size:13px;cursor:pointer;border:1.5px solid transparent;position:relative;
   transition:transform .18s,background-color .18s,color .18s,box-shadow .18s}
+/* 视觉尺寸不变，热区扩到 44px（同 .btn-sm::before 的做法） */
+.stab::before{content:"";position:absolute;inset:-3px;border-radius:inherit}
 html[data-theme="dark"] .stab{background:rgba(255,255,255,.06)}
 .stab.on{background:linear-gradient(135deg,var(--pink),var(--violet));color:var(--on-accent);
   box-shadow:0 4px 14px rgba(214,116,180,.35)}
@@ -642,6 +644,7 @@ html[data-theme="dark"] .log-console{background:#0d0a18}
 .log-line{white-space:pre-wrap;word-break:break-all}
 .log-console .empty-state{color:#c9c2ea}
 .log-lv{display:inline-block;width:64px;color:#a89ed2;font-weight:800;margin-right:8px}
+.log-ts{color:#8d84bb;margin-right:8px;font-variant-numeric:tabular-nums}
 .log-line.log-warn{color:#f3c96b}
 .log-line.log-err{color:#ff9aa6}
 .log-line.log-info{color:#cfc7e8}
@@ -687,6 +690,9 @@ html[data-theme="dark"] .log-console{background:#0d0a18}
   .err-bar{transform:scaleX(var(--w,0))!important}
   .sw.on::after{transform:translateY(-50%) translateX(21px)!important}
   .petal,.login-icon{display:none}
+  /* 提交中的转圈动画也停：保留静态圈环提示「正在处理」。
+     !important 是必需的：基础规则在本块之后声明，同级特异性靠它取胜 */
+  .btn[data-busy]::after{animation:none!important;border-top-color:var(--on-accent);opacity:.7}
 }
 
 /* 视觉隐藏但保留给读屏：只有 placeholder 无可见 label 的输入框 */
@@ -711,6 +717,4 @@ html[data-theme="dark"] .log-console{background:#0d0a18}
   border-radius:50%;border:2.5px solid rgba(255,255,255,.35);border-top-color:var(--on-accent);
   animation:spin .7s linear infinite}
 .btn-ghost[data-busy]::after{border-color:rgba(240,79,152,.28);border-top-color:var(--pink-ink)}
-@media (prefers-reduced-motion:reduce){
-  .btn[data-busy]::after{animation:none;border-top-color:var(--on-accent);opacity:.7}
-}
+/* prefers-reduced-motion 下的降级与上方合并声明（文件唯一的 reduce 块） */

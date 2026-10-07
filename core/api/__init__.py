@@ -19,7 +19,7 @@ from .kg import KugouClient  # noqa: E402
 from .ncm import NeteaseClient  # noqa: E402
 from .qq import QQClient  # noqa: E402
 from .qq import available as qq_available  # noqa: E402
-from .registry import create, register, registered, verify
+from .registry import create, register, registered
 
 __all__ = [
     "ApiError",
@@ -34,6 +34,5 @@ __all__ = [
     "create",
     "register",
     "registered",
-    "verify",
     "missing_methods",
 ]

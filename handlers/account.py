@@ -33,8 +33,8 @@ _LIKES_LIMIT = 60
 _DETAIL_BATCH = 30
 
 
-async def _pick(service, event, token: str, supported: tuple[str, ...]) -> str:
-    """音源仲裁：显式前缀 > 配置默认 > 支持列表顺序。"""
+def _pick(service, event, token: str, supported: tuple[str, ...]) -> str:
+    """音源仲裁：显式前缀 > 配置默认 > 支持列表顺序（纯查表，无需 async）。"""
     src = token_to_source(token)
     if src == "auto":
         src = service.config.default_source
@@ -45,7 +45,8 @@ async def _pick(service, event, token: str, supported: tuple[str, ...]) -> str:
         names = " / ".join(SOURCE_NAMES[s] for s in supported)
         raise ApiError(f"该功能仅支持：{names}", source=src or "")
     if not service.config.src_enabled(src):
-        raise ApiError(f"{SOURCE_NAMES[src]}音源未配置", source=src)
+        # 文案不带音源名：with_source 会加「[酷狗]」前缀，叠加会重复
+        raise ApiError("音源未配置", source=src)
     return src
 
 
@@ -74,7 +75,7 @@ async def _last_played_song(service, event) -> dict | None:
 
 async def run_likes(service, event):
     m = re.search(_RE_LIKES, event.message_str, re.IGNORECASE)
-    src = await _pick(service, event, m.group(1) if m else "", (SOURCE_NCM, SOURCE_QQ))
+    src = _pick(service, event, m.group(1) if m else "", (SOURCE_NCM, SOURCE_QQ))
     client = service.client_of(src)
     # 平台独占能力：红心列表只有网易云与 QQ 有，且取数方式无法统一——
     # 网易云要 uid + 分批 song_detail 才能拼出曲目，QQ 直接给成品列表。
@@ -130,10 +131,9 @@ async def _like_op(service, event, like: bool):
         await service.reply(event, f"红心操作仅支持：{names}")
         return
     client = service.client_of(src)
-    if src == SOURCE_NCM:
-        # 平台独占能力：网易云的红心以 uid 标识账号，必须先校验登录态；
-        # QQ 用登录凭据直接操作，无需这一步。
-        await _ncm_uid(service)  # 未登录直接提示
+    # 先取歌并对齐音源，再查网易云登录态：无前缀的歌是酷狗时 src 会兜底成 ncm，
+    # 登录态校验放在前面的话，ncm 未登录的用户会看到「网易云未登录」，
+    # 而真正的问题是这首歌本来就不归 ncm 红心
     song = await _last_played_song(service, event)
     if not song or not song.get("sid"):
         await service.reply(event, "还没有可操作的歌曲，先「点歌」或「听N」一次吧")
@@ -145,6 +145,10 @@ async def _like_op(service, event, like: bool):
             f"红心要用对应音源前缀（如「听N {song.get('source')}」切音源后再试）",
         )
         return
+    if src == SOURCE_NCM:
+        # 平台独占能力：网易云的红心以 uid 标识账号，必须先校验登录态；
+        # QQ 用登录凭据直接操作，无需这一步。
+        await _ncm_uid(service)  # 未登录直接提示
     # 平台独占能力：网易云按 sid 切换红心、QQ 按整首歌切换（like_toggle 收 song），
     # 两者入参形态不同，无法收敛成统一 resolver，故在此按平台分支。
     if src == SOURCE_NCM:
@@ -156,7 +160,7 @@ async def _like_op(service, event, like: bool):
 
 async def run_record(service, event):
     m = re.search(_RE_RECORD, event.message_str, re.IGNORECASE)
-    src = await _pick(service, event, m.group(1) if m else "", (SOURCE_NCM,))
+    src = _pick(service, event, m.group(1) if m else "", (SOURCE_NCM,))
     uid = await _ncm_uid(service)
     songs = await service.call(src, "explore", service.client_of(src).user_record(uid))
     if not songs:
@@ -167,7 +171,7 @@ async def run_record(service, event):
 
 async def run_my_playlists(service, event):
     m = re.search(_RE_MY_PLAYLIST, event.message_str, re.IGNORECASE)
-    src = await _pick(service, event, m.group(1) if m else "", (SOURCE_NCM, SOURCE_KG, SOURCE_QQ))
+    src = _pick(service, event, m.group(1) if m else "", (SOURCE_NCM, SOURCE_KG, SOURCE_QQ))
     client = service.client_of(src)
     # 平台独占能力：三家的「我的歌单」语义不同——网易云按 uid 查、酷狗走 cookie、
     # QQ 需要把「创建的歌单」与「收藏的歌单」合并去重并标注来源。
@@ -202,7 +206,7 @@ async def run_my_playlists(service, event):
 
 async def run_cloud(service, event):
     m = re.search(_RE_CLOUD, event.message_str, re.IGNORECASE)
-    src = await _pick(service, event, m.group(1) if m else "", (SOURCE_NCM, SOURCE_KG))
+    src = _pick(service, event, m.group(1) if m else "", (SOURCE_NCM, SOURCE_KG))
     # 平台独占能力：云盘只有网易云与酷狗有，QQ 无此概念（故 _pick 的支持列表里没有它）。
     # 两家方法名不同（user_cloud / cloud_songs）但入参与返回结构一致，
     # 属纯粹的命名差异——仍按平台分支，因为它是能力边界而非可下沉的解析逻辑。
@@ -260,15 +264,13 @@ async def run_purchased(service, event):
 
 async def run_recent(service, event):
     m = re.search(_RE_RECENT, event.message_str, re.IGNORECASE)
-    src = await _pick(service, event, m.group(1) if m else "", (SOURCE_NCM, SOURCE_KG))
+    src = _pick(service, event, m.group(1) if m else "", (SOURCE_NCM, SOURCE_KG))
     client = service.client_of(src)
     # 平台独占能力：最近在听只有网易云与酷狗有（QQ 无此概念）。
-    # 网易云需先校验登录态（uid），酷狗不需要——这是账号能力差异，故按平台分支。
+    # 取数两家一致（recent_songs），唯一差异是网易云需先校验登录态（uid）。
     if src == SOURCE_NCM:
         await _ncm_uid(service)
-        rows = await service.call(src, "explore", client.recent_songs(30))
-    else:
-        rows = await service.call(src, "explore", client.recent_songs(30))
+    rows = await service.call(src, "explore", client.recent_songs(30))
     if not rows:
         await service.reply(event, f"[{SOURCE_NAMES[src]}] 没有最近在听记录")
         return
@@ -293,7 +295,7 @@ async def run_recent(service, event):
 async def run_follow_list(service, event):
     """关注歌手列表（QQ 音源）。"""
     m = re.search(_RE_FOLLOW, event.message_str, re.IGNORECASE)
-    src = await _pick(service, event, m.group(1) if m else "", (SOURCE_QQ,))
+    src = _pick(service, event, m.group(1) if m else "", (SOURCE_QQ,))
     artists = await service.call(src, "explore", service.client_of(src).follow_singers(30))
     if not artists:
         await service.reply(event, "[QQ音乐] 关注列表是空的（或需要重新扫码登录）")
