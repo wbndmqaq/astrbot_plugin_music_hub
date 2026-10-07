@@ -67,7 +67,7 @@ class LoginSession:
             self.done_evt.set()
 
 
-class LoginManager:
+class LoginFlows:
     def __init__(self, service):
         self._service = service  # core.service.MusicService
         self.sessions: dict[str, LoginSession] = {}
@@ -76,6 +76,9 @@ class LoginManager:
     async def start(self, source: str, login_type: str = "qq") -> LoginSession:
         """创建扫码会话并启动后台轮询。"""
         await self.gc()
+        # 同一音源已有的待扫码会话先取消：gc 只清超 600 秒或已完成的，
+        # 刚开的那一个不满足条件，不主动取消就会和新的一起轮询上游。
+        await self.cancel_source(source)
         if source == "qq":
             session = await self._start_qq(login_type)
         elif source == "ncm":
@@ -85,7 +88,9 @@ class LoginManager:
         else:
             raise ApiError(f"未知音源 {source}", source=source)
         self.sessions[session.ticket] = session
-        session.task = asyncio.create_task(self._drive(session))
+        # 走 service.spawn 纳入统一生命周期：terminate 的 cancel-all 才能收到它，
+        # 否则插件卸载后这个轮询器还会继续打上游登录接口直到自身超时
+        session.task = self._service.spawn(self._drive(session))
         return session
 
     def get(self, ticket: str) -> LoginSession | None:
@@ -97,9 +102,12 @@ class LoginManager:
 
     async def cancel(self, ticket: str) -> None:
         s = self.sessions.get(ticket)
-        if s and s.state in ("wait", "scanned"):
-            s.set_state("cancel")
-        if s and s.task:
+        # 已完成的会话不能动 task：_drive 的 finally 里 _finish 负责写配置，
+        # 取消它会让 cookie 丢失而状态仍显示 done。
+        if s is None or s.state not in ("wait", "scanned"):
+            return
+        s.set_state("cancel")
+        if s.task:
             s.task.cancel()
 
     async def wait_done(self, session: LoginSession, timeout: float = MAX_WAIT) -> LoginSession:
@@ -110,12 +118,31 @@ class LoginManager:
         return session
 
     async def gc(self) -> None:
+        """清掉过期/已完成的会话，并等待轮询任务真正退出。
+
+        cancel() 只投递信号，不等落地就返回的话旧 _drive 仍会继续每 2 秒打上游，
+        反复开扫码时会累积出大量在跑的轮询器。
+        """
         now = time.time()
         stale = [t for t, s in self.sessions.items() if now - s.created > 600 or s.done_evt.is_set()]
+        tasks: list[asyncio.Task] = []
         for t in stale:
             s = self.sessions.pop(t, None)
-            if s and s.task and not s.task.done():
+            if s is None:
+                continue
+            if s.state in ("wait", "scanned"):
+                s.set_state("cancel")  # 唤醒仍在等 done_evt 的调用方
+            if s.task and not s.task.done():
                 s.task.cancel()
+                tasks.append(s.task)
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+
+    async def cancel_source(self, source: str) -> None:
+        """同一音源只保留一个活跃会话：先取消旧的再让调用方新建。"""
+        for st in list(self.sessions.values()):
+            if st.source == source and st.state in ("wait", "scanned"):
+                await self.cancel(st.ticket)
 
     def active_of(self, source: str) -> LoginSession | None:
         for s in self.sessions.values():

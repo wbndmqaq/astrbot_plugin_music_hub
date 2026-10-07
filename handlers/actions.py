@@ -9,6 +9,7 @@ from __future__ import annotations
 import re
 
 from ..core import SOURCE_NCM, SOURCE_QQ
+from ..core.cards import build_comment_card_data, build_lyric_card_data
 from ..core.errors import ApiError
 
 LYRIC_PAGE_SIZE = 36
@@ -26,7 +27,7 @@ def _song_meta(song: dict) -> dict:
 
 
 async def _act_lyric(service, event, song):
-    from ..core.cards import build_lyric_card_data, format_lyric_text
+    from ..core.formatters import format_lyric_text
 
     try:
         lyric = await service.fetch_lyric(song)
@@ -55,7 +56,7 @@ async def _act_lyric(service, event, song):
 
 
 async def _act_lyric_word(service, event, song):
-    from ..core.cards import build_lyric_card_data, format_lyric_text
+    from ..core.formatters import format_lyric_text
 
     try:
         lyric = await service.fetch_lyric_karaoke(song)
@@ -108,7 +109,7 @@ def _parse_krc_lines(krc: str) -> list[str]:
 
 
 async def _act_comment(service, event, song):
-    from ..core.cards import build_comment_card_data, format_comment_text
+    from ..core.formatters import format_comment_text
 
     try:
         comments = await service.fetch_comments(song)
@@ -136,6 +137,9 @@ async def _act_comment(service, event, song):
 async def _act_similar(service, event, song):
     source = song.get("source", "")
     client = service.client_of(source)
+    # 平台独占能力：三家的「相似歌曲」入口与主键都不同
+    # （ncm=simi_songs(sid) / kg=related_songs(sid2 或 sid) / qq=similar_songs(sid2 或 sid)），
+    # 且 kg 的 related_songs 不接受 limit 参数。属能力差异，按平台分支。
     if source == SOURCE_NCM:
         songs = await service.call(source, "explore", client.simi_songs(song.get("sid", ""), 10))
     elif source == "kg":
@@ -173,6 +177,8 @@ async def _act_mv(service, event, song):
 
 async def _act_climax(service, event, song):
     client = service.client_of("kg")
+    # 平台独占能力：高潮片段只有酷狗提供（/song/climax），另两家无此接口。
+    # 必须按平台拒绝，否则会对不存在的客户端调方法抛 AttributeError。
     if song.get("source") != "kg":
         await service.reply(event, "高潮片段仅支持酷狗音源（可用 kg: 前缀点歌）")
         return
@@ -194,11 +200,14 @@ async def _act_climax(service, event, song):
 async def _act_versions(service, event, song):
     source = song.get("source", "")
     client = service.client_of(source)
+    # 平台独占能力：只有酷狗与 QQ 提供「其他版本」（kg=related_songs / qq=other_versions），
+    # 网易云没有该能力——故按平台分支并对 else 给出明确提示，而不是静默返回空。
     if source == "kg":
         songs = await service.call(
             source, "explore", client.related_songs(song.get("sid2") or song.get("sid", ""))
         )
     elif source == SOURCE_QQ:
+        # QQ 的「其他版本」入参是整首歌对象（内部取 mid），与酷狗不同
         songs = await service.call(source, "explore", client.other_versions(song))
     else:
         await service.reply(event, "版本查询支持酷狗 / QQ 音源")
@@ -214,6 +223,7 @@ async def _act_versions(service, event, song):
 async def _act_ai_recommend(service, event, song):
     """酷狗 AI 相似推荐（/ai/recommend，参数是 album_audio_id）。"""
     client = service.client_of("kg")
+    # 平台独占能力：AI 推荐只有酷狗提供，另两家无此接口，故按平台拒绝。
     if song.get("source") != "kg":
         await service.reply(event, "AI 推荐仅支持酷狗音源（可用 kg: 前缀点歌）")
         return
@@ -229,6 +239,7 @@ async def _act_ai_recommend(service, event, song):
 async def _act_simi_playlist(service, event, song):
     """网易云相似歌单：参数必须是歌曲 id。"""
     client = service.client_of(SOURCE_NCM)
+    # 平台独占能力：相似歌单只有网易云提供（/simi/playlist），另两家无此接口。
     if song.get("source") != SOURCE_NCM:
         await service.reply(event, "相似歌单仅支持网易云音源（可用 ncm: 前缀点歌）")
         return
@@ -236,12 +247,12 @@ async def _act_simi_playlist(service, event, song):
     if not pls:
         await service.reply(event, "没有找到相似歌单")
         return
-    from .explore import _playlists_as_items
+    from .explore_common import playlists_as_items
 
     await service.list_to_session(
         event,
         f"相似歌单 · {song.get('name', '')}",
-        _playlists_as_items(pls, SOURCE_NCM),
+        playlists_as_items(pls, SOURCE_NCM),
         source=SOURCE_NCM,
         kind="playlists",
         tip="回复 听N 展开对应歌单",

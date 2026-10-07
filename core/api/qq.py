@@ -2,7 +2,7 @@
 
 - 单例 ``Client``：设备指纹落盘（data/plugin_data/<plugin>/qq_device.json），
   避免每次重启都是新设备触发风控
-- 登录态：``Credential`` JSON 存配置 ``qq.credential``（扫码登录自动写入）
+- 登录态：``Credential`` JSON 存配置 ``qq.cookie``（扫码登录自动写入）
 - 取流：CDN dispatch + get_song_urls 按音质阶梯尝试；匿名 VIP 歌 104003，
   免费歌可用；试听档 SpecialSongFileType.TRY 匿名可用
 """
@@ -18,11 +18,17 @@ from pathlib import Path
 from ..errors import ApiError, NotEnabledError
 from ..quality import QQ_LABEL, QQ_LADDER, ladder_for
 from .http import list_of
+from .registry import register
 
 # qqmusic-api 是可选重依赖：缺失时给出清晰指引而不是 import 崩溃
 try:
     from qqmusic_api import Client, Credential
-    from qqmusic_api.core.exceptions import BaseApiException
+    from qqmusic_api.core.exceptions import (
+        BaseApiException,
+        CredentialExpiredError,
+        NetworkError,
+        RatelimitedError,
+    )
     from qqmusic_api.models.login import QRCodeLoginEvents, QRLoginType
     from qqmusic_api.modules.login_utils import QRCodeLoginSession
     from qqmusic_api.modules.search import SearchType
@@ -32,7 +38,30 @@ except ImportError as _e:  # pragma: no cover
     Credential = None
     _IMPORT_ERROR = _e
 
+    # except 子句要求可捕获类型：库缺失时方法入口先抛 NotEnabledError，占位异常
+    # 永远不会真正命中，只保证 `except BaseApiException` 语句本身合法
+    class BaseApiException(Exception):
+        pass
+
+    CredentialExpiredError = NetworkError = RatelimitedError = ()
+    SearchType = None
+    SongFileInfo = None
+    SongFileType = None
+    SpecialSongFileType = None
+    QRCodeLoginEvents = None
+    QRLoginType = None
+    QRCodeLoginSession = None
+
 _NO_LOGIN_CODES = {104003}  # 104004=VKey 获取失败（换源重试可解）、104013=设备受限，都不该归因于"未登录"
+
+# core.search 传的是平台无关的参数名，QQ 侧映射到 SearchType 的整数值。
+# 放在模块级而非方法内：库未安装时 SearchType 为 None，映射表仍可安全构建。
+_QQ_TYPE_BY_NAME: dict[str, int] = {}
+if SearchType is not None:
+    for _name in ("SONGLIST", "ALBUM", "SINGER", "MV", "SONG"):
+        _member = getattr(SearchType, _name, None)
+        if _member is not None:
+            _QQ_TYPE_BY_NAME[_name.lower()] = int(_member)
 
 
 def available() -> bool:
@@ -105,11 +134,17 @@ def _norm_album(item, idx: int = 0) -> dict | None:
     if not name:
         return None
     mid = getattr(item, "mid", "") or ""
-    # 歌手字段三种模型不同：搜索/详情是 .singer 列表，新专辑是 .singers，
+    # 歌手字段四种形态：AlbumSearch（搜索）覆写 singer 为含 <em> 高亮的字符串、
+    # 结构化列表在 singer_list；基类 Album / 详情是 .singer 列表；新专辑是 .singers；
     # 歌手专辑 AlbumBrief 是 .singer_name 字符串
-    singers = getattr(item, "singer", None) or getattr(item, "singers", None) or []
-    if singers:
-        artist = " / ".join(s.name for s in singers if getattr(s, "name", ""))
+    raw_singer = getattr(item, "singer", None)
+    structured = getattr(item, "singer_list", None) or getattr(item, "singers", None)
+    if not isinstance(raw_singer, str):
+        structured = structured or raw_singer or []
+    if structured:
+        artist = " / ".join(s.name for s in structured if getattr(s, "name", ""))
+    elif isinstance(raw_singer, str):
+        artist = re.sub(r"</?em>", "", raw_singer).strip()
     else:
         artist = str(getattr(item, "singer_name", "") or "")
     return {
@@ -203,24 +238,42 @@ class QQClient:
         self._client: Client | None = None
         self._lock = asyncio.Lock()
         self._cdn_cache: tuple[float, str] = (0.0, "")
+        # 凭证缓存：(载入时刻, credential)。取流是热路径，每次 json.loads 配置串太浪费
+        self._cred_cache: tuple[float, object] = (0.0, None)
 
-    @property
     def ready(self) -> bool:
+        """重依赖是否就绪。与 ncm/kg 保持同为方法（不是 property），
+        否则契约自检的 callable 判定会把它误判为「未实现」。"""
         return available()
 
-    def _credential(self):
+    _CRED_TTL = 5.0
+
+    def _credential(self, force: bool = False):
         if not available():
             return None
-        raw = self._config.src_cookie("qq")  # qq.credential JSON
-        if not raw:
+        ts, cached = self._cred_cache
+        if not force and cached is not None and time.monotonic() - ts < self._CRED_TTL:
+            return cached
+        raw = self._config.src_cookie("qq")  # qq.cookie 存 Credential JSON
+        cred = None
+        if raw:
+            try:
+                data = json.loads(raw)
+                if isinstance(data, dict) and data.get("musickey"):
+                    cred = Credential.model_validate(data)
+            except (ValueError, TypeError):
+                cred = None
+        # 只在解析出有效凭证时更新缓存：解析失败保留旧值，
+        # 否则一次配置写入失败就会把有效登录态冲成 None
+        if cred is not None:
+            self._cred_cache = (time.monotonic(), cred)
+        elif force:
             return None
-        try:
-            data = json.loads(raw)
-            if isinstance(data, dict) and data.get("musickey"):
-                return Credential.model_validate(data)
-        except (ValueError, TypeError):
-            pass
-        return None
+        return cred if cred is not None else cached
+
+    def invalidate_credential(self) -> None:
+        """登录态变更后主动失效缓存（扫码成功 / 登出 / 刷新失败）。"""
+        self._cred_cache = (0.0, None)
 
     async def get_client(self):
         """懒加载单例 Client（带登录态）。未安装库抛 NotEnabledError。"""
@@ -236,7 +289,14 @@ class QQClient:
                     pass
                 self._client = Client(device_path=str(self._device_path))
                 await self._client.__aenter__()
-            self._client.credential = self._credential()
+            # 仅在 client 尚无有效登录态时补一次：扫码成功后库会自己更新 credential，
+            # 每次调用都重写会用配置里的旧值（或 None）把刚拿到的有效凭证冲掉。
+            # 判据必须是 musicid/musickey，不能是 `credential is None`——
+            # qqmusic_api 的 setter 是 `value or Credential()`，None 会被兜底成空凭证，
+            # 判 None 永远为假，配置里的凭证在插件重启后永远注入不进来。
+            cred = getattr(self._client, "credential", None)
+            if not (cred and cred.musicid and cred.musickey):
+                self._client.credential = await asyncio.to_thread(self._credential)
             return self._client
 
     async def close(self) -> None:
@@ -248,11 +308,21 @@ class QQClient:
             self._client = None
 
     # ──────────── 搜索 ────────────
+    def search_type(self, param: str):
+        """把 core 层的数据驱动参数名（"songlist"/"album"/"singer"）转成 SearchType。
+
+        平台适配点：core.search 不必知道 QQ 用的是枚举而不是裸值。
+        """
+        st = _QQ_TYPE_BY_NAME.get(param)
+        return SearchType(st) if st else None
+
     async def search(
         self, keyword: str, limit: int = 10, type_: SearchType | None = None, page: int = 1
     ) -> list[dict]:
         client = await self.get_client()
         st = type_ or SearchType.SONG
+        if isinstance(st, str):  # 容忍直接传参数名
+            st = self.search_type(st) or SearchType.SONG
         res = await client.search.search_by_type(keyword=keyword, search_type=st, num=limit, page=page)
         if st == SearchType.SONG:
             return [s for s in (_norm_song(x, i) for i, x in enumerate(res.song or [])) if s][:limit]
@@ -388,7 +458,9 @@ class QQClient:
         info = data[0] if data else None
         if info is None:
             return {"ok": False, "code": None, "url": ""}
-        result = int(getattr(info, "result", -1) or -1)
+        # result 是必填 int，成功值为 0 —— 不能用 `or` 兜底（0 会被短路成 -1）
+        raw = getattr(info, "result", None)
+        result = -1 if raw is None else int(raw)
         purl = getattr(info, "purl", "") or ""
         return {"ok": result == 0 and bool(purl), "code": result, "url": purl}
 
@@ -500,7 +572,7 @@ class QQClient:
                 out.append(
                     {
                         "index": idx,
-                        "id": str(getattr(t, "top_id", 0) or getattr(t, "id", 0) or ""),
+                        "id": str(getattr(t, "id", 0) or ""),
                         "name": getattr(t, "name", "") or "",
                         "sub": getattr(t, "update_time", "") or getattr(t, "title", "") or "",
                         "cover": getattr(t, "head_pic_url", "") or getattr(t, "front_pic_url", "") or "",
@@ -718,8 +790,17 @@ class QQClient:
                     break
         return {"url": url, "vid": vid}
 
+    async def song_mv_url(self, song: dict) -> dict:
+        """统一协议：取 MV 直链；无 mvid 返回空。"""
+        vid = song.get("mvid")
+        if not vid:
+            return {"url": ""}
+        return await self.mv_urls(str(vid))
+
     # ──────────── 登录态 ────────────
     async def login_status(self) -> dict:
+        """本地登录态摘要。loggedIn 只代表凭证未过本地有效期（is_expired 读本地
+        时间戳），服务端吊销的凭证这里仍显示已登录；真正失效会在取流时暴露。"""
         cred = self._credential()
         if cred is None:
             return {"loggedIn": False, "uid": "", "nickname": "", "avatar": ""}
@@ -865,17 +946,23 @@ class QQClient:
                 "qq", json.dumps(data, ensure_ascii=False), str(data.get("musicid") or "")
             )
             saved = await self._config.save_async()
+            # 刷新后的 musickey 已变，必须让缓存失效，否则 5 秒内仍用旧凭证
+            self.invalidate_credential()
             return saved
         except BaseApiException:
             return False
 
     async def logout(self) -> None:
         self._config.clear_src_cookie("qq")
+        self.invalidate_credential()
+        # client 上残留的 credential 也要清，否则匿名判定会看到旧登录态
+        if self._client is not None:
+            self._client.credential = None
         await self._config.save_async()
 
     # ---- 扫码登录（供 WebUI / 聊天指令共用）----
     async def qr_start(self, login_type: str = "qq") -> dict:
-        """创建扫码会话。返回 {session, qrB64}；session 由 LoginManager 持有并后台消费。"""
+        """创建扫码会话。返回 {session, qrB64}；session 由 LoginFlows 持有并后台消费。"""
         if not available():
             raise NotEnabledError("qqmusic-api-python 未安装", source="qq")
         client = await self.get_client()
@@ -913,6 +1000,7 @@ class QQClient:
                         await on_event("refuse", "登录结果缺少凭证")
                         return
                     data = credential.model_dump(by_alias=True)
+                    self._cred_cache = (time.monotonic(), credential)
                     await on_event("done", json.dumps(data, ensure_ascii=False))
                     return
                 elif ev == QRCodeLoginEvents.TIMEOUT:
@@ -930,10 +1018,31 @@ class QQClient:
     # ──────────── 异常映射 ────────────
     @staticmethod
     def _map(e: BaseApiException) -> ApiError:
-        code = getattr(e, "code", None)
+        """按异常类型映射，不靠匹配 message 字符串。
+
+        库各异常的默认文案并不统一（CredentialExpiredError 是"登录凭证已过期, 请重新登录"，
+        不含任何可匹配的中文关键词），按字符串匹配会让过期凭证走兜底分支、
+        把英文原文透给用户。
+        """
+        if isinstance(e, CredentialExpiredError):
+            return ApiError("QQ 登录凭证已过期，请重新扫码登录", code=getattr(e, "code", None), source="qq")
+        if isinstance(e, RatelimitedError):
+            hint = str(getattr(e, "feedback_url", "") or "")
+            suffix = f"（{hint}）" if hint else ""
+            return ApiError(
+                f"QQ 音乐触发风控，请稍后再试{suffix}", code=getattr(e, "code", None), source="qq"
+            )
+        if isinstance(e, NetworkError):
+            return ApiError("QQ 音乐网络异常，请稍后重试", code=getattr(e, "code", None), source="qq")
         msg = str(e)
         if "需要登录" in msg or "未提供有效" in msg:
-            return ApiError("需要登录 QQ 音乐账号", code=code, source="qq")
+            return ApiError("需要登录 QQ 音乐账号", code=getattr(e, "code", None), source="qq")
         if "风控" in msg:
-            return ApiError("触发风控，请稍后再试", code=code, source="qq")
-        return ApiError(msg, code=code, source="qq")
+            return ApiError("触发风控，请稍后再试", code=getattr(e, "code", None), source="qq")
+        return ApiError(msg, code=getattr(e, "code", None), source="qq")
+
+
+if available():  # 依赖缺失时不注册：create() 不会拿到一个必然失败的实例
+    register(
+        "qq", lambda config, device_path=None, cred_path=None, **kw: QQClient(config, device_path, cred_path)
+    )

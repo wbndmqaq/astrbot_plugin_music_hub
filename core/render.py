@@ -1,9 +1,13 @@
-"""HTML 卡片渲染引擎：Jinja2 模板 + 常驻 Playwright Chromium。
+"""HTML 卡片渲染引擎：Jinja2 模板 + Playwright Chromium。
 
-- 模板位于 ``resources/html/<name>/<name>.html``，编译缓存
-- 封面取色动态主题注入（``data["theme"]`` → CSS 变量覆盖）
-- 截图 ``animations="disabled"``：入场动画直接跳到末态，不会截到半程
-- 启动失败短路：渲染环境缺失是稳定状态，后续渲染即时回退纯文本
+设计要点：
+
+- 浏览器运行时收敛为 :class:`Renderer` 实例，随 service 创建/销毁。
+  启动失败的状态在 close() 时归位，插件重载后可重新尝试启动，
+  不会因一次失败永久短路（模块级失败标记就无法恢复）。
+- 模板编译缓存仍为模块级（跨实例复用，模板内容不变时无需重编译）。
+- 截图 ``animations="disabled"``：入场动画直接跳到末态，不会截到半程。
+- 渲染环境缺失属稳定状态，失败后即时回退纯文本，不影响点歌。
 """
 
 from __future__ import annotations
@@ -26,10 +30,6 @@ _CHROME_ARGS = [
     "--hide-scrollbars",
 ]
 
-_playwright = None
-_browser = None
-_lock = asyncio.Lock()
-_launch_failed = False
 _hint_logged = False
 
 _RENDER_TUTORIAL = (
@@ -52,48 +52,7 @@ def _log_env_hint(reason: str) -> None:
     logger.error(f"{TAG} 卡片渲染不可用（{reason}）。\n{_RENDER_TUTORIAL}")
 
 
-async def _get_browser():
-    global _playwright, _browser, _launch_failed
-    if _browser is not None:
-        return _browser
-    if _launch_failed:
-        return None
-    try:
-        from playwright.async_api import async_playwright
-    except ImportError as e:
-        _launch_failed = True
-        _log_env_hint(f"缺少依赖 {e.name}")
-        return None
-    async with _lock:
-        if _browser is not None:
-            return _browser
-        pw = None
-        try:
-            pw = await async_playwright().start()
-            _browser = await pw.chromium.launch(headless=True, args=_CHROME_ARGS)
-            _playwright = pw
-        except Exception as e:  # noqa: BLE001
-            _launch_failed = True
-            msg = str(e)
-            if "Executable doesn't exist" in msg or "playwright install" in msg:
-                _log_env_hint("未下载 Chromium")
-            elif "shared libraries" in msg or "shared object" in msg:
-                _log_env_hint("Chromium 缺少系统运行库")
-            else:
-                logger.error(f"{TAG} Chromium 启动失败: {e}")
-            if pw is not None:
-                with contextlib.suppress(Exception):
-                    await pw.stop()
-            return None
-    return _browser
-
-
-def _remove_output(path: str) -> None:
-    with contextlib.suppress(OSError):
-        os.remove(path)
-
-
-# ──────────── 模板 ────────────
+# ──────────── 模板（跨实例共享，模板内容不变时无需重编译） ────────────
 _compiled_templates: dict[str, object] = {}
 
 
@@ -102,7 +61,13 @@ def _compile_template(tmpl_path: str):
 
     with open(tmpl_path, encoding="utf-8") as f:
         src = f.read()
-    return jinja2.Template(src, autoescape=True)
+    # ChainableUndefined：缺失键返回自身（falsy），任意属性/索引访问都不报错。
+    # 卡片模板大量使用 {{ a.b.c }} 形式的可选字段，直接用 Jinja 原生能力兜底。
+    return jinja2.Template(
+        src,
+        autoescape=True,
+        undefined=jinja2.ChainableUndefined,
+    )
 
 
 async def load_template(tmpl_path: str):
@@ -113,34 +78,123 @@ async def load_template(tmpl_path: str):
     return template
 
 
-_DICT_METHODS = frozenset(
-    {"items", "keys", "values", "get", "copy", "update", "pop", "popitem", "clear", "setdefault"}
-)
+# ──────────── 浏览器运行时（随实例生命周期） ────────────
+class Renderer:
+    """常驻 Chromium 实例。close() 后状态归位，允许再次尝试启动。"""
 
+    def __init__(self):
+        self._pw = None
+        self._browser = None
+        self._lock = asyncio.Lock()
+        self._disabled = False
 
-class _SafeData(dict):
-    """缺失键给空值；与字典方法同名键优先当数据键。"""
+    @property
+    def disabled(self) -> bool:
+        """环境不可用（如未安装 Playwright）时为 True，调用方应直接回退纯文本。"""
+        return self._disabled
 
-    def __missing__(self, key):
-        return ""
-
-    def __getattribute__(self, key):
-        if key in _DICT_METHODS:
+    async def _ensure_browser(self):
+        if self._browser is not None:
+            return self._browser
+        if self._disabled:
+            return None
+        try:
+            from playwright.async_api import async_playwright
+        except ImportError as e:
+            self._disabled = True
+            _log_env_hint(f"缺少依赖 {e.name}")
+            return None
+        async with self._lock:
+            if self._browser is not None:
+                return self._browser
+            pw = None
             try:
-                return dict.__getitem__(self, key)
-            except KeyError:
-                return ""
-        return dict.__getattribute__(self, key)
+                pw = await async_playwright().start()
+                self._browser = await pw.chromium.launch(headless=True, args=_CHROME_ARGS)
+                self._pw = pw
+            except Exception as e:  # noqa: BLE001
+                self._disabled = True
+                msg = str(e)
+                if "Executable doesn't exist" in msg or "playwright install" in msg:
+                    _log_env_hint("未下载 Chromium")
+                elif "shared libraries" in msg or "shared object" in msg:
+                    _log_env_hint("Chromium 缺少系统运行库")
+                else:
+                    logger.error(f"{TAG} Chromium 启动失败: {e}")
+                if pw is not None:
+                    with contextlib.suppress(Exception):
+                        await pw.stop()
+                return None
+        return self._browser
+
+    async def render(self, html: str, out_path: str, bg: str) -> bool:
+        """渲染 HTML → PNG。成功返回 True，失败返回 False（调用方回退纯文本）。"""
+        browser = await self._ensure_browser()
+        if browser is None:
+            return False
+        page = await browser.new_page(viewport={"width": 640, "height": 2200}, device_scale_factor=3)
+        try:
+            try:
+                await page.set_content(html, wait_until="networkidle", timeout=12000)
+            except Exception:  # noqa: BLE001
+                with contextlib.suppress(Exception):
+                    await page.set_content(html, wait_until="load", timeout=8000)
+            safe_bg = bg if isinstance(bg, str) and bg.startswith("#") and len(bg) == 7 else "#faf4f2"
+            await page.evaluate(
+                """(bg) => {
+                    document.documentElement.style.background = bg;
+                    document.body.style.background = bg;
+                    document.documentElement.style.width = 'fit-content';
+                    document.body.style.width = 'fit-content';
+                    document.documentElement.style.margin = '0';
+                    document.body.style.margin = '0';
+                }""",
+                safe_bg,
+            )
+            with contextlib.suppress(Exception):
+                await page.evaluate("document.fonts.ready.then(() => {})")
+            await page.wait_for_timeout(200)
+
+            el = await page.query_selector(".page") or await page.query_selector(".card") or page
+            box = await el.bounding_box()
+            if box:
+                need_w = int(box["x"] + box["width"] + 4)
+                need_h = int(box["y"] + box["height"] + 4)
+                cur = page.viewport_size
+                if need_w > cur["width"] or need_h > cur["height"]:
+                    await page.set_viewport_size(
+                        {"width": max(cur["width"], need_w), "height": max(cur["height"], need_h)}
+                    )
+                    await page.wait_for_timeout(80)
+            await el.screenshot(path=out_path, type="png", omit_background=False, animations="disabled")
+            return True
+        except Exception as e:  # noqa: BLE001
+            logger.error(f"{TAG} 渲染失败: {e}")
+            _remove_output(out_path)
+            return False
+        except BaseException:
+            _remove_output(out_path)
+            raise
+        finally:
+            with contextlib.suppress(Exception):
+                await page.close()
+
+    async def close(self) -> None:
+        """关闭浏览器并归位状态（disabled 复位，允许下次重载重试启动）。"""
+        if self._browser is not None:
+            with contextlib.suppress(Exception):
+                await self._browser.close()
+            self._browser = None
+        if self._pw is not None:
+            with contextlib.suppress(Exception):
+                await self._pw.stop()
+            self._pw = None
+        self._disabled = False
 
 
-def wrap_card_data(value):
-    if isinstance(value, dict):
-        return _SafeData({k: wrap_card_data(v) for k, v in value.items()})
-    if isinstance(value, list):
-        return [wrap_card_data(v) for v in value]
-    if isinstance(value, tuple):
-        return tuple(wrap_card_data(v) for v in value)
-    return value
+def _remove_output(path: str) -> None:
+    with contextlib.suppress(OSError):
+        os.remove(path)
 
 
 # ──────────── 主题 ────────────
@@ -240,71 +294,6 @@ def inject_theme_css(html: str, data: dict, tmpl_name: str, source: str) -> str:
     if "</style>" not in html:
         return html
     return html.replace("</style>", css + "</style>", 1)
-
-
-# ──────────── 渲染 ────────────
-async def render_html_to_png(html: str, out_path: str, bg: str = DEFAULT_PAGE_BG) -> bool:
-    browser = await _get_browser()
-    if browser is None:
-        return False
-    page = await browser.new_page(viewport={"width": 640, "height": 2200}, device_scale_factor=3)
-    try:
-        try:
-            await page.set_content(html, wait_until="networkidle", timeout=12000)
-        except Exception:  # noqa: BLE001
-            with contextlib.suppress(Exception):
-                await page.set_content(html, wait_until="load", timeout=8000)
-        safe_bg = bg if isinstance(bg, str) and bg.startswith("#") and len(bg) == 7 else DEFAULT_PAGE_BG
-        await page.evaluate(
-            """(bg) => {
-                document.documentElement.style.background = bg;
-                document.body.style.background = bg;
-                document.documentElement.style.width = 'fit-content';
-                document.body.style.width = 'fit-content';
-                document.documentElement.style.margin = '0';
-                document.body.style.margin = '0';
-            }""",
-            safe_bg,
-        )
-        with contextlib.suppress(Exception):
-            await page.evaluate("document.fonts.ready.then(() => {})")
-        await page.wait_for_timeout(200)
-
-        el = await page.query_selector(".page") or await page.query_selector(".card") or page
-        box = await el.bounding_box()
-        if box:
-            need_w = int(box["x"] + box["width"] + 4)
-            need_h = int(box["y"] + box["height"] + 4)
-            cur = page.viewport_size
-            if need_w > cur["width"] or need_h > cur["height"]:
-                await page.set_viewport_size(
-                    {"width": max(cur["width"], need_w), "height": max(cur["height"], need_h)}
-                )
-                await page.wait_for_timeout(80)
-        await el.screenshot(path=out_path, type="png", omit_background=False, animations="disabled")
-        return True
-    except Exception as e:  # noqa: BLE001
-        logger.error(f"{TAG} 渲染失败: {e}")
-        _remove_output(out_path)
-        return False
-    except BaseException:
-        _remove_output(out_path)
-        raise
-    finally:
-        with contextlib.suppress(Exception):
-            await page.close()
-
-
-async def close() -> None:
-    global _playwright, _browser
-    if _browser is not None:
-        with contextlib.suppress(Exception):
-            await _browser.close()
-        _browser = None
-    if _playwright is not None:
-        with contextlib.suppress(Exception):
-            await _playwright.stop()
-        _playwright = None
 
 
 def template_path(tmpl_root: Path, name: str) -> str:

@@ -21,7 +21,7 @@ def make_login(server):
             server.auth.record_fail(ip)
             return _json({"error": "密码错误"}, 401)
         server.auth.record_success(ip)
-        token = server.auth.create_session()
+        token = server.auth.create_session(ip=ip)
         resp = _json({"ok": True})
         resp.set_cookie(COOKIE_NAME, token, httponly=True, samesite="Lax", max_age=12 * 3600, path="/")
         return resp
@@ -82,7 +82,9 @@ def make_revoke(server):
         if sid == "*":
             n = server.auth.revoke_others(request.get("jti", ""))
             return _json({"ok": True, "revoked": n})
-        target = next((j for j in server.auth.sessions if j.startswith(sid)), None)
+        # UI 只展示 jti 前 8 位；这里按前 8 位精确比对，不做任意长度前缀匹配
+        # （1 个字符的前缀会吊销第一个碰巧命中的、可能是别人的会话）。也接受完整 jti。
+        target = next((j for j in server.auth.sessions if j == sid or j[:8] == sid), None)
         if not target:
             return _json({"error": "会话不存在"}, 404)
         server.auth.revoke(target)

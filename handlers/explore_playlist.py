@@ -5,6 +5,8 @@ from __future__ import annotations
 import re
 
 from ..core import SOURCE_KG, SOURCE_NAMES, SOURCE_NCM
+from ..core.cards import build_playlist_card_data
+from ..core.catalog import PLAYLIST_CATEGORY_METHODS, resolver_for
 from .explore_common import (
     _RE_ALBUM,
     _RE_HIGHQUALITY,
@@ -16,8 +18,54 @@ from .explore_common import (
     _albums_as_items,
     _locked_source,
     _pick_source,
-    _playlists_as_items,
+    playlists_as_items,
 )
+
+
+async def _resolve_by_keyword(service, event, src: str, kw: str, kind: str, spec: dict) -> None:
+    """「关键词 → 专辑/歌单」的统一编排：取 resolver → 调用 → 按结果分支。
+
+    平台差异（三家的方法名、返回结构、唯一/多命中判定）全在 core/catalog 的
+    resolver 表里，这里不出现任何平台判断，因此新增平台无需改本函数。
+    spec 承载纯展示差异（候选项 kind、tip、两类空结果文案）。
+    """
+    resolve = resolver_for(kind, src)
+    if resolve is None:
+        await service.reply(event, spec["unsupported"].format(src=SOURCE_NAMES.get(src, src)))
+        return
+    res = await resolve(service.client_of(src), kw)
+    if res.candidates:
+        items = (
+            _albums_as_items(res.candidates, src)
+            if kind == "album"
+            else playlists_as_items(res.candidates, src)
+        )
+        await service.list_to_session(
+            event, f"{spec['label']}候选 · {kw}", items, source=src, kind=spec["kind"], tip=spec["tip"]
+        )
+        return
+    if not res.songs:
+        await service.reply(event, spec["not_found"].format(kw=kw) if res.not_found else spec["empty"])
+        return
+    await service.list_to_session(event, res.title_or(kw), res.songs, source=src)
+
+
+_ALBUM_SPEC = {
+    "label": "专辑",
+    "kind": "albums",
+    "tip": "回复 听N 展开对应专辑",
+    "not_found": "没有找到专辑「{kw}」",
+    "empty": "专辑暂无曲目",
+    "unsupported": "专辑搜索暂不支持{src}音源",
+}
+_PLAYLIST_SPEC = {
+    "label": "歌单",
+    "kind": "playlists",
+    "tip": "回复 听N 展开对应歌单",
+    "not_found": "没有找到歌单「{kw}」",
+    "empty": "歌单暂无曲目",
+    "unsupported": "歌单搜索暂不支持{src}音源",
+}
 
 
 async def run_album(service, event):
@@ -27,60 +75,7 @@ async def run_album(service, event):
     if not kw:
         await service.reply(event, "用法：专辑 专辑名")
         return
-    client = service.client_of(src)
-    if src == SOURCE_NCM:
-        cands = await client.search(kw, 6, type_=10)
-        if not cands:
-            await service.reply(event, f"没有找到专辑「{kw}」")
-            return
-        if len(cands) == 1:
-            detail = await client.album_detail(cands[0]["id"])
-            songs = detail.get("songs", [])
-            meta = detail.get("album") or cands[0]
-        else:
-            await service.list_to_session(
-                event,
-                f"专辑候选 · {kw}",
-                _albums_as_items(cands, src),
-                source=src,
-                kind="albums",
-                tip="回复 听N 展开对应专辑",
-            )
-            return
-    elif src == SOURCE_KG:
-        cands = await client.search(kw, 6, "album")
-        if not cands:
-            await service.reply(event, f"没有找到专辑「{kw}」")
-            return
-        if len(cands) == 1:
-            meta = cands[0]
-            songs = await client.album_songs(meta["id"], 30)
-        else:
-            await service.list_to_session(
-                event,
-                f"专辑候选 · {kw}",
-                _albums_as_items(cands, src),
-                source=src,
-                kind="albums",
-                tip="回复 听N 展开对应专辑",
-            )
-            return
-    else:
-        meta, songs = await client.album_songs_by_keyword(kw, 30)
-        if meta is None and songs and "songCount" in songs[0]:
-            await service.list_to_session(
-                event,
-                f"专辑候选 · {kw}",
-                _albums_as_items(songs, src),
-                source=src,
-                kind="albums",
-                tip="回复 听N 展开对应专辑",
-            )
-            return
-    if not songs:
-        await service.reply(event, "专辑暂无曲目")
-        return
-    await service.list_to_session(event, f"{meta.get('name', kw)}", songs, source=src)
+    await _resolve_by_keyword(service, event, src, kw, "album", _ALBUM_SPEC)
 
 
 async def run_playlist(service, event):
@@ -90,70 +85,15 @@ async def run_playlist(service, event):
     if not kw:
         await service.reply(event, "用法：歌单 歌单名 或 歌单 歌单ID")
         return
-    client = service.client_of(src)
     if kw.isdigit():
-        # 直接按 ID 取
-        if src == SOURCE_NCM:
-            pl, songs = await service.ncm_playlist_songs(kw)
-        elif src == SOURCE_KG:
-            songs, name, cover = await client.playlist_songs(kw, 30)
-            pl = {"name": name, "cover": cover}
-        else:
-            meta, songs = await client.songlist_songs(kw, 30)
-            pl = meta
+        # 纯 ID 直取：无需搜索，因此复用「听N」展开用的 resolver（同一实现、同一取数上限）
+        pl, songs = await resolver_for("playlist_songs", src)(service.client_of(src), kw, kw)
         if not songs:
             await service.reply(event, "歌单暂无曲目或不存在")
             return
         await service.list_to_session(event, pl.get("name") or f"歌单 {kw}", songs, source=src)
         return
-    if src == SOURCE_NCM:
-        meta, songs = await client.playlist_songs_by_keyword(kw, 30)
-        if meta is None and songs:
-            await service.list_to_session(
-                event,
-                f"歌单候选 · {kw}",
-                _playlists_as_items(songs, src),
-                source=src,
-                kind="playlists",
-                tip="回复 听N 展开对应歌单",
-            )
-            return
-    elif src == SOURCE_KG:
-        cands = await client.search(kw, 6, "special")
-        if not cands:
-            await service.reply(event, f"没有找到歌单「{kw}」")
-            return
-        if len(cands) == 1:
-            songs, name, cover = await client.playlist_songs(cands[0]["id"], 30)
-            meta = {"name": name or cands[0].get("name", "")}
-        else:
-            await service.list_to_session(
-                event,
-                f"歌单候选 · {kw}",
-                _playlists_as_items(cands, src),
-                source=src,
-                kind="playlists",
-                tip="回复 听N 展开对应歌单",
-            )
-            return
-    else:
-        meta, songs = await client.songlist_by_keyword(kw, 30)
-        if meta is None and songs and "trackCount" in songs[0]:
-            await service.list_to_session(
-                event,
-                f"歌单候选 · {kw}",
-                _playlists_as_items(songs, src),
-                source=src,
-                kind="playlists",
-                tip="回复 听N 展开对应歌单",
-            )
-            return
-    if not songs:
-        await service.reply(event, "歌单暂无曲目")
-        return
-    await service.list_to_session(
-        event, meta.get("name", kw) if isinstance(meta, dict) else kw, songs, source=src
-    )
+    await _resolve_by_keyword(service, event, src, kw, "playlist", _PLAYLIST_SPEC)
 
 
 async def run_theme(service, event):
@@ -164,11 +104,11 @@ async def run_theme(service, event):
     )
     if src is None:
         return
-    pls = await service.call(src, "explore", service.kg.theme_playlists())
+    pls = await service.call(src, "explore", service.client_of(src).theme_playlists())
     if not pls:
         await service.reply(event, "暂无主题歌单")
         return
-    from ..core.cards import build_playlist_card_data, format_playlist_text
+    from ..core.formatters import format_playlist_text
 
     data = build_playlist_card_data("酷狗主题歌单", "", pls, source=src, tip="回复 歌单 歌单名 查看曲目")
     await service.reply_card_or_text(event, data, "playlist", src, format_playlist_text)
@@ -179,9 +119,17 @@ async def run_playlist_categories(service, event):
     m = re.search(_RE_PLAYLIST_CATS, event.message_str, re.IGNORECASE)
     src = await _pick_source(service, event, m.group(1) if m else "", prefer=SOURCE_NCM)
     client = service.client_of(src)
-    cats = await service.call(
-        src, "explore", client.playlist_categories() if src == SOURCE_NCM else client.playlist_tags()
-    )
+    # 三个客户端方法名不统一（ncm=playlist_categories / kg=playlist_tags），且 QQ 侧
+    # 根本没有这个能力 —— 表里查不到方法名就 getattr 探测，
+    # 否则只配了 QQ 的用户（qq 恒 enabled）会直接 AttributeError
+    method = PLAYLIST_CATEGORY_METHODS.get(src, "")
+    fetch = getattr(client, method, None) if method else None
+    if fetch is None:
+        await service.reply(
+            event, f"歌单分类暂不支持{SOURCE_NAMES.get(src, src)}音源，可用 ncm: 或 kg: 前缀指定"
+        )
+        return
+    cats = await service.call(src, "explore", fetch())
     if not cats:
         await service.reply(event, "暂无分类数据")
         return
@@ -203,11 +151,11 @@ async def run_highquality(service, event):
     if src is None:
         return
     cat = (m.group(2) if m else "").strip()
-    pls = await service.call(src, "explore", service.ncm.high_quality_playlists(cat))
+    pls = await service.call(src, "explore", service.client_of(src).high_quality_playlists(cat))
     if not pls:
         await service.reply(event, "暂无精品歌单")
         return
-    from ..core.cards import build_playlist_card_data, format_playlist_text
+    from ..core.formatters import format_playlist_text
 
     data = build_playlist_card_data(
         "网易云 · 精品歌单" + (f" · {cat}" if cat else ""),
@@ -234,7 +182,7 @@ async def run_related_playlists(service, event):
     if kw.isdigit():
         pid = kw
     else:
-        cands = await service.call(src, "explore", service.ncm.search(kw, 6, 1000))
+        cands = await service.call(src, "explore", service.client_of(src).search(kw, 6, 1000))
         if not cands:
             await service.reply(event, f"没有找到歌单「{kw}」")
             return
@@ -242,18 +190,18 @@ async def run_related_playlists(service, event):
             await service.list_to_session(
                 event,
                 f"歌单候选 · {kw}",
-                _playlists_as_items(cands, src),
+                playlists_as_items(cands, src),
                 source=src,
                 kind="playlists",
                 tip="命中多个歌单，回复 听N 展开后用「相关歌单 歌单ID」",
             )
             return
         pid = cands[0]["id"]
-    pls = await service.call(src, "explore", service.ncm.related_playlists(pid, 10))
+    pls = await service.call(src, "explore", service.client_of(src).related_playlists(pid, 10))
     if not pls:
         await service.reply(event, "这个歌单没有相关推荐（官方榜单没有该数据）")
         return
-    from ..core.cards import build_playlist_card_data, format_playlist_text
+    from ..core.formatters import format_playlist_text
 
     data = build_playlist_card_data(
         "网易云 · 相关歌单推荐", "", pls, source=src, tip="回复 歌单 歌单名 查看曲目"
@@ -269,7 +217,7 @@ async def run_yueku(service, event):
     )
     if src is None:
         return
-    songs = await service.call(src, "explore", service.kg.yueku_songs(30))
+    songs = await service.call(src, "explore", service.client_of(src).yueku_songs(30))
     if not songs:
         await service.reply(event, "暂无乐库推荐")
         return

@@ -40,10 +40,3 @@ class Acl:
             allowed = {w.strip() for w in self._config.acl_list("whitelist")}
             if not (candidates & allowed):
                 raise AclDeniedError("当前用户/群不在白名单内")
-
-    def is_denied(self, sender_id: str, group_id: str = "", platform: str = "") -> bool:
-        try:
-            self.check(sender_id, group_id, platform)
-            return False
-        except AclDeniedError:
-            return True

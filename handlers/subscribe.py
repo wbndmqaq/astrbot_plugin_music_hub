@@ -1,6 +1,6 @@
 """订阅推送路由：订阅 日推 / 订阅新歌 歌手名 / 退订 / 我的订阅。
 
-推送在 core.scheduler 每日任务里执行（core.subs.SubManager.push_all）。
+推送在 core.scheduler 每日任务里执行（core.subs.Subscriptions.push_all）。
 """
 
 from __future__ import annotations
@@ -105,10 +105,15 @@ async def run_sub_list(service, event):
 def routes() -> list[Route]:
     rs = [
         Route(
-            re.compile(_RE_SUB_DAILY), "mh_sub_daily", "订阅每日推荐", run_sub_daily, admin=True, priority=6
+            re.compile(_RE_SUB_DAILY, re.IGNORECASE),
+            "mh_sub_daily",
+            "订阅每日推荐",
+            run_sub_daily,
+            admin=True,
+            priority=6,
         ),
         Route(
-            re.compile(_RE_UNSUB_DAILY),
+            re.compile(_RE_UNSUB_DAILY, re.IGNORECASE),
             "mh_unsub_daily",
             "退订每日推荐",
             run_unsub_daily,
@@ -116,7 +121,7 @@ def routes() -> list[Route]:
             priority=6,
         ),
         Route(
-            re.compile(_RE_SUB_ARTIST),
+            re.compile(_RE_SUB_ARTIST, re.IGNORECASE),
             "mh_sub_artist",
             "订阅歌手新歌",
             run_sub_artist,
@@ -124,14 +129,14 @@ def routes() -> list[Route]:
             priority=6,
         ),
         Route(
-            re.compile(_RE_UNSUB_ARTIST),
+            re.compile(_RE_UNSUB_ARTIST, re.IGNORECASE),
             "mh_unsub_artist",
             "退订歌手新歌",
             run_unsub_artist,
             admin=True,
             priority=6,
         ),
-        Route(re.compile(_RE_SUB_LIST), "mh_sub_list", "我的订阅", run_sub_list, priority=6),
+        Route(re.compile(_RE_SUB_LIST, re.IGNORECASE), "mh_sub_list", "我的订阅", run_sub_list, priority=6),
     ]
     for r in rs:
         r.gated = True

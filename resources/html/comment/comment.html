@@ -66,8 +66,8 @@
   <div class="comments">
     {% for c in data.comments %}
     <div class="cmt">
-      {% if c.avatar %}<img class="ava" src="{{ c.avatar }}" referrerpolicy="no-referrer" onerror="this.outerHTML='<div class=&quot;ava-ph&quot;>{{ c.nick[0] if c.nick else '友' }}</div>'" />
-      {% else %}<div class="ava-ph">{{ c.nick[0] if c.nick else '友' }}</div>{% endif %}
+      {% if c.avatar %}<img class="ava" src="{{ c.avatar }}" referrerpolicy="no-referrer" data-fb="{{ (c.nick or '友')[0:1] }}" onerror="var d=document.createElement('div');d.className='ava-ph';d.textContent=this.dataset.fb;this.replaceWith(d)" />
+      {% else %}<div class="ava-ph">{{ (c.nick or '友')[0:1] }}</div>{% endif %}
       <div class="cmt-main">
         <div class="cmt-head">
           <span class="nick">{{ c.nick }}</span>

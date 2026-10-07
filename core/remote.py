@@ -12,12 +12,12 @@ from astrbot.api import logger
 
 from . import SOURCE_NAMES
 from .media import (
-    _VOCAL_DIRECT_EXT,
-    _schedule_cleanup,
+    VOCAL_DIRECT_EXT,
     build_music_filename,
     download_audio,
     get_temp_dir,
     prepare_vocal_file,
+    schedule_cleanup,
 )
 from .platform_caps import caps_for_name
 
@@ -64,11 +64,11 @@ async def send_audio_to(service, umo: str, song: dict, play: dict, *, note: str 
             return {"ok": False, "reason": "download_fail"}
         path = dl["filePath"]
         keep = service.config.keep_file_sec
-        _schedule_cleanup(path, keep)
+        schedule_cleanup(path, keep)
         if caps.vocal:
-            vocal = await prepare_vocal_file(path, direct_ext=_VOCAL_DIRECT_EXT)
+            vocal = await prepare_vocal_file(path, direct_ext=VOCAL_DIRECT_EXT)
             if vocal and vocal != path:
-                _schedule_cleanup(vocal, keep)
+                schedule_cleanup(vocal, keep)
             try:
                 await service.context.send_message(
                     umo, MessageChain(chain=[Comp.Plain(text), Comp.Record.fromFileSystem(vocal or path)])

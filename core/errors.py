@@ -72,3 +72,7 @@ class NotEnabledError(ApiError):
 
 class AclDeniedError(Exception):
     """黑白名单拒绝。"""
+
+
+class TooManyTasks(Exception):
+    """后台任务并发超上限（拒绝新任务，避免内存被耗尽）。"""

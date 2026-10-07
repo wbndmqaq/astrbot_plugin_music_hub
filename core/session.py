@@ -105,10 +105,14 @@ class SessionStore:
         async with self._lock:
             self._cache[scope] = entry
             if len(self._cache) > MAX_ENTRIES:
-                oldest = min(self._cache, key=lambda k: self._cache[k].get("updatedAt", 0))
-                self._cache.pop(oldest, None)
+                # 批量淘汰：只弹一条的话高频写入下 _cache 会远超上限，内存不受控
+                over = len(self._cache) - MAX_ENTRIES + 1
+                for k in sorted(self._cache, key=lambda k: self._cache[k].get("updatedAt", 0))[:over]:
+                    self._cache.pop(k, None)
+            # KV 写放在锁内：同一 scope 的并发 set 若在锁外落盘，
+            # 后完成的旧 entry 可能覆盖新 entry，重载后「听N」拿到过期列表。
+            await self._kv_put(f"{self._kv_prefix}:sess:{scope}", entry)
         await self.claim_owner(scope)
-        await self._kv_put(f"{self._kv_prefix}:sess:{scope}", entry)
 
     async def get(self, scope: str, refresh: bool = False) -> dict | None:
         async with self._lock:
@@ -121,6 +125,11 @@ class SessionStore:
         if isinstance(stored, dict) and stored.get("kind"):
             if time.time() - float(stored.get("updatedAt", 0)) < TTL:
                 async with self._lock:
+                    # 二次检查：等 KV 期间可能已有别的协程写入了更新的 entry，
+                    # 无条件覆盖会让新数据被旧值顶掉。
+                    current = self._cache.get(scope)
+                    if current is not None and current.get("updatedAt", 0) >= stored.get("updatedAt", 0):
+                        return dict(current)
                     self._cache[scope] = stored
                 return dict(stored)
         return None

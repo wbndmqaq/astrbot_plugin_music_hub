@@ -72,7 +72,7 @@ class MusicHubPlugin(Star):
             return
         import secrets
 
-        self.config.set_webui_password(secrets.token_hex(4))
+        self.config.set_webui_password(secrets.token_hex(8))
         await self.config.save_async()
         logger.info(
             "[music_hub] WebUI 首次启动已生成随机登录密码，请在 AstrBot 插件配置（webui.password）中查看"
@@ -184,5 +184,4 @@ class MusicHubPlugin(Star):
 
 # 声明式路由在模块导入时安装（AstrBot 以 __module__+__name__ 为键绑定 handler，
 # 必须先于星图扫描完成；重写 __module__ 以配合加载机制）
-_installed = install(MusicHubPlugin, filter, __name__, all_routes())
-logger.info(f"[music_hub] 已注册 {_installed} 个指令路由")
+logger.info(f"[music_hub] 已注册 {install(MusicHubPlugin, filter, __name__, all_routes())} 个指令路由")

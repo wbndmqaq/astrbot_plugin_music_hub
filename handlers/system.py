@@ -2,11 +2,14 @@
 
 from __future__ import annotations
 
+import asyncio
 import re
+from typing import Any
 
-from ..core import SOURCE_NAMES, SOURCES
+from ..core import SOURCE_NAMES, SOURCE_QQ, SOURCES
 from ..core.errors import ApiError
 from ..core.quality import KG_LABEL, NCM_LABEL, QQ_LABEL
+from ..core.sources import token_to_source
 from .base import Route
 
 _SRC = r"(ncm|kg|qqm|qq)?"
@@ -23,11 +26,21 @@ _RE_TOGGLE = r"^\s*#?(?:音乐|mh)?\s*(开启|关闭)\s+(点歌|解析|卡片|�
 
 _QUALITY_TABLES = {"ncm": NCM_LABEL, "kg": KG_LABEL, "qq": QQ_LABEL}
 
+# 「设置 API 地址」后的连通性探针：source → (请求路径, 参数)。
+# 只含走外部 HTTP API 的平台——QQ 是进程内内置库，不需要也不该探 apiBase。
+API_PROBE_PARAMS: dict[str, tuple[str, dict]] = {
+    "ncm": ("/song/url/v1", {"id": 1, "level": "standard"}),
+    "kg": ("/search/hot", {}),
+}
 
-def _src_of(token: str | None, default: str = "") -> str:
-    from ..core.sources import token_to_source
-
-    return token_to_source(token, default)
+# 「测试」指令的连通性探针：source → (展示用短名, 探针调用)。
+# 短名沿用各平台惯用叫法（网易云/酷狗，而非 SOURCE_NAMES 的「网易云音乐」），
+# 因为这些字符串是用户可见输出，改名会变更既有文案。
+# 两家的探针调用也不同（网易云用 search、酷狗用裸 request），故存 callable 而非路径。
+CONNECTIVITY_PROBES: dict[str, tuple[str, Any]] = {
+    "ncm": ("网易云", lambda client: client.search("测试", 1)),
+    "kg": ("酷狗", lambda client: client.request("/search/hot", {})),
+}
 
 
 async def run_help(service, event):
@@ -68,7 +81,7 @@ def _format_settings_text(data: dict) -> str:
 
 async def run_quality(service, event):
     m = re.search(_RE_QUALITY, event.message_str, re.IGNORECASE)
-    src = _src_of(m.group(1) if m else None, service.config.default_source)
+    src = token_to_source(m.group(1) if m else None, service.config.default_source)
     if src == "auto":
         src = "ncm"
     value = (m.group(2) if m else "").strip().lower()
@@ -95,7 +108,7 @@ async def run_quality(service, event):
 
 async def run_api(service, event):
     m = re.search(_RE_API, event.message_str, re.IGNORECASE)
-    src = _src_of(m.group(1) if m else None)
+    src = token_to_source(m.group(1) if m else None)
     url = (m.group(2) if m else "").strip()
     if src in ("", "qq"):
         await service.reply(event, "用法：ncm api <地址> 或 kg api <地址>（QQ 音源内置，无需配置）")
@@ -109,10 +122,10 @@ async def run_api(service, event):
     saved = await service.config.save_async()
     await service.reply(event, f"[{SOURCE_NAMES[src]}] API 地址已设置并测试中…")
     try:
-        if src == "ncm":
-            await service.ncm.request("/song/url/v1", {"id": 1, "level": "standard"})
-        else:
-            await service.kg.request("/search/hot", {})
+        # 平台独占能力：连通性探针路径因平台而异（网易云试取播放地址、酷狗试热搜），
+        # 且 QQ 内置库无需配置 api（上面已拦下），故按平台分支选探针。
+        path, params = API_PROBE_PARAMS[src]
+        await service.client_of(src).request(path, params)
         await service.reply(event, "连通性 OK ✓" + ("" if saved else "（保存失败，重启后失效）"))
     except ApiError as e:
         await service.reply(event, f"连通性失败：{e.user_msg()}")
@@ -132,36 +145,48 @@ async def run_stats(service, event):
 
 async def run_test(service, event):
     lines = ["♪ Music Hub 连通性测试"]
-    # QQ
+    # QQ：内置库，无需配置 API，故单独一段（也用它自己的 available() 探测）
     try:
         from ..core.api.qq import available as qq_ok
 
         if qq_ok():
-            status = await service.qq.login_status()
+            status = await service.client_of(SOURCE_QQ).login_status()
             lines.append(f"· QQ音乐：内置库 ✓（{'已登录' if status.get('loggedIn') else '匿名'}）")
         else:
             lines.append("· QQ音乐：✗ 未安装 qqmusic-api-python")
     except Exception as e:  # noqa: BLE001
         lines.append(f"· QQ音乐：✗ {e}")
-    # ncm
-    if not service.config.src_api_base("ncm"):
-        lines.append("· 网易云：未配置 API")
-    else:
+    # 走 HTTP API 的平台：探针调用因平台而异，按 CONNECTIVITY_PROBES 查表后统一遍历，
+    # 新增平台只需加一行探针，无需再复制一段 ncm/kg 分支。
+    # label 用各平台惯用短名（不是 SOURCE_NAMES 的「网易云音乐」），与既有输出一致。
+    for src, probe in CONNECTIVITY_PROBES.items():
+        label, fetch = probe
+        base = service.config.src_api_base(src)
+        if not base:
+            lines.append(f"· {label}：未配置 API")
+            continue
         try:
-            await service.ncm.search("测试", 1)
-            lines.append(f"· 网易云：✓（{service.config.src_api_base('ncm')}）")
+            await fetch(service.client_of(src))
+            lines.append(f"· {label}：✓（{base}）")
         except Exception as e:  # noqa: BLE001
-            lines.append(f"· 网易云：✗ {e}")
-    # kg
-    if not service.config.src_api_base("kg"):
-        lines.append("· 酷狗：未配置 API")
-    else:
-        try:
-            await service.kg.request("/search/hot", {})
-            lines.append(f"· 酷狗：✓（{service.config.src_api_base('kg')}）")
-        except Exception as e:  # noqa: BLE001
-            lines.append(f"· 酷狗：✗ {e}")
+            lines.append(f"· {label}：✗ {e}")
     await service.reply(event, "\n".join(lines))
+
+
+def _detect_lan_ip() -> str:
+    """探测本机局域网 IP。UDP connect 不发包，通常瞬时返回；失败回环地址。"""
+    import socket
+
+    s = None
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.connect(("223.5.5.5", 80))
+        return s.getsockname()[0]
+    except Exception:  # noqa: BLE001
+        return "127.0.0.1"
+    finally:
+        if s is not None:
+            s.close()
 
 
 async def run_webui(service, event):
@@ -170,15 +195,7 @@ async def run_webui(service, event):
         await service.reply(event, "WebUI 未启用（插件配置里开启）")
         return
     host = cfg.webui_host
-    import socket
-
-    try:
-        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        s.connect(("223.5.5.5", 80))
-        lan_ip = s.getsockname()[0]
-        s.close()
-    except Exception:  # noqa: BLE001
-        lan_ip = "127.0.0.1"
+    lan_ip = await asyncio.to_thread(_detect_lan_ip)  # socket 探测放线程池
     display = lan_ip if host in ("0.0.0.0", "") else host
     await service.reply(
         event,
@@ -222,5 +239,7 @@ def routes() -> list[Route]:
         Route(re.compile(_RE_STATS, re.IGNORECASE), "mh_stats", "调用统计", run_stats, priority=6),
         Route(re.compile(_RE_TEST, re.IGNORECASE), "mh_test", "连通性测试", run_test, admin=True, priority=6),
         Route(re.compile(_RE_WEBUI, re.IGNORECASE), "mh_webui", "WebUI 地址", run_webui, priority=6),
-        Route(re.compile(_RE_TOGGLE), "mh_toggle", "功能开关", run_toggle, admin=True, priority=6),
+        Route(
+            re.compile(_RE_TOGGLE, re.IGNORECASE), "mh_toggle", "功能开关", run_toggle, admin=True, priority=6
+        ),
     ]

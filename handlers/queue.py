@@ -1,6 +1,6 @@
 """点歌台路由：群内跨用户排队（排队 / 队列 / 切歌 / 清空队列）。
 
-队列状态在 core.queue.QueueManager（内存态）；播放经会话注册表的
+队列状态在 core.queue.RequestDesk（内存态）；播放经会话注册表的
 unified_msg_origin 主动发送，不依赖触发事件。
 """
 
@@ -46,6 +46,10 @@ async def run_enqueue(service, event):
     if pos == -2:
         await service.reply(event, "点歌台还没有绑定本会话，先在群里发一次「点歌」再排队")
         return
+    if pos == -3:
+        # 后台任务已达并发上限，入队已回滚；不提示具体上限，避免误导
+        await service.reply(event, "系统繁忙，排队没有成功，稍后再试")
+        return
     src_name = {"ncm": "网易云", "kg": "酷狗", "qq": "QQ"}.get(song.get("source", ""), "")
     await service.reply(
         event,
@@ -61,7 +65,7 @@ async def run_queue(service, event):
 
 async def run_skip(service, event):
     scope = service.scope(event)
-    nxt = service.queue.skip(scope)
+    nxt = await service.queue.skip(scope)
     if nxt is None:
         await service.reply(event, "已切歌，队列里没有下一首了")
     else:
@@ -71,18 +75,25 @@ async def run_skip(service, event):
 
 async def run_clear(service, event):
     scope = service.scope(event)
-    n = service.queue.clear(scope)
+    n = await service.queue.clear(scope)
     await service.reply(event, f"已清空队列（移除 {n} 首）" if n else "队列本来就是空的")
 
 
 def routes() -> list[Route]:
     rs = [
-        Route(re.compile(_RE_ENQUEUE), "mh_enqueue", "点歌台排队", run_enqueue, priority=6),
+        Route(re.compile(_RE_ENQUEUE, re.IGNORECASE), "mh_enqueue", "点歌台排队", run_enqueue, priority=6),
         # 队列路由要在「播放 关键词」(mh_play) 之前判定空参形式
-        Route(re.compile(_RE_QUEUE), "mh_queue", "查看点歌台队列", run_queue, priority=7),
-        Route(re.compile(_RE_SKIP), "mh_skip", "切歌（管理员）", run_skip, admin=True, priority=7),
+        Route(re.compile(_RE_QUEUE, re.IGNORECASE), "mh_queue", "查看点歌台队列", run_queue, priority=7),
         Route(
-            re.compile(_RE_CLEAR), "mh_queue_clear", "清空队列（管理员）", run_clear, admin=True, priority=7
+            re.compile(_RE_SKIP, re.IGNORECASE), "mh_skip", "切歌（管理员）", run_skip, admin=True, priority=7
+        ),
+        Route(
+            re.compile(_RE_CLEAR, re.IGNORECASE),
+            "mh_queue_clear",
+            "清空队列（管理员）",
+            run_clear,
+            admin=True,
+            priority=7,
         ),
     ]
     for r in rs:

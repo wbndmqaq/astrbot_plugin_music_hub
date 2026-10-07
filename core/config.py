@@ -8,7 +8,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from . import SOURCES
+from . import DEFAULT_API_BASE, SOURCES
 
 
 def as_int(value: Any, default: int = 0, lo: int | None = None, hi: int | None = None) -> int:
@@ -164,7 +164,7 @@ class Config:
 
     @property
     def download_timeout(self) -> float:
-        return as_int(self.get("downloadTimeout"), 120000, lo=5000) / 1000.0
+        return as_int(self.get("downloadTimeout"), 120000, lo=5000, hi=600000) / 1000.0
 
     @property
     def keep_file_sec(self) -> int:
@@ -189,16 +189,31 @@ class Config:
         return node if isinstance(node, dict) else {}
 
     def src_api_base(self, source: str) -> str:
-        """音源 API 地址；ncm/kg 未配置返回空串。QQ 不依赖外部服务，恒返回 "local"。"""
+        """音源 API 地址；未配置时回落到内置默认地址。QQ 不依赖外部服务，恒返回 "local"。"""
         if source == "qq":
             return "local"
-        return normalize_base(as_str(self.src_node(source).get("apiBase")))
+        configured = normalize_base(as_str(self.src_node(source).get("apiBase")))
+        return configured or DEFAULT_API_BASE.get(source, "")
+
+    # 旧版 QQ 节点用 credential/uin，与另两平台的 cookie/uid 不一致；
+    # AstrBot 加载时会删掉 Schema 外键，导致扫码登录态每次重载即丢。保留读取别名做迁移。
+    _LEGACY_KEYS = {"qq": {"cookie": "credential", "uid": "uin"}}
 
     def src_cookie(self, source: str) -> str:
-        return as_str(self.src_node(source).get("cookie")).strip()
+        node = self.src_node(source)
+        cookie = as_str(node.get("cookie")).strip()
+        if cookie:
+            return cookie
+        legacy = self._LEGACY_KEYS.get(source, {}).get("cookie", "")
+        return as_str(node.get(legacy)).strip() if legacy else ""
 
     def src_uid(self, source: str) -> str:
-        return as_str(self.src_node(source).get("uid")).strip()
+        node = self.src_node(source)
+        uid = as_str(node.get("uid")).strip()
+        if uid:
+            return uid
+        legacy = self._LEGACY_KEYS.get(source, {}).get("uid", "")
+        return as_str(node.get(legacy)).strip() if legacy else ""
 
     def set_src_cookie(self, source: str, cookie: str, uid: str = "") -> None:
         node = dict(self.src_node(source))
@@ -214,7 +229,9 @@ class Config:
         self.set(source, node)
 
     def src_quality(self, source: str) -> str:
-        q = as_str(self.src_node(source).get("quality"), "auto")
+        # 归一大小写：用户在 WebUI 填 "Lossless"/"HIRES" 时若不归一，
+        # quality 阶梯查不到会静默降级到 lossless，音质降级无任何提示
+        q = as_str(self.src_node(source).get("quality"), "auto").strip().lower()
         return q or "auto"
 
     def src_quality_unblock(self, source: str) -> bool:
@@ -237,7 +254,8 @@ class Config:
     # ──────────── 黑白名单 ────────────
     @property
     def acl_mode(self) -> str:
-        mode = as_str(self.get("acl", {}).get("mode") if isinstance(self.get("acl"), dict) else "", "off")
+        acl = self.get("acl")
+        mode = as_str(acl.get("mode") if isinstance(acl, dict) else "", "off")
         return mode if mode in ("off", "blacklist", "whitelist") else "off"
 
     def acl_list(self, kind: str) -> list[str]:
@@ -265,7 +283,16 @@ class Config:
 
     @property
     def webui_host(self) -> str:
-        return as_str(self.webui_node().get("host"), "0.0.0.0") or "0.0.0.0"
+        # 默认只听回环：面板能改全部插件配置、导入平台 Cookie，不该默认暴露到局域网
+        return as_str(self.webui_node().get("host"), "127.0.0.1") or "127.0.0.1"
+
+    @property
+    def webui_host_allowlist(self) -> list[str]:
+        """允许以域名访问面板的 Host 白名单（子域名自动放行）。"""
+        raw = self.webui_node().get("hostAllowlist")
+        if not isinstance(raw, list):
+            return []
+        return [d.strip().lower().lstrip(".") for d in (str(x) for x in raw) if d.strip()]
 
     @property
     def webui_port(self) -> int:

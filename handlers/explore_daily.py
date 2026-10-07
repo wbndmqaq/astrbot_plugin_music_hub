@@ -4,12 +4,21 @@ from __future__ import annotations
 
 import re
 
-from ..core import SOURCE_KG, SOURCE_NAMES, SOURCE_NCM, SOURCE_QQ
+from ..core import SOURCE_NAMES, SOURCE_NCM, SOURCE_QQ
+from ..core.cards import build_playlist_card_data
+from ..core.catalog import (
+    FM_FETCHERS,
+    HISTORY_DAILY_CLIENT_SOURCE,
+    HISTORY_DAILY_DEFAULT_CLIENT_SOURCE,
+    HISTORY_DAILY_DEFAULT_HINT,
+    HISTORY_DAILY_HINTS,
+    NEW_ALBUM_FETCHERS,
+    PLAYLIST_RECOMMENDERS,
+    RANDOM_FETCHERS,
+    RECOMMEND_CATEGORY_SOURCES,
+)
 from ..core.errors import ApiError
 from .explore_common import (
-    _AREA_NCM_ALBUM,
-    _KG_AREA_ALBUM,
-    _QQ_AREA_ALBUM,
     _RE_BANNER,
     _RE_DAILY,
     _RE_DJ,
@@ -21,7 +30,6 @@ from .explore_common import (
     _RE_RANDOM,
     _RE_RECOMMEND,
     _RE_SUGGEST,
-    _kg_new_albums,
     _locked_source,
     _pick_source,
     _send_generic,
@@ -42,18 +50,8 @@ async def run_hot_search(service, event):
 async def run_random(service, event):
     m = re.search(_RE_RANDOM, event.message_str, re.IGNORECASE)
     src = await _pick_source(service, event, m.group(1) if m else "")
-    client = service.client_of(src)
-    if src == SOURCE_NCM:
-        songs = await service.call(src, "explore", client.personal_fm())
-        if not songs:
-            songs = await service.call(src, "explore", client.personalized_newsong())
-    elif src == SOURCE_KG:
-        songs = await service.call(src, "explore", client.personal_fm())
-        if not songs:
-            songs = await service.call(src, "explore", client.everyday_recommend())
-    else:
-        song = await client.random_song()
-        songs = [song] if song else []
+    # 记账由各平台 fetcher 自己决定（QQ 改动前不记账），故把 service.call 注入进去
+    songs = await RANDOM_FETCHERS[src](service.client_of(src), service.call, src)
     if not songs:
         await service.reply(event, "没有拿到随机歌曲，稍后再试")
         return
@@ -81,7 +79,9 @@ async def run_fm(service, event):
     m = re.search(_RE_FM, event.message_str, re.IGNORECASE)
     src = await _pick_source(service, event, m.group(1) if m else "")
     client = service.client_of(src)
-    songs = await service.call(src, "explore", client.personal_fm())
+    # 私人电台：QQ 侧没有 personal_fm，对应能力是 radar 推荐（返回单曲而非列表）
+    result = await service.call(src, "explore", FM_FETCHERS[src](client))
+    songs = [result] if isinstance(result, dict) else result
     if not songs:
         await service.reply(event, "私人电台需要登录后使用")
         return
@@ -93,23 +93,16 @@ async def run_recommend(service, event):
     src = await _pick_source(service, event, m.group(1) if m else "")
     cat = (m.group(2) if m else "").strip()
     client = service.client_of(src)
-    if src == SOURCE_NCM:
-        pls = (
-            await service.call(src, "explore", client.top_playlists(cat))
-            if cat
-            else await service.call(src, "explore", client.personalized(15))
-        )
-    elif src == SOURCE_KG:
-        pls = await service.call(src, "explore", client.top_playlists())
-    else:
-        pls = await service.call(src, "explore", client.recommend_playlists())
+    pls = await service.call(src, "explore", PLAYLIST_RECOMMENDERS[src](client, cat))
     if not pls:
         await service.reply(event, "暂无推荐歌单")
         return
-    from ..core.cards import build_playlist_card_data, format_playlist_text
+    from ..core.formatters import format_playlist_text
 
+    # 分类后缀只给真正按分类筛选的平台（当前仅网易云），见 RECOMMEND_CATEGORY_SOURCES
+    suffix = f" · {cat}" if cat and src in RECOMMEND_CATEGORY_SOURCES else ""
     data = build_playlist_card_data(
-        f"{SOURCE_NAMES[src]}歌单推荐" + (f" · {cat}" if cat and src == SOURCE_NCM else ""),
+        f"{SOURCE_NAMES[src]}歌单推荐{suffix}",
         "",
         pls,
         source=src,
@@ -123,17 +116,7 @@ async def run_new_albums(service, event):
     src = await _pick_source(service, event, m.group(1) if m else "")
     area = (m.group(2) if m else "").strip()
     client = service.client_of(src)
-    if src == SOURCE_NCM:
-        # 带地区走新碟榜，不带走最新上架
-        albums = (
-            await service.call(src, "explore", client.top_albums(_AREA_NCM_ALBUM[area]))
-            if area in _AREA_NCM_ALBUM
-            else await service.call(src, "explore", client.album_newest())
-        )
-    elif src == SOURCE_KG:
-        albums = await service.call(src, "explore", _kg_new_albums(client, _KG_AREA_ALBUM.get(area, 0)))
-    else:
-        albums = await service.call(src, "explore", client.new_albums(_QQ_AREA_ALBUM.get(area, 1), 15))
+    albums = await service.call(src, "explore", NEW_ALBUM_FETCHERS[src](client, area))
     if not albums:
         await service.reply(event, "暂无新碟数据")
         return
@@ -159,7 +142,7 @@ async def run_guess(service, event):
     )
     if src is None:
         return
-    songs = await service.call(src, "explore", service.qq.guess_songs(10))
+    songs = await service.call(src, "explore", service.client_of(src).guess_songs(10))
     if not songs:
         await service.reply(event, "没有拿到推荐，稍后再试")
         return
@@ -174,7 +157,7 @@ async def run_dj(service, event):
     )
     if src is None:
         return
-    rows = await service.call(src, "explore", service.ncm.dj_radios(10))
+    rows = await service.call(src, "explore", service.client_of(src).dj_radios(10))
     if not rows:
         await service.reply(event, "暂无电台数据")
         return
@@ -189,7 +172,7 @@ async def run_banner(service, event):
     )
     if src is None:
         return
-    rows = await service.call(src, "explore", service.ncm.banners())
+    rows = await service.call(src, "explore", service.client_of(src).banners())
     if not rows:
         await service.reply(event, "暂无 banner 数据")
         return
@@ -220,18 +203,15 @@ async def run_history_daily(service, event):
     """历史日推（网易云需要黑胶，酷狗需要登录）。"""
     m = re.search(_RE_HISTORY_DAILY, event.message_str, re.IGNORECASE)
     src = await _pick_source(service, event, m.group(1) if m else "", prefer=SOURCE_NCM)
-    if src == SOURCE_NCM:
-        try:
-            songs = await service.call(src, "explore", service.ncm.history_recommend())
-        except ApiError as e:
-            await service.reply(event, f"历史日推查询失败：{e.user_msg()}（黑胶特权）")
-            return
-    else:
-        try:
-            songs = await service.call(src, "explore", service.kg.history_recommend())
-        except ApiError as e:
-            await service.reply(event, f"历史日推查询失败：{e.user_msg()}（需酷狗登录）")
-            return
+    # 取数客户端与失败提示都按平台查表：改动前是「ncm 走 ncm、其余一律走 kg」，
+    # 这里如实保留该行为（含 src 为 qq 时仍取酷狗客户端），见 core/catalog 的说明。
+    client_src = HISTORY_DAILY_CLIENT_SOURCE.get(src, HISTORY_DAILY_DEFAULT_CLIENT_SOURCE)
+    hint = HISTORY_DAILY_HINTS.get(src, HISTORY_DAILY_DEFAULT_HINT)
+    try:
+        songs = await service.call(src, "explore", service.client_of(client_src).history_recommend())
+    except ApiError as e:
+        await service.reply(event, f"历史日推查询失败：{e.user_msg()}{hint}")
+        return
     if not songs:
         await service.reply(event, "暂无历史日推（网易云需要黑胶 VIP，酷狗需要登录）")
         return

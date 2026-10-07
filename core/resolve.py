@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 import re
+from urllib.parse import urlsplit
 
 import aiohttp
 
@@ -26,10 +27,31 @@ HINTS = {
 
 SHORT_LINK_RE = re.compile(r"https?://(?:163cn\.tv|c6\.y\.qq\.com|url\.cn)/\S+", re.IGNORECASE)
 
-# 302 展开白名单（SSRF 防护）
-_REDIRECT_ALLOW = (".163.com", ".126.net", ".qq.com", ".gtimg.cn", "url.cn", "qpic.cn")
+# 302 展开白名单（SSRF 防护）：按 hostname 精确/后缀匹配，
+# 不用子串——子串会让 https://evil.com/?x=.163.com 这类地址通过校验。
+# 每项必须带前导点：裸后缀 "url.cn" 会让 endswith 匹配到 evilurl.cn。
+_REDIRECT_ALLOW = (".163.com", ".126.net", ".qq.com", ".gtimg.cn", ".url.cn", ".qpic.cn")
+# 会发生重定向的 HTTP 状态码（307/308 与 301/302 等价，漏掉等于不校验）
+_REDIRECT_STATUS = (301, 302, 303, 307, 308)
 
 _EXPAND_TIMEOUT = aiohttp.ClientTimeout(total=8)
+
+
+def is_allowed_redirect(loc: str) -> bool:
+    """重定向目标是否在三平台白名单内。
+
+    只看 hostname：query / fragment 里带白名单串不算命中，
+    也不做「结尾匹配」以外的模糊判断（evil.com 子串 .163.com 必须被拒）。
+    """
+    if not loc:
+        return False
+    try:
+        host = (urlsplit(loc).hostname or "").lower()
+    except ValueError:
+        return False
+    if not host:
+        return False
+    return any(host == d.lstrip(".") or host.endswith(d) for d in _REDIRECT_ALLOW)
 
 
 async def expand_short_links(text: str) -> str:
@@ -41,7 +63,7 @@ async def expand_short_links(text: str) -> str:
                 url, timeout=_EXPAND_TIMEOUT, allow_redirects=False, headers={"User-Agent": USER_AGENT}
             ) as resp:
                 loc = resp.headers.get("Location", "")
-                if resp.status in (301, 302) and loc and any(d in loc for d in _REDIRECT_ALLOW):
+                if resp.status in _REDIRECT_STATUS and is_allowed_redirect(loc):
                     return loc
         except Exception:  # noqa: BLE001
             pass
@@ -138,15 +160,28 @@ def extract_qq_target(text: str) -> tuple[str, str] | None:
     return None
 
 
-_EXTRACTORS = {
-    SOURCE_NCM: extract_ncm_target,
-    SOURCE_KG: extract_kg_target,
-    SOURCE_QQ: extract_qq_target,
-}
-
-
 async def handle_resolve(service, event, text: str) -> bool:
-    """解析分享链接/卡片。返回是否已处理。"""
+    """解析分享链接/卡片。返回是否已处理。
+
+    与点歌共用同一冷却章：连发分享链接会连环触发取流 + 下载 + 发送，必须频控。
+    未接管（返回 False）或只回了提示（如短链失败）时退还，不占用接下来的点歌冷却。
+    """
+    try:
+        reason = await service.check_cooldown(event)
+        if reason:
+            await service.reply(event, "操作太频繁，链接解析冷却中，稍后再试")
+            return True
+        handled = await _resolve_inner(service, event, text)
+        if not handled:
+            service.release_cooldown(event)
+        return handled
+    except Exception as e:  # noqa: BLE001 - 解析失败不影响主流程
+        service.release_cooldown(event)
+        service.log_warn(f"链接解析异常: {e}")
+        return False
+
+
+async def _resolve_inner(service, event, text: str) -> bool:
     try:
         expanded = await expand_short_links(text)
         short_unexpanded = bool(SHORT_LINK_RE.search(expanded))
@@ -230,6 +265,7 @@ async def handle_resolve(service, event, text: str) -> bool:
 
         if short_unexpanded and (HINTS[SOURCE_NCM].search(text) or HINTS[SOURCE_QQ].search(text)):
             await service.reply(event, "短链解析失败，请发完整链接")
+            service.release_cooldown(event)  # 只回了提示没有产出，不占冷却
             return True
         return False
     except Exception as e:  # noqa: BLE001 - 解析失败不影响主流程
@@ -278,10 +314,10 @@ async def _keyword_fallback(service, event, text: str, source: str) -> bool:
     if not kw:
         return False
     try:
-        results = await service.search_songs(kw, source, limit=1)
+        songs, _real = await service.search_songs(kw, source, limit=1)
     except Exception:  # noqa: BLE001
         return False
-    if results:
-        await service.play_song(event, results[0], source_label="链接解析")
-        return True
-    return False
+    if not songs:
+        return False
+    await service.play_song(event, songs[0], source_label="链接解析")
+    return True

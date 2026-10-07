@@ -69,10 +69,3 @@ def caps_of(event) -> PlatformCaps:
         return caps_for_name(str(event.get_platform_name() or ""))
     except Exception:  # noqa: BLE001
         return _DEFAULT
-
-
-def platform_name(event) -> str:
-    try:
-        return str(event.get_platform_name() or "")
-    except Exception:  # noqa: BLE001
-        return ""

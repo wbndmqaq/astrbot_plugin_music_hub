@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import re
 
+from ..core.cards import build_comment_card_data, build_lyric_card_data
 from ..core.errors import ApiError
 from .actions import LYRIC_PAGE_SIZE
 from .base import Route
@@ -45,7 +46,7 @@ async def run_lyric_page(service, event):
     song = data.get("song", {})
     lines = data.get("lines", [])
     seg = lines[(page - 1) * LYRIC_PAGE_SIZE : page * LYRIC_PAGE_SIZE]
-    from ..core.cards import build_lyric_card_data, format_lyric_text
+    from ..core.formatters import format_lyric_text
 
     card = build_lyric_card_data(
         song,
@@ -86,7 +87,7 @@ async def run_comment_next(service, event):
     if not fresh:
         await service.reply(event, "没有更多评论啦（最新评论仅网易云 / QQ 提供）")
         return
-    from ..core.cards import build_comment_card_data, format_comment_text
+    from ..core.formatters import format_comment_text
 
     view = {"hot": fresh, "total": comments.get("total", 0)}
     card = build_comment_card_data(song, view)
@@ -94,12 +95,6 @@ async def run_comment_next(service, event):
     await service.reply_card_or_text(
         event, card, "comment", song.get("source", ""), lambda d: format_comment_text(song, view)
     )
-
-
-def _src_of(token: str | None) -> str:
-    from ..core.sources import token_to_source
-
-    return token_to_source(token)
 
 
 def _make_select_runner(action: str, _actor=None):
@@ -133,8 +128,16 @@ _ACTION_LABELS = {
 def routes() -> list[Route]:
     out: list[Route] = [
         # 翻页路由用更高优先级，避免被「歌词 关键词」/「评论 关键词」吃掉
-        Route(re.compile(_RE_LYRIC_PAGE), "mh_lyric_page", "歌词翻页", run_lyric_page, priority=7),
-        Route(re.compile(_RE_COMMENT_NEXT), "mh_comment_next", "评论翻页", run_comment_next, priority=7),
+        Route(
+            re.compile(_RE_LYRIC_PAGE, re.IGNORECASE), "mh_lyric_page", "歌词翻页", run_lyric_page, priority=7
+        ),
+        Route(
+            re.compile(_RE_COMMENT_NEXT, re.IGNORECASE),
+            "mh_comment_next",
+            "评论翻页",
+            run_comment_next,
+            priority=7,
+        ),
     ]
     specs = [
         # (pattern, route-name, action, 说明, priority)

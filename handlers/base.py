@@ -43,7 +43,8 @@ def install(cls, flt, module_path: str, routes: list[Route]) -> int:
             taken = True
             try:
                 if _route.gated and not service.config.enable:
-                    return False  # 总开关关闭：静默让路，不回复也不吞事件
+                    taken = False  # 总开关关闭：静默让路，不回复也不吞事件
+                    return False
                 service.note_umo(event)
                 if _route.check_acl:
                     service.check_acl(event)

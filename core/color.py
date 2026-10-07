@@ -68,6 +68,9 @@ def brand_for(source: str) -> dict:
 
 
 _CACHE: dict[str, tuple[float, dict | None]] = {}
+# 正在计算中的封面 → Future。同一张热门封面被 N 个并发请求同时命中未命中时，
+# 只发起一次下载 + 一次 Pillow 量化，其余 await 同一个 Future。
+_INFLIGHT: dict[str, asyncio.Future] = {}
 _LOCK = asyncio.Lock()
 _TTL = 600
 _MAX = 128
@@ -79,18 +82,35 @@ async def palette_for(cover_url: str, session: aiohttp.ClientSession) -> dict | 
     """取封面主色色板；失败返回 None（调用方回退品牌色）。"""
     if not cover_url or not cover_url.startswith("http"):
         return None
-    now = time.time()
     async with _LOCK:
         hit = _CACHE.get(cover_url)
-        if hit is not None and now - hit[0] < _TTL:
+        if hit is not None and time.time() - hit[0] < _TTL:
             return hit[1]
-    palette = await _compute(cover_url, session)
-    async with _LOCK:
-        if len(_CACHE) >= _MAX:
-            for k in sorted(_CACHE, key=lambda k: _CACHE[k][0])[: len(_CACHE) - _MAX + 1]:
-                _CACHE.pop(k, None)
-        _CACHE[cover_url] = (now, palette)
-    return palette
+        fut = _INFLIGHT.get(cover_url)
+        if fut is None:
+            fut = asyncio.ensure_future(_compute_tracked(cover_url, session))
+            _INFLIGHT[cover_url] = fut
+    # shield：单个等待者被取消时不要连带取消共享的 Future，否则其他人也拿不到结果。
+    # 清理与写缓存都在 _compute_tracked 内部完成 —— 放调用方 finally 会在取消时二次抛
+    # CancelledError，反而掩盖真实异常。
+    return await asyncio.shield(fut)
+
+
+async def _compute_tracked(url: str, session: aiohttp.ClientSession) -> dict | None:
+    """执行取色并负责 in-flight 登记的清理与结果缓存。"""
+    try:
+        palette = await _compute(url, session)
+        async with _LOCK:
+            if len(_CACHE) >= _MAX:
+                for k in sorted(_CACHE, key=lambda k: _CACHE[k][0])[: len(_CACHE) - _MAX + 1]:
+                    _CACHE.pop(k, None)
+            _CACHE[url] = (time.time(), palette)
+        return palette
+    finally:
+        # 失败也要清：否则这个 URL 会永远命中同一个已异常的 Future
+        async with _LOCK:
+            if _INFLIGHT.get(url) is asyncio.current_task():
+                _INFLIGHT.pop(url, None)
 
 
 async def _compute(url: str, session: aiohttp.ClientSession) -> dict | None:

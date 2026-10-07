@@ -7,6 +7,7 @@ service.terminate() 统一关闭）；音频下载与封面取色也复用它。
 from __future__ import annotations
 
 import math
+import threading
 from typing import Any
 
 import aiohttp
@@ -19,12 +20,28 @@ USER_AGENT = (
 )
 
 _session: aiohttp.ClientSession | None = None
+_session_lock = threading.Lock()
+
+# 连接池上限与兜底超时：漏传 timeout= 的调用点会永久挂起（aiohttp 默认总超时 5 分钟，
+# 但 socket 层可无限），三源聚合 + 30 首连播下 100 连接默认值也容易被占满
+_CONNECT_LIMIT = 64
+_TIMEOUT_TOTAL = 30
+_TIMEOUT_CONNECT = 10
 
 
 def get_session() -> aiohttp.ClientSession:
+    """共享会话。首次创建用线程锁保护：两个协程同时通过 _session is None 判断
+    会各自建一个 ClientSession，后者覆盖前者 → 前者的连接池永远不会被 close。"""
     global _session
-    if _session is None or _session.closed:
-        _session = aiohttp.ClientSession(headers={"User-Agent": USER_AGENT})
+    if _session is not None and not _session.closed:
+        return _session
+    with _session_lock:
+        if _session is None or _session.closed:
+            _session = aiohttp.ClientSession(
+                connector=aiohttp.TCPConnector(limit=_CONNECT_LIMIT, ttl_dns_cache=300),
+                timeout=aiohttp.ClientTimeout(total=_TIMEOUT_TOTAL, connect=_TIMEOUT_CONNECT),
+                headers={"User-Agent": USER_AGENT},
+            )
     return _session
 
 
@@ -92,13 +109,6 @@ def merge_cookie(base: str, extra: str) -> str:
                 k, v = part.split("=", 1)
                 merged[k.strip()] = v.strip()
     return "; ".join(f"{k}={v}" for k, v in merged.items())
-
-
-def first(*vals) -> str:
-    for v in vals:
-        if v:
-            return str(v)
-    return ""
 
 
 def data_of(body: Any) -> dict:

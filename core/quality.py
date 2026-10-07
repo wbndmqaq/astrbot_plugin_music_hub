@@ -6,7 +6,8 @@
 from __future__ import annotations
 
 
-def _first(*vals) -> str:
+def first(*vals) -> str:
+    """宽松取首个非空值（上游字段形态不稳定，缺字段层层兜底）。"""
     for v in vals:
         if v:
             return str(v)
@@ -43,13 +44,11 @@ NCM_LABEL = {
 NCM_AUTO_START = "lossless"
 
 # ── 酷狗（song/url quality + 每档专属 hash）──
-KG_LADDER = ["viper_tape", "viper_clear", "super", "high", "flac", "320", "128"]
+# 只保留旧版 /song/url 支持的档位：viper/super/high 属新版 /song/url/new，
+# 对旧端点是无效 quality，只会白打失败请求再降级
+KG_LADDER = ["flac", "320", "128"]
 KG_LABEL = {
     "auto": "自动适配",
-    "viper_tape": "蝰蛇母带",
-    "viper_clear": "蝰蛇超清",
-    "super": "蝰蛇HiFi",
-    "high": "Hi-Res",
     "flac": "无损 FLAC",
     "320": "高品 320K",
     "128": "标准 128K",
@@ -112,17 +111,13 @@ def quality_label(source: str, quality: str) -> str:
 
 
 def kg_hash_for(song: dict, quality: str) -> str:
-    """酷狗：取某音质的专属 hash（viper/super 由最高无损源派生，尽力而为）。"""
+    """酷狗：取某音质的专属 hash。"""
     q = (quality or "").lower()
-    if q in ("viper_tape", "viper_clear", "viper_atmos", "super"):
-        return _first(song.get("hash_super"), song.get("hash_high"), song.get("hash_flac"))
-    if q == "high":
-        return _first(song.get("hash_high"), song.get("hash_flac"))
     if q == "flac":
-        return _first(song.get("hash_flac"), song.get("hash_high"))
+        return first(song.get("hash_flac"), song.get("hash_high"))
     if q == "320":
-        return _first(song.get("hash_320"), song.get("hash_flac"))
-    return _first(song.get("hash_128"), song.get("hash"), song.get("FileHash"))
+        return first(song.get("hash_320"), song.get("hash_flac"))
+    return first(song.get("hash_128"), song.get("hash"), song.get("FileHash"))
 
 
 def trial_suffix(play: dict) -> str:

@@ -3,10 +3,13 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import ipaddress
+import time
 import traceback
 from collections import OrderedDict
 from pathlib import Path
+from urllib.parse import urlparse
 
 from aiohttp import web
 
@@ -15,6 +18,10 @@ from . import _api
 from ._auth import COOKIE_NAME, AuthManager
 from ._util import json_response as _json
 
+# 搜索结果缓存：容量与有效期都要有上限，否则 WebUI 面板长期开着会累积陈旧对象
+SONG_CACHE_MAX = 400
+SONG_CACHE_TTL = 900.0
+
 SHUTDOWN_TIMEOUT = 2
 
 PUBLIC_PATHS = {
@@ -22,7 +29,11 @@ PUBLIC_PATHS = {
     "/webui/style.css",
     "/webui/app.js",
     "/webui/theme-boot.js",
-    "/webui/logo.svg",
+    "/webui/logo.png",
+    "/webui/logos/ncm.svg",
+    "/webui/logos/ncm.png",
+    "/webui/logos/kg.png",
+    "/webui/logos/qq.png",
     "/api/meta",
     "/api/auth/login",
     "/api/auth/check",
@@ -32,7 +43,8 @@ PUBLIC_PATHS = {
 # media-src 放开 http:：歌曲 CDN 直链多为 http，且面板本身是 http 服务无混合内容问题
 CSP = (
     "default-src 'self'; "
-    "img-src 'self' https: data:; "
+    # img-src 含 http:：不少音乐 CDN 封面只有 http 直链，面板本身不走 https 无混内容问题
+    "img-src 'self' http: https: data:; "
     "media-src 'self' http: https:; "
     "style-src 'self' 'unsafe-inline'; "
     "script-src 'self'; "
@@ -52,7 +64,9 @@ class WebUIServer:
         self.host = self.config.webui_host
         self.port = self.config.webui_port
         # 搜索结果歌曲缓存（source:sid → 完整归一化歌曲）：试听 / 远程投递取流用
-        self._song_cache: OrderedDict[str, dict] = OrderedDict()
+        self._song_cache: OrderedDict[str, tuple[float, dict]] = OrderedDict()
+        # 静态资源缓存：fname → (mtime, body, etag)
+        self._file_cache: dict[str, tuple[float, bytes, str]] = {}
 
     # ──────────── 歌曲缓存 ────────────
     def cache_song(self, song: dict) -> None:
@@ -60,19 +74,28 @@ class WebUIServer:
         if not sid:
             return
         key = f"{song.get('source', '')}:{sid}"
-        self._song_cache[key] = song
+        self._song_cache[key] = (time.time(), song)
         self._song_cache.move_to_end(key)
-        while len(self._song_cache) > 400:
+        while len(self._song_cache) > SONG_CACHE_MAX:
             self._song_cache.popitem(last=False)
 
     def get_song(self, source: str, sid: str) -> dict | None:
-        return self._song_cache.get(f"{source}:{sid}")
+        # 必须判过期：缓存里的 song 带 cover 等字段，长期不过期会让远程投递
+        # 拿到陈旧的封面与元数据，也让 sid 复用时串到旧对象
+        hit = self._song_cache.get(f"{source}:{sid}")
+        if hit is None:
+            return None
+        ts, song = hit
+        if time.time() - ts > SONG_CACHE_TTL:
+            self._song_cache.pop(f"{source}:{sid}", None)
+            return None
+        return song
 
     # ──────────── 中间件 ────────────
     async def _guard(self, request: web.Request, handler):
-        # Host 校验（防 DNS rebinding：公网域名解析到非私网地址一律拒绝）
+        # Host 校验（防 DNS rebinding：非 IP / localhost / 白名单的域名一律拒绝）
         if not await self._host_ok(request.headers.get("Host", "")):
-            return _json({"error": "非法 Host"}, 403)
+            return _json({"error": "非法 Host：用域名访问面板需在插件配置 webui.hostAllowlist 登记"}, 403)
         # 非 GET 的 Origin 同源校验（防 CSRF）
         if request.method not in ("GET", "HEAD", "OPTIONS"):
             origin = request.headers.get("Origin", "")
@@ -85,6 +108,13 @@ class WebUIServer:
         return await handler(request)
 
     async def _host_ok(self, host: str) -> bool:
+        """Host 必须是字面 IP、localhost 或 webui.hostAllowlist 里的域名。
+
+        旧实现按「域名是否解析到私网地址」放行，两个方向都失效：攻击者域名同时配
+        公网 + 私网两条 A 记录即可恒通过（rebinding 挡不住）；面板部署在 VPS 用域名
+        访问时，域名只解析到公网反而每个请求都被 403。反解式校验已弃用 —— CSRF 另有
+        Origin 同源 + SameSite cookie 双层防线，这里只做严格白名单。
+        """
         if not host:
             return True
         h = host.strip()
@@ -94,40 +124,36 @@ class WebUIServer:
             netloc = h[1 : h.find("]")].lower()
         else:
             netloc = h.split(":", 1)[0].lower()
-        if not netloc:
-            return True
-        if netloc in ("localhost",):
+        if not netloc or netloc == "localhost":
             return True
         try:
             ipaddress.ip_address(netloc)
             return True  # 字面 IP（私网/公网/回环）没有 DNS rebinding 向量，放行
         except ValueError:
             pass
-        try:
-            loop = asyncio.get_running_loop()
-            infos = await loop.getaddrinfo(netloc, None)
-        except Exception:  # noqa: BLE001
-            return False  # 域名解析失败时无法证明其指向本机，拒绝（DNS rebinding 不给放行窗口）
-        for info in infos:
-            try:
-                ip = ipaddress.ip_address(info[4][0])
-            except ValueError:
-                continue
-            if ip.is_loopback or ip.is_private or ip.is_link_local:
-                return True
-        # 注：开启 TUN/fake-IP 代理的本机（伪 DNS 解析到 198.18.0.0/15）会被
-        # ipaddress 视为私有网段而放行 —— 该场景下面板以登录口令为主要防线。
-        return False  # 域名只解析到公网地址 → 拒绝
+        allowed = self.config.webui_host_allowlist
+        return any(netloc == d or netloc.endswith("." + d) for d in allowed)
 
     def _origin_ok(self, origin: str, host: str) -> bool:
-        try:
-            from urllib.parse import urlparse
+        """Origin 必须与 Host 完全一致：scheme + hostname + port 三者全等。
 
+        只比 hostname 会被端口差异绕过 —— SameSite 的同站点判定同样忽略端口，
+        `localhost:3000` 与 `localhost:17818` 互为同站点，Lax cookie 照常携带，
+        本机任意 web 服务都能发起带凭据的写请求（改 apiBase 即等于外泄平台 cookie）。
+        用 urlparse 而非 split(":"):0 以正确剥离 IPv6 方括号。
+        """
+        try:
             o = urlparse(origin)
-            o_host = (o.hostname or "").lower()
-            h_host = (host or "").split(":")[0].lower()
-            return bool(o_host) and o_host == h_host
-        except Exception:  # noqa: BLE001
+            h = urlparse(f"http://{host or ''}")
+            if not o.hostname or not h.hostname:
+                return False
+            if o.scheme != h.scheme or o.hostname.lower() != h.hostname.lower():
+                return False
+            # 无显式端口时按 scheme 取默认端口，http/https 混用也要挡住
+            o_port = o.port or (443 if o.scheme == "https" else 80)
+            h_port = h.port or (443 if h.scheme == "https" else 80)
+            return o_port == h_port
+        except ValueError:
             return False
 
     def _authed(self, request: web.Request) -> bool:
@@ -168,7 +194,17 @@ class WebUIServer:
         async def errors_mw(request, handler):
             return await self._handle_errors(request, handler)
 
-        app = web.Application(middlewares=[errors_mw, guard_mw])
+        @web.middleware
+        async def security_headers_mw(request, handler):
+            # 统一注入：原先安全头只挂在 _file 上，所有 /api/* JSON 响应都没有，
+            # 新增路由很容易漏挂
+            resp = await handler(request)
+            resp.headers.setdefault("X-Content-Type-Options", "nosniff")
+            resp.headers.setdefault("X-Frame-Options", "DENY")
+            resp.headers.setdefault("Referrer-Policy", "no-referrer")
+            return resp
+
+        app = web.Application(middlewares=[security_headers_mw, errors_mw, guard_mw])
         app["server"] = self
         r = app.router
         # 静态
@@ -176,7 +212,11 @@ class WebUIServer:
         r.add_get("/webui/style.css", self._static("style.css", "text/css"))
         r.add_get("/webui/app.js", self._static("app.js", "application/javascript"))
         r.add_get("/webui/theme-boot.js", self._static("theme-boot.js", "application/javascript"))
-        r.add_get("/webui/logo.svg", self._static("logo.svg", "image/svg+xml"))
+        r.add_get("/webui/logo.png", self._static("logo.png", "image/png"))
+        # 三平台官方标识（侧边栏 / 音源标签用）
+        r.add_get("/webui/logos/ncm.svg", self._static("logos/ncm.svg", "image/svg+xml"))
+        for _name in ("ncm", "kg", "qq"):
+            r.add_get(f"/webui/logos/{_name}.png", self._static(f"logos/{_name}.png", "image/png"))
         # 元信息 / 认证
         r.add_get("/api/meta", self._meta)
         r.add_post("/api/auth/login", _api.make_login(self))
@@ -239,34 +279,46 @@ class WebUIServer:
             runner, self._runner = self._runner, None
             try:
                 await asyncio.wait_for(runner.cleanup(), timeout=5)
-            except (TimeoutError, Exception):  # noqa: BLE001
-                pass
+            except Exception as e:  # noqa: BLE001
+                # 静默吞掉会让「端口没释放」这类问题彻底无线索，
+                # 下次重载表现为 OSError: 地址已使用
+                self.log.warning(f"[music_hub] WebUI 关闭异常（端口可能未释放）：{e}")
 
     # ──────────── 静态 ────────────
     async def _index(self, request: web.Request) -> web.Response:
-        return await self._file("index.html", "text/html")
+        return await self._file("index.html", "text/html", request)
 
     def _static(self, fname: str, ctype: str):
         async def _handler(request: web.Request) -> web.Response:
-            return await self._file(fname, ctype)
+            return await self._file(fname, ctype, request)
 
         return _handler
 
-    async def _file(self, fname: str, ctype: str) -> web.Response:
+    async def _file(self, fname: str, ctype: str, request: web.Request | None = None) -> web.Response:
+        """静态资源。按 mtime 缓存内容 + ETag：40KB CSS + 55KB JS 每次整页加载
+        全量重下（原来是 no-store），二次打开面板要等 2 秒以上。"""
         try:
-            body = await asyncio.to_thread((self.dir / fname).read_bytes)
-            return web.Response(
-                body=body,
-                content_type=ctype,
-                charset="utf-8",
-                headers={
-                    "Cache-Control": "no-store",
-                    "X-Frame-Options": "DENY",
-                    "Referrer-Policy": "no-referrer",
-                    "X-Content-Type-Options": "nosniff",
-                    "Content-Security-Policy": CSP,
-                },
-            )
+            path = self.dir / fname
+            mtime = path.stat().st_mtime
+            hit = self._file_cache.get(fname)
+            if hit is None or hit[0] != mtime:
+                body = await asyncio.to_thread(path.read_bytes)
+                etag = f'"{hashlib.sha256(body).hexdigest()[:16]}"'
+                self._file_cache[fname] = (mtime, body, etag)
+            else:
+                _, body, etag = hit
+            headers = {
+                # no-cache 而非 no-store：允许缓存但每次校验，ETag 命中即 304
+                "Cache-Control": "no-cache",
+                "ETag": etag,
+                "X-Frame-Options": "DENY",
+                "Referrer-Policy": "no-referrer",
+                "X-Content-Type-Options": "nosniff",
+                "Content-Security-Policy": CSP,
+            }
+            if request is not None and request.headers.get("If-None-Match") == etag:
+                return web.Response(status=304, headers=headers)
+            return web.Response(body=body, content_type=ctype, charset="utf-8", headers=headers)
         except OSError:
             return _json({"error": "面板资源缺失，请检查插件安装完整性"}, 500)
 

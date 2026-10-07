@@ -4,7 +4,12 @@ from __future__ import annotations
 
 import re
 
-from ..core import SOURCE_KG, SOURCE_NCM, SOURCE_QQ
+from ..core import SOURCE_QQ
+from ..core.catalog import (
+    ALBUM_COMMENT_TYPES,
+    ARTIST_ALBUM_FETCHERS,
+    PLAYLIST_COMMENT_TYPES,
+)
 from .explore_common import (
     _RE_ALBUM_COMMENT,
     _RE_ARTIST_ALBUM,
@@ -28,13 +33,12 @@ async def run_album_comments(service, event):
         await service.reply(event, "用法：专辑评论 专辑名")
         return
     client = service.client_of(src)
-    if src == SOURCE_NCM:
-        cands = await service.call(src, "explore", client.search(kw, 5, 10))
-    elif src == SOURCE_KG:
-        cands = await service.call(src, "explore", client.search(kw, 5, "album"))
-    else:
+    # 专辑评论只有网易云 / 酷狗提供：QQ 的评论接口按歌曲 id 走，专辑 id 查不到
+    type_ = ALBUM_COMMENT_TYPES.get(src)
+    if type_ is None:
         await service.reply(event, "专辑评论支持网易云 / 酷狗音源")
         return
+    cands = await service.call(src, "explore", client.search(kw, 5, type_))
     if not cands:
         await service.reply(event, f"没有找到专辑「{kw}」")
         return
@@ -58,13 +62,12 @@ async def run_playlist_comments(service, event):
         await service.reply(event, "用法：歌单评论 歌单名")
         return
     client = service.client_of(src)
-    if src == SOURCE_NCM:
-        cands = await service.call(src, "explore", client.search(kw, 5, 1000))
-    elif src == SOURCE_KG:
-        cands = await service.call(src, "explore", client.search(kw, 5, "special"))
-    else:
+    # 歌单评论同样只有网易云 / 酷狗提供（原因同 run_album_comments）
+    type_ = PLAYLIST_COMMENT_TYPES.get(src)
+    if type_ is None:
         await service.reply(event, "歌单评论支持网易云 / 酷狗音源")
         return
+    cands = await service.call(src, "explore", client.search(kw, 5, type_))
     if not cands:
         await service.reply(event, f"没有找到歌单「{kw}」")
         return
@@ -89,30 +92,19 @@ async def run_artist_albums(service, event):
         await service.reply(event, "用法：歌手专辑 歌手名")
         return
     client = service.client_of(src)
-    if src == SOURCE_NCM:
-        cands = await service.call(src, "explore", client.search(kw, 5, 100))
-        if not cands:
-            await service.reply(event, f"没有找到歌手「{kw}」")
-            return
-        albums = await service.call(src, "explore", client.artist_albums(cands[0]["id"], 15))
-    elif src == SOURCE_KG:
-        cands = await service.call(src, "explore", client.search(kw, 3, "author"))
-        if not cands:
-            await service.reply(event, f"没有找到歌手「{kw}」")
-            return
-        albums = await service.call(src, "explore", client.artist_albums(cands[0]["id"], 15))
-    else:
-        singer, albums = await client.artist_albums_by_keyword(kw, 15)
-        if singer is None:
-            await service.reply(event, f"没有找到歌手「{kw}」")
-            return
-    if not albums:
+    # 三平台都是「搜歌手 → 取其专辑」，差异（搜索类型参数、是否分两步、是否记账）
+    # 已在 catalog 内，注入 service.call 让各平台自己决定记账段数
+    got = await ARTIST_ALBUM_FETCHERS[src](client, service.call, src, kw)
+    if not got.found:
+        await service.reply(event, f"没有找到歌手「{kw}」")
+        return
+    if not got.albums:
         await service.reply(event, f"「{kw}」暂无专辑数据")
         return
     await service.list_to_session(
         event,
         f"歌手专辑 · {kw}",
-        _albums_as_items(albums, src),
+        _albums_as_items(got.albums, src),
         source=src,
         kind="albums",
         tip="回复 听N 展开对应专辑",
@@ -131,7 +123,7 @@ async def run_singer_mvs(service, event):
     if not kw:
         await service.reply(event, "用法：歌手MV 歌手名")
         return
-    singer, mvs = await service.qq.artist_mvs_by_keyword(kw, 10)
+    singer, mvs = await service.client_of(src).artist_mvs_by_keyword(kw, 10)
     if singer is None or not mvs:
         await service.reply(event, f"没有找到「{kw}」的 MV")
         return
@@ -156,7 +148,7 @@ async def run_similar_singers(service, event):
     if not kw:
         await service.reply(event, "用法：相似歌手 歌手名")
         return
-    singer, cands = await service.qq.similar_singers_by_keyword(kw, 10)
+    singer, cands = await service.client_of(src).similar_singers_by_keyword(kw, 10)
     if singer is None:
         await service.reply(event, f"没有找到歌手「{kw}」")
         return

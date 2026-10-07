@@ -4,8 +4,9 @@ from __future__ import annotations
 
 import re
 
-from ..core.cards import build_versions_card_data, format_versions_text
+from ..core.cards import build_versions_card_data
 from ..core.errors import ApiError
+from ..core.formatters import format_versions_text
 from ..core.sources import token_to_source, word_to_source
 from .actions import (  # noqa: F401
     _act_ai_recommend,
@@ -74,8 +75,15 @@ def _map_source(token: str) -> str:
     return token_to_source(token)
 
 
-async def _no_result_hint(service, event, keyword: str) -> None:
-    """零结果回复：有建议词时给"你是不是想搜"。"""
+async def _no_result_hint(service, event, keyword: str, notices: list[str] | None = None) -> None:
+    """零结果回复：优先告知"某音源需扫码"，其次给搜索建议。
+
+    notices 由本次搜索随结果一起返回——不能从 search 实例上取，
+    那样并发搜索会互相取走对方的提示。
+    """
+    if notices:
+        await service.reply(event, f"没有搜到「{keyword}」。\n" + "\n".join(notices))
+        return
     sug = await service.suggest_for(keyword)
     if sug:
         await service.reply(event, f"没有搜到「{keyword}」。你是不是想搜：{' / '.join(sug[:5])}")
@@ -99,10 +107,10 @@ async def _song_request(service, event, keyword: str, forced_source: str = "auto
         # 配置了具体默认音源就单源搜索；auto 才走三平台聚合
         forced_source = service.config.default_source
     if forced_source != "auto":
-        songs, src = await service.search_songs(keyword, forced_source)
+        songs, src, notices = await service.search_with_notices(keyword, forced_source)
         if not songs:
             service.release_cooldown(event)
-            await _no_result_hint(service, event, keyword)
+            await _no_result_hint(service, event, keyword, notices)
             return
         tip = f"共 {len(songs)} 首"
         await service.list_to_session(event, keyword, songs, source=src, tip=tip)
@@ -183,10 +191,10 @@ async def run_listen_n(service, event):
         return
     # 候选项展开（专辑/歌单/榜单分类/MV 候选）
     if song.get("kind") in ("album", "playlist", "rank", "mv"):
-        from .explore import _expand_candidate
+        from .explore_common import expand_candidate
 
         try:
-            handled = await _expand_candidate(service, event, song, n)
+            handled = await expand_candidate(service, event, song, n)
         except ApiError as e:
             await service.reply(event, e.with_source())
             return
@@ -218,10 +226,10 @@ async def run_listen_n(service, event):
 async def run_listen_all(service, event):
     reason = service.check_song_request()
     if reason:
-        return
+        return False  # 功能关闭：静默让路，与 run_listen_n 一致
     scope = service.scope(event)
     if not await service.sessions.owns_scope(scope):
-        return
+        return False  # 列表是别的音乐插件出的：让路不抢答
     songs = await service.sessions.songs_of(scope)
     if not songs:
         await service.reply(event, "当前没有歌曲列表，先「点歌 关键词」吧")

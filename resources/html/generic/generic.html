@@ -67,7 +67,7 @@
       <div class="row">
         <div class="row-idx{% if it.index <= 3 %} top{% endif %}">{{ it.index }}</div>
         {% if it.cover %}
-        <img class="row-cover" src="{{ it.cover }}" referrerpolicy="no-referrer" onerror="this.outerHTML='<div class=&quot;row-cover-ph&quot;>♪</div>'" />
+        <img class="row-cover" src="{{ it.cover }}" referrerpolicy="no-referrer" onerror="var d=document.createElement('div');d.className='row-cover-ph';d.textContent='♪';this.replaceWith(d)" />
         {% else %}
         <div class="row-cover-ph">♪</div>
         {% endif %}

@@ -5,9 +5,13 @@ from __future__ import annotations
 import re
 
 from ..core import SOURCE_KG, SOURCE_NAMES, SOURCE_NCM
+from ..core.catalog import (
+    NEW_SONG_FETCHERS,
+    TOP_ARTIST_COUNTED_SOURCES,
+    TOP_ARTIST_FETCHERS,
+    resolver_for,
+)
 from .explore_common import (
-    _AREA_NEW,
-    _QQ_AREA_NEW,
     _RE_ARTIST,
     _RE_HOT_ARTISTS,
     _RE_MV_SEARCH,
@@ -20,7 +24,6 @@ from .explore_common import (
     _RE_TOP_MV,
     _locked_source,
     _pick_source,
-    _qq_singer_type,
     _send_generic,
     _to_items,
 )
@@ -31,8 +34,10 @@ async def run_rank(service, event):
     src = await _pick_source(service, event, m.group(1) if m else "")
     name = (m.group(2) if m else "").strip()
     client = service.client_of(src)
+    # 两条分支都要榜单列表，只拉一次 —— ncm 的 /toplist 是 460/403 高发区，
+    # 重复请求等于双倍风控暴露
+    lst = await service.call(src, "rank", client.rank_list())
     if not name:
-        lst = await service.call(src, "rank", client.rank_list())
         items = _to_items(lst[:30], "rank", src)
         await service.sessions.set(service.scope(event), "topCategory", {"songs": items, "keyword": "排行榜"})
         await _send_generic(
@@ -45,18 +50,10 @@ async def run_rank(service, event):
             subtitle="回复 排行榜 榜单名 查看歌曲",
         )
         return
-    # 按名匹配
-    lst = await service.call(src, "rank", client.rank_list())
-    hit = None
-    for r in lst:
-        if name in (r.get("name") or ""):
-            hit = r
-            break
-    if hit is None:
-        for r in lst:
-            if (r.get("name") or "") in name:
-                hit = r
-                break
+    # 按名匹配：先正向包含，再反向包含
+    hit = next((r for r in lst if name in (r.get("name") or "")), None) or next(
+        (r for r in lst if (r.get("name") or "") in name), None
+    )
     if hit is None:
         await service.reply(event, f"没有找到榜单「{name}」，回复「排行榜」查看全部")
         return
@@ -72,12 +69,7 @@ async def run_new_songs(service, event):
     src = await _pick_source(service, event, m.group(1) if m else "")
     area = (m.group(2) if m else "").strip()
     client = service.client_of(src)
-    if src == SOURCE_NCM:
-        songs = await service.call(src, "explore", client.new_songs(_AREA_NEW.get(area, 0)))
-    elif src == SOURCE_KG:
-        songs = await service.call(src, "explore", client.new_songs(21608))
-    else:
-        songs = await service.call(src, "explore", client.new_songs(_QQ_AREA_NEW.get(area, 5)))
+    songs = await service.call(src, "explore", NEW_SONG_FETCHERS[src](client, area))
     if not songs:
         await service.reply(event, "暂无新歌数据")
         return
@@ -91,34 +83,20 @@ async def run_artist(service, event):
     if not kw:
         await service.reply(event, "用法：歌手 歌手名")
         return
-    client = service.client_of(src)
-    if src == SOURCE_NCM:
-        artist, songs = await client.artist_songs_by_keyword(kw, 30)
-    elif src == SOURCE_KG:
-        cands = await client.search(kw, 3, "author")
-        if not cands:
-            await service.reply(event, f"没有找到歌手「{kw}」")
-            return
-        artist = cands[0]
-        songs = await client.artist_songs(artist["id"], 30)
-    else:
-        artist, songs = await client.artist_songs_by_keyword(kw, 30)
-    if not songs:
-        await service.reply(event, f"没有找到「{kw}」的歌曲")
+    res = await resolver_for("artist", src)(service.client_of(src), kw)
+    if not res.songs:
+        await service.reply(event, f"没有找到歌手「{kw}」" if res.not_found else f"没有找到「{kw}」的歌曲")
         return
-    await service.list_to_session(event, f"{artist.get('name', kw)} 的热门歌曲", songs, source=src)
+    await service.list_to_session(event, f"{res.title_or(kw)} 的热门歌曲", res.songs, source=src)
 
 
 async def run_top_artists(service, event):
     m = re.search(_RE_TOP_ARTISTS, event.message_str, re.IGNORECASE)
     src = await _pick_source(service, event, m.group(1) if m else "")
     client = service.client_of(src)
-    if src == SOURCE_NCM:
-        artists = await service.call(src, "explore", client.toplist_artist())
-    elif src == SOURCE_KG:
-        artists = await service.call(src, "explore", client.artist_lists(0))
-    else:
-        artists = await client.search("热门", 15, _qq_singer_type())
+    fetch = TOP_ARTIST_FETCHERS[src](client)
+    # 仅 ncm/kg 计入调用统计（与改动前一致，见 TOP_ARTIST_COUNTED_SOURCES 注释）
+    artists = await (service.call(src, "explore", fetch) if src in TOP_ARTIST_COUNTED_SOURCES else fetch)
     if not artists:
         await service.reply(event, "暂无歌手榜数据")
         return
@@ -144,7 +122,7 @@ async def run_hot_artists(service, event):
     )
     if src is None:
         return
-    artists = await service.call(src, "explore", service.ncm.top_artists())
+    artists = await service.call(src, "explore", service.client_of(src).top_artists())
     if not artists:
         await service.reply(event, "暂无热门歌手数据")
         return
@@ -188,7 +166,7 @@ async def run_rank_top(service, event):
     )
     if src is None:
         return
-    rows = await service.call(src, "explore", service.kg.rank_top())
+    rows = await service.call(src, "explore", service.client_of(src).rank_top())
     if not rows:
         await service.reply(event, "暂无排行推荐数据")
         return
@@ -205,7 +183,7 @@ async def run_top_ip(service, event):
     )
     if src is None:
         return
-    rows = await service.call(src, "explore", service.kg.top_ip())
+    rows = await service.call(src, "explore", service.client_of(src).top_ip())
     if not rows:
         await service.reply(event, "暂无编辑精选数据")
         return
@@ -220,7 +198,7 @@ async def run_top_card(service, event):
     )
     if src is None:
         return
-    songs = await service.call(src, "explore", service.kg.top_card())
+    songs = await service.call(src, "explore", service.client_of(src).top_card())
     if not songs:
         await service.reply(event, "暂无好歌精选数据")
         return
@@ -239,7 +217,7 @@ async def run_top_mvs(service, event):
     )
     if src is None:
         return
-    mvs = await service.call(src, "explore", service.ncm.top_mvs(10))
+    mvs = await service.call(src, "explore", service.client_of(src).top_mvs(10))
     if not mvs:
         await service.reply(event, "暂无 MV 榜数据")
         return

@@ -26,6 +26,7 @@ from .http import (
     query_safe,
     safe_url,
 )
+from .registry import register
 
 # 统一歌曲结构（本客户端产出）
 # {source, sid, sid2, name, artist, album, cover, duration, dtMs,
@@ -149,6 +150,10 @@ class NeteaseClient:
     def __init__(self, config):
         self._config = config  # core.config.Config
         self._vip_cache: tuple[float, bool] = (0.0, False)  # (检查时刻, 是否有特权)
+
+    def ready(self) -> bool:
+        """无重依赖（走 HTTP 服务），配置了地址即可用。"""
+        return bool(self.base)
 
     # ──────────── 基础 ────────────
     @property
@@ -277,7 +282,9 @@ class NeteaseClient:
 
     # ──────────── 取流 ────────────
     async def song_url(self, sid: str, level: str, *, unblock: bool = False) -> dict:
-        params = {"id": sid, "level": level}
+        # 必须拼 timestamp 穿透 api-enhanced 的 2 分钟 URL 缓存：网易云直链带时效签名，
+        # 命中缓存会拿到已过期的 url，下载必失败，且 delivery 的重取重试同样会命中缓存
+        params = self._ts({"id": sid, "level": level})
         if unblock:
             params["unblock"] = "true"
         if level == "dolby":
@@ -295,8 +302,12 @@ class NeteaseClient:
         }
 
     async def song_url_best(
-        self, sid: str, preferred: str = "auto", *, unblock_fallback: bool = True
+        self, song: dict, preferred: str = "auto", *, unblock_fallback: bool = True
     ) -> dict:
+        # 统一协议：与其他音源一致接收 song dict，内部取 sid
+        sid = song.get("sid") or song.get("sid2") or ""
+        if not sid:
+            raise ApiError("歌曲缺少 id，无法取流", source="ncm")
         full = preferred in ("auto", "adaptive", "best") and await self.has_high_quality_privilege()
         levels = ladder_for("ncm", preferred, full=full)
         last_err: ApiError | None = None
@@ -690,6 +701,13 @@ class NeteaseClient:
             "size": int(num(node.get("size"))),
         }
 
+    async def song_mv_url(self, song: dict) -> dict:
+        """统一协议：取 MV 直链；无 mvid 返回空。"""
+        mvid = song.get("mvid")
+        if not mvid:
+            return {"url": ""}
+        return await self.mv_url(str(mvid))
+
     async def mv_search(self, keyword: str, limit: int = 8) -> list[dict]:
         body = await self.request("/cloudsearch", {"keywords": keyword, "type": 1004, "limit": limit})
         result = body.get("result") if isinstance(body.get("result"), dict) else {}
@@ -862,3 +880,6 @@ class NeteaseClient:
             await self.request("/logout", self._ts({}))
         except ApiError:
             pass
+
+
+register("ncm", lambda config, **kw: NeteaseClient(config))

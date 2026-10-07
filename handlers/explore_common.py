@@ -2,19 +2,16 @@
 
 from __future__ import annotations
 
-from ..core import SOURCE_KG, SOURCE_NAMES, SOURCE_NCM
+from ..core import SOURCE_NAMES
+from ..core.cards import build_comment_card_data, build_generic_card_data
+from ..core.catalog import EXPAND_KINDS, resolver_for
 from ..core.errors import ApiError, NotEnabledError
-
-
-def _src_of(token: str | None) -> str:
-    from ..core.sources import token_to_source
-
-    return token_to_source(token)
+from ..core.sources import token_to_source
 
 
 async def _pick_source(service, event, token: str, *, prefer: str = "") -> str:
     """确定音源：显式前缀 > 配置默认 > （prefer 优先的）可用音源；不可用时提示。"""
-    src = _src_of(token)
+    src = token_to_source(token)
     if src == "auto":
         src = service.config.default_source
         if src == "auto":
@@ -61,7 +58,7 @@ async def _send_generic(
     service, event, title: str, items: list[dict], src: str, tip: str = "", subtitle: str = ""
 ) -> None:
     """通用列表卡的统一出口（榜单/歌手/分类/MV榜等共用）。"""
-    from ..core.cards import build_generic_card_data, format_generic_text
+    from ..core.formatters import format_generic_text
 
     data = build_generic_card_data(title, subtitle, items, source=src, tip=tip)
     await service.reply_card_or_text(event, data, "generic", src, format_generic_text)
@@ -69,7 +66,7 @@ async def _send_generic(
 
 async def _send_comments(service, event, target: dict, comments: dict, src: str) -> None:
     """专辑/歌单评论卡：复用 comment 模板，构造一个类歌曲的标题对象。"""
-    from ..core.cards import build_comment_card_data, format_comment_text
+    from ..core.formatters import format_comment_text
 
     fake = {
         "source": src,
@@ -101,7 +98,7 @@ def _albums_as_items(cands: list[dict], source: str = "") -> list[dict]:
     ]
 
 
-def _playlists_as_items(cands: list[dict], source: str = "") -> list[dict]:
+def playlists_as_items(cands: list[dict], source: str = "") -> list[dict]:
     return [
         {
             "index": c.get("index"),
@@ -116,57 +113,34 @@ def _playlists_as_items(cands: list[dict], source: str = "") -> list[dict]:
     ]
 
 
-async def _kg_new_albums(client, type_: int = 0):
-    from ..core.api.http import data_of, list_of
-    from ..core.api.kg import normalize_album
-
-    params = {"pagesize": 15}
-    if type_:
-        params["type"] = type_
-    body = await client.request("/top/album", params, anon=True)
-    data = data_of(body)
-    items = list_of(data.get("info") or data.get("chn"))
-    return [a for a in (normalize_album(x, i) for i, x in enumerate(items)) if a]
+# 展开时 meta 缺 name 时的兜底标题（与改动前逐字一致：专辑 / 歌单）
+_EXPAND_DEFAULT_NAME = {"album": "专辑", "playlist": "歌单"}
 
 
-def _qq_singer_type():
-    from qqmusic_api.modules.search import SearchType
+async def expand_candidate(service, event, entry: dict, n: int) -> bool:
+    """会话里的候选项展开：返回是否处理。
 
-    return SearchType.SINGER
-
-
-async def _expand_candidate(service, event, entry: dict, n: int) -> bool:
-    """会话里的候选项展开：返回是否处理。"""
+    专辑/歌单原本是 kind × source 双层分支（2×3 六段几乎相同的取数代码），
+    现改为查表：kind 决定 resolver kind（EXPAND_KINDS），source 决定 resolver
+    （core/catalog），本函数只负责取回元信息与曲目并下发。
+    榜单与 MV 三平台方法名一致，仍直接调客户端。
+    """
     kind = entry.get("kind", "")
     item_id = str(entry.get("id", "") or "")
     if not item_id:
         return False
     source = entry.get("source", "")
-    if kind == "album":
-        if source == SOURCE_NCM:
-            detail = await service.ncm.album_detail(item_id)
-            songs = detail.get("songs", [])
-            meta = detail.get("album") or {}
-        elif source == SOURCE_KG:
-            songs = await service.kg.album_songs(item_id, 30)
-            meta = {"name": entry.get("name", "")}
-        else:
-            songs = await service.qq.album_songs(item_id, 30)
-            meta = {"name": entry.get("name", "")}
+    resolver_kind = EXPAND_KINDS.get(kind)
+    if resolver_kind is not None:
+        expand = resolver_for(resolver_kind, source)
+        # 查不到 resolver 说明该平台不支持此 kind：返回 False 让上层回「没有可展开的内容」
+        if expand is None:
+            return False
+        meta, songs = await expand(service.client_of(source), item_id, entry.get("name", ""))
         if songs:
-            await service.list_to_session(event, meta.get("name", "专辑"), songs, source=source)
-            return True
-    elif kind == "playlist":
-        if source == SOURCE_NCM:
-            pl, songs = await service.ncm_playlist_songs(item_id)
-        elif source == SOURCE_KG:
-            songs, name, cover = await service.kg.playlist_songs(item_id, 30)
-            pl = {"name": name}
-        else:
-            meta, songs = await service.qq.songlist_songs(item_id, 30)
-            pl = meta
-        if songs:
-            await service.list_to_session(event, pl.get("name", "歌单"), songs, source=source)
+            await service.list_to_session(
+                event, meta.get("name", _EXPAND_DEFAULT_NAME[kind]), songs, source=source
+            )
             return True
     elif kind == "rank":
         src = source

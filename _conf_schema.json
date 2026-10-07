@@ -60,8 +60,8 @@
       "apiBase": {
         "description": "api-enhanced 服务地址",
         "type": "string",
-        "default": "",
-        "hint": "自建 NeteaseCloudMusicApiEnhanced 服务，如 http://127.0.0.1:3000。留空禁用网易云音源。"
+        "default": "http://120.26.120.184:3000",
+        "hint": "网易云音乐 API 服务地址（api-enhanced，默认端口 3000），默认已填好公共实例 http://120.26.120.184:3000，开箱即用。自建请改为自己的地址，如 http://127.0.0.1:3000（注意这是网易云的 3000 端口，酷狗用4000，两者不要冲突）。"
       },
       "cookie": {
         "description": "登录 Cookie",
@@ -79,9 +79,10 @@
       "quality": {
         "description": "最高音质",
         "type": "string",
-        "options": ["auto", "standard", "higher", "exhigh", "lossless", "hires", "jyeffect", "sky", "dolby", "jymaster"],
-        "labels": ["自动", "标准", "较高", "极高", "无损", "Hi-Res", "高清臻音", "沉浸环绕", "杜比全景", "超清母带"],
-        "default": "auto"
+        "options": ["auto", "standard", "higher", "exhigh", "lossless", "hires", "jyeffect", "vivid", "sky", "dolby", "jymaster"],
+        "labels": ["自动", "标准", "较高", "极高", "无损", "Hi-Res", "高清臻音", "臻音全景声", "沉浸环绕", "杜比全景", "超清母带"],
+        "default": "auto",
+        "hint": "取不到时自动按阶梯向下降级。"
       },
       "qualityUnblock": {
         "description": "VIP 歌自动解灰",
@@ -98,8 +99,8 @@
       "apiBase": {
         "description": "KuGouMusicApi 服务地址",
         "type": "string",
-        "default": "",
-        "hint": "自建 KuGouMusicApi 服务，如 http://127.0.0.1:4000。留空禁用酷狗音源。"
+        "default": "http://127.0.0.1:4000",
+        "hint": "酷狗音乐 API 服务地址，默认已填好本机自建服务 http://127.0.0.1:4000（KuGouMusicApi 的默认端口为 4000）。服务在别处时请改成实际地址。"
       },
       "cookie": {
         "description": "登录 Cookie",
@@ -117,9 +118,10 @@
       "quality": {
         "description": "最高音质",
         "type": "string",
-        "options": ["auto", "128", "320", "flac", "high", "super", "viper_clear", "viper_tape"],
-        "labels": ["自动", "标准", "HQ", "无损", "Hi-Res", "Super", "蝰蛇超清", "蝰蛇母带"],
-        "default": "auto"
+        "options": ["auto", "128", "320", "flac"],
+        "labels": ["自动", "标准", "HQ", "无损"],
+        "default": "auto",
+        "hint": "蝰蛇/Super/Hi-Res 属新版取流端点，旧版 /song/url 不支持，已从选项移除。"
       },
       "trialFallback": {
         "description": "VIP 歌发试听片段",
@@ -133,14 +135,14 @@
     "description": "QQ音乐",
     "type": "object",
     "items": {
-      "credential": {
+      "cookie": {
         "description": "登录凭证",
         "type": "string",
         "default": "",
         "secret": true,
-        "hint": "扫码登录后自动写入（JSON）。留空为匿名：免费歌可完整播放，VIP 歌仅试听。"
+        "hint": "扫码登录后自动写入（含 musickey 的 JSON）。留空为匿名：免费歌可完整播放，VIP 歌仅试听。"
       },
-      "uin": {
+      "uid": {
         "description": "用户 ID",
         "type": "string",
         "default": "",
@@ -157,7 +159,8 @@
       "trialFallback": {
         "description": "VIP 歌发试听片段",
         "type": "bool",
-        "default": true
+        "default": true,
+        "hint": "未登录/非会员拿不到完整 URL 时，发送 60 秒试听。"
       }
     }
   },
@@ -186,12 +189,24 @@
   "compressBitrate": {
     "description": "压缩码率 (kbps)",
     "type": "int",
-    "default": 128
+    "default": 128,
+    "slider": {
+      "min": 32,
+      "max": 320,
+      "step": 32
+    },
+    "hint": "32-320，发送失败压缩重试时的 mp3 码率。"
   },
   "downloadTimeout": {
     "description": "下载超时 (ms)",
     "type": "int",
-    "default": 120000
+    "default": 120000,
+    "slider": {
+      "min": 5000,
+      "max": 600000,
+      "step": 5000
+    },
+    "hint": "5000-600000。歌曲直链下载的超时时间，网络慢可调大。"
   },
   "keepFileSec": {
     "description": "临时文件保留 (秒)",
@@ -220,13 +235,13 @@
     "description": "音源请求最小间隔 (ms)",
     "type": "int",
     "default": 250,
-    "hint": "网易云/酷狗每个请求之间的最小间隔，防止突发触发风控。0 = 关闭。"
+    "hint": "0-5000。网易云/酷狗每个请求之间的最小间隔，防止突发触发风控。0 = 关闭。"
   },
   "cooldownSec": {
     "description": "点歌冷却 (秒)",
     "type": "int",
     "default": 0,
-    "hint": "同群两次点歌的最小间隔，防刷屏。0 = 关闭。"
+    "hint": "0-600。同群两次点歌的最小间隔，防刷屏。0 = 关闭。"
   },
   "scheduler": {
     "description": "定时任务",
@@ -293,8 +308,14 @@
       "host": {
         "description": "监听地址",
         "type": "string",
-        "default": "0.0.0.0",
-        "hint": "0.0.0.0 允许局域网访问；仅本机访问填 127.0.0.1。"
+        "default": "127.0.0.1",
+        "hint": "默认仅本机访问；需要局域网其他设备访问时改 0.0.0.0（面板可管理全部插件配置，请自行评估暴露面）。"
+      },
+      "hostAllowlist": {
+        "description": "域名访问白名单",
+        "type": "list",
+        "default": [],
+        "hint": "用域名（而非 IP）访问面板时在此登记，如 panel.example.com，子域名自动放行；留空则只允许 IP / localhost 访问。"
       },
       "port": {
         "description": "端口",
@@ -324,7 +345,8 @@
       "retentionDays": {
         "description": "明细保留天数",
         "type": "int",
-        "default": 30
+        "default": 30,
+        "hint": "1-365，超出后按天清理。"
       }
     }
   }

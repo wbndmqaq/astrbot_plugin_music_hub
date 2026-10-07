@@ -6,25 +6,29 @@
 <meta name="referrer" content="no-referrer" />
 <title>Music Hub · 聚合音乐面板</title>
 <script src="/webui/theme-boot.js"></script>
-<link rel="icon" href="/webui/logo.svg" type="image/svg+xml" />
+<link rel="icon" href="/webui/logo.png" type="image/png" />
 <link rel="stylesheet" href="/webui/style.css" />
 </head>
 <body>
+<a class="skip-link" href="#main">跳到主内容</a>
 <!-- 花瓣飘落 + 渐变云雾 -->
 <div class="bg-wash" aria-hidden="true"></div>
 <div class="petal-layer" id="petalLayer" aria-hidden="true"></div>
-<div class="scroll-progress" id="scrollProgress"></div>
+<div class="scroll-progress" id="scrollProgress" aria-hidden="true"></div>
 
 <!-- 登录遮罩 -->
 <div class="login-mask" id="loginMask" hidden>
   <div class="login-box">
-    <div class="login-icon">
-      <svg viewBox="0 0 24 24" width="38" height="38" fill="none" stroke="currentColor" stroke-width="1.7"><path d="M9 18.5V6.8l10-2v11.2"/><circle cx="6.6" cy="18.5" r="2.4"/><circle cx="16.6" cy="16" r="2.4"/></svg>
+    <div class="login-icon" aria-hidden="true">
+      <img src="/webui/logos/qq.png" alt="" />
+      <img src="/webui/logos/kg.png" alt="" />
+      <img src="/webui/logos/ncm.png" alt="" />
     </div>
-    <div class="login-title">Music <b>Hub</b></div>
+    <h1 class="login-title">Music <b>Hub</b></h1>
     <div class="login-sub">三平台聚合点歌 · 管理面板</div>
+    <label class="sr-only" for="loginPwd">管理密码</label>
     <input id="loginPwd" class="input" type="password" placeholder="请输入管理密码" autocomplete="current-password" />
-    <div class="login-err" id="loginErr" hidden></div>
+    <div class="login-err" id="loginErr" role="alert" hidden></div>
     <button class="btn btn-login" id="loginBtn">进入面板</button>
     <div class="login-hint">默认密码见插件配置 <code>webui.password</code></div>
   </div>
@@ -33,90 +37,100 @@
 <!-- 侧边栏 -->
 <aside class="side">
   <div class="brand">
-    <div class="brand-logo">
-      <svg viewBox="0 0 24 24" width="24" height="24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M9 18.5V6.8l10-2v11.2"/><circle cx="6.6" cy="18.5" r="2.4"/><circle cx="16.6" cy="16" r="2.4"/></svg>
+    <!-- 三个 logo 是装饰（旁边已有 "Music Hub" 文字），alt 必须为空，
+         否则读屏每次进页会多念三段平台名 -->
+    <div class="brand-logo" aria-hidden="true">
+      <img src="/webui/logos/qq.png" alt="" />
+      <img src="/webui/logos/kg.png" alt="" />
+      <img src="/webui/logos/ncm.png" alt="" />
     </div>
     <div class="brand-txt">Music <b>Hub</b><small>聚合点歌 · 管理面板</small></div>
   </div>
-  <nav class="side-list" id="sideList"></nav>
+  <nav class="side-list" id="sideList" aria-label="面板导航"></nav>
   <div class="side-foot">
-    <button class="theme-toggle" data-act="theme" title="切换主题">
-      <svg class="ico-auto" viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="1.8"><circle cx="12" cy="12" r="8.5"/><path d="M12 3.5v17A8.5 8.5 0 0 0 12 3.5z" fill="currentColor" stroke="none"/></svg>
-      <svg class="ico-sun" viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="1.8"><circle cx="12" cy="12" r="4.2"/><path d="M12 2.5v2.4M12 19.1v2.4M2.5 12h2.4M19.1 12h2.4M4.9 4.9l1.7 1.7M17.4 17.4l1.7 1.7M19.1 4.9l-1.7 1.7M6.6 17.4l-1.7 1.7"/></svg>
-      <svg class="ico-moon" viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M20 13.5A8.5 8.5 0 0 1 10.5 4 7.5 7.5 0 1 0 20 13.5z"/></svg>
+    <button class="theme-toggle" data-act="theme" title="切换主题" aria-label="切换主题（跟随系统 / 夜间 / 樱花粉）">
+      <svg class="ico-auto" viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="1.8" aria-hidden="true"><circle cx="12" cy="12" r="8.5"/><path d="M12 3.5v17A8.5 8.5 0 0 0 12 3.5z" fill="currentColor" stroke="none"/></svg>
+      <svg class="ico-sun" viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="1.8" aria-hidden="true"><circle cx="12" cy="12" r="4.2"/><path d="M12 2.5v2.4M12 19.1v2.4M2.5 12h2.4M19.1 12h2.4M4.9 4.9l1.7 1.7M17.4 17.4l1.7 1.7M19.1 4.9l-1.7 1.7M6.6 17.4l-1.7 1.7"/></svg>
+      <svg class="ico-moon" viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="1.8" aria-hidden="true"><path d="M20 13.5A8.5 8.5 0 0 1 10.5 4 7.5 7.5 0 1 0 20 13.5z"/></svg>
     </button>
     <button class="btn btn-ghost btn-sm btn-logout" data-act="logout">退出</button>
   </div>
 </aside>
 
-<!-- 移动端底栏 -->
-<nav class="bottom-nav" id="bottomNav"></nav>
+<!-- 移动端底栏：只 5 项（总览/搜索/账号/统计/更多），其余进「更多」抽屉 -->
+<nav class="bottom-nav" id="bottomNav" aria-label="面板导航（精简）"></nav>
+<!-- 移动端「更多」抽屉：承载另外 4 个面板 + 主题切换 + 退出登录 -->
+<div class="more-sheet" id="moreSheet" aria-label="更多面板" hidden></div>
 
-<main class="wrap" id="wrap">
+<main class="wrap" id="main" tabindex="-1">
   <div class="topbar">
     <div class="chip" id="chipVersion"><span class="dot"></span>v--</div>
+    <!-- 未知状态：中性灰点，不能用绿色（假阳性） -->
     <div class="chip" id="chipMaster"><span class="dot"></span>加载中</div>
     <div class="chip" id="chipAcl"><span class="dot"></span>ACL</div>
   </div>
 
   <!-- 总览 -->
-  <section class="panel on" id="panel-overview">
+  <section class="panel on" id="panel-overview" aria-labelledby="ovTitle">
     <div class="hero-banner">
-      <h2>Music Hub 控制台</h2>
+      <h1 id="ovTitle">Music Hub 控制台</h1>
       <p>搜索试听、扫码登录、统计与配置；未配置的音源到「插件配置」填 API 地址</p>
     </div>
     <div class="stat-grid" id="statGrid"></div>
     <div class="card">
-      <div class="card-head"><h3>音源状态</h3><button class="btn btn-blue btn-sm" data-act="svc-check">检测连通性</button></div>
+      <div class="card-head"><h2>音源状态</h2><button class="btn btn-blue btn-sm" data-act="svc-check">检测连通性</button></div>
       <div class="svc-grid" id="svcGrid"></div>
     </div>
     <div class="card">
-      <div class="card-head"><h3>最近调用</h3><span class="muted" id="recentHint"></span></div>
+      <div class="card-head"><h2>最近调用</h2><span class="muted" id="recentHint"></span></div>
       <div class="feed" id="recentFeed"></div>
     </div>
   </section>
 
   <!-- 多音源搜索 -->
-  <section class="panel" id="panel-search">
+  <section class="panel" id="panel-search" aria-label="多音源搜索">
     <div class="hint-bar">输入关键词，<b>三平台并行搜索</b>并按「同名同歌手」聚合 —— 每首歌展示全部可用音源版本；切「歌单/专辑/歌手」看更多内容。</div>
     <div class="search-bar">
-      <input id="searchInput" class="input" placeholder="试着搜：晴天 / 海阔天空 / 周杰伦…" />
+      <label class="sr-only" for="searchInput">搜索关键词</label>
+      <input id="searchInput" class="input" placeholder="试着搜：晴天 / 海阔天空 / 周杰伦…" autocomplete="off" />
       <button class="btn" data-act="do-search">搜索</button>
     </div>
-    <div class="search-tabs" id="searchTabs">
-      <button class="stab on" data-t="song">单曲</button>
-      <button class="stab" data-t="playlist">歌单</button>
-      <button class="stab" data-t="album">专辑</button>
-      <button class="stab" data-t="artist">歌手</button>
+    <div class="search-tabs" id="searchTabs" role="group" aria-label="搜索类型">
+      <button class="stab on" data-t="song" aria-pressed="true">单曲</button>
+      <button class="stab" data-t="playlist" aria-pressed="false">歌单</button>
+      <button class="stab" data-t="album" aria-pressed="false">专辑</button>
+      <button class="stab" data-t="artist" aria-pressed="false">歌手</button>
     </div>
     <div class="remote-bar" id="remoteBar" hidden>
-      <span class="rb-label">投递到群</span>
+      <label class="rb-label" for="remoteScope">投递到群</label>
       <select id="remoteScope" class="input sel-narrow"></select>
       <button class="btn btn-ghost btn-sm" data-act="remote-refresh">刷新会话</button>
     </div>
-    <div class="src-filter" id="srcFilter" hidden>
-      <button class="sfilter on" data-f="all">全部</button>
-      <button class="sfilter" data-f="ncm">网易云</button>
-      <button class="sfilter" data-f="kg">酷狗</button>
-      <button class="sfilter" data-f="qq">QQ</button>
-      <button class="sfilter" data-f="multi">多音源</button>
+    <div class="src-filter" id="srcFilter" role="group" aria-label="按音源筛选" hidden>
+      <button class="sfilter on" data-f="all" aria-pressed="true">全部</button>
+      <button class="sfilter" data-f="ncm" aria-pressed="false">网易云</button>
+      <button class="sfilter" data-f="kg" aria-pressed="false">酷狗</button>
+      <button class="sfilter" data-f="qq" aria-pressed="false">QQ</button>
+      <button class="sfilter" data-f="multi" aria-pressed="false">多音源</button>
     </div>
     <div class="result-list" id="searchResults"></div>
   </section>
 
   <!-- 账号扫码 -->
-  <section class="panel" id="panel-accounts">
+  <section class="panel" id="panel-accounts" aria-label="账号扫码">
     <div class="hint-bar">扫码登录后凭证自动保存；<b>QQ 音乐匿名可听免费歌</b>，VIP 歌需登录。</div>
     <div class="acct-grid" id="acctGrid"></div>
     <div class="card">
-      <div class="card-head"><h3>手动导入凭证</h3></div>
+      <div class="card-head"><h2>手动导入凭证</h2></div>
       <div class="form-row" style="margin-top:0">
+        <label class="sr-only" for="cookieSource">凭证类型</label>
         <select id="cookieSource" class="input sel-narrow">
           <option value="ncm">网易云 Cookie（MUSIC_U=...）</option>
           <option value="kg">酷狗 Cookie（token=...; userid=...）</option>
           <option value="qq">QQ 凭证（JSON）</option>
         </select>
-        <input id="cookieValue" class="input" type="password" placeholder="粘贴凭证内容" />
+        <label class="sr-only" for="cookieValue">登录凭证内容</label>
+        <input id="cookieValue" class="input" type="password" placeholder="粘贴凭证内容" autocomplete="off" />
         <button class="btn" data-act="cookie-save">导入</button>
       </div>
       <div class="muted small" style="margin-top:8px">推荐使用扫码登录；本功能用于已有 Cookie 的迁移场景。</div>
@@ -125,11 +139,11 @@
 
   <!-- 扫码弹窗 -->
   <div class="modal-mask" id="qrMask" hidden>
-    <div class="modal qr-modal">
-      <div class="modal-head"><h3 id="qrTitle">扫码登录</h3><button class="modal-x" data-act="qr-close">×</button></div>
+    <div class="modal qr-modal" role="dialog" aria-modal="true" aria-labelledby="qrTitle" id="qrDialog" tabindex="-1">
+      <div class="modal-head"><h3 id="qrTitle">扫码登录</h3><button class="modal-x" data-act="qr-close" aria-label="关闭扫码登录对话框">×</button></div>
       <div class="qr-body">
-        <div class="qr-img-wrap" id="qrImgWrap"><img id="qrImg" alt="二维码" /></div>
-        <div class="qr-state" id="qrState">正在获取二维码…</div>
+        <div class="qr-img-wrap" id="qrImgWrap"><img id="qrImg" alt="登录二维码" /></div>
+        <div class="qr-state" id="qrState" role="status" aria-live="polite">正在获取二维码…</div>
         <div class="qr-actions">
           <button class="btn btn-ghost btn-sm" data-act="qr-refresh">刷新二维码</button>
           <button class="btn btn-ghost btn-sm" data-act="qr-cancel">取消</button>
@@ -138,58 +152,77 @@
     </div>
   </div>
 
+  <!-- 自定义确认框（替代原生 confirm()：可样式化、可 Esc 取消、焦点可归位） -->
+  <div class="modal-mask" id="confirmMask" hidden>
+    <div class="modal" role="dialog" aria-modal="true" aria-labelledby="confirmTitle" aria-describedby="confirmText" id="confirmDialog" tabindex="-1">
+      <div class="modal-head"><h3 id="confirmTitle">请确认</h3></div>
+      <div class="confirm-text" id="confirmText"></div>
+      <div class="confirm-actions">
+        <button class="btn btn-ghost btn-sm" id="confirmCancel">取消</button>
+        <button class="btn btn-red btn-sm" id="confirmOk">确定</button>
+      </div>
+    </div>
+  </div>
+
   <!-- 调用统计 -->
-  <section class="panel" id="panel-stats">
+  <section class="panel" id="panel-stats" aria-label="调用统计">
     <div class="stat-grid" id="statGrid2"></div>
     <div class="card">
-      <div class="card-head"><h3>近 14 天调用趋势</h3>
+      <div class="card-head"><h2>近 14 天调用趋势</h2>
         <div class="legend"><span class="lg lg-ncm">网易云</span><span class="lg lg-kg">酷狗</span><span class="lg lg-qq">QQ</span></div>
       </div>
-      <div class="chart-wrap"><svg id="trendChart" viewBox="0 0 720 220" preserveAspectRatio="none"></svg></div>
+      <!-- 骨架屏是 svg 的兄弟节点：SVG 不能容纳 HTML 子节点，
+           塞进 #trendChart 不会渲染 -->
+      <div class="chart-wrap" id="chartWrap">
+        <div class="chart-skeleton" id="chartSkeleton" aria-hidden="true"></div>
+        <svg id="trendChart" viewBox="0 0 720 220" preserveAspectRatio="xMidYMid meet" role="img" aria-labelledby="trendA11y"></svg>
+      </div>
     </div>
     <div class="card">
-      <div class="card-head"><h3>今日动作分布</h3><button class="btn btn-red btn-sm" data-act="stats-reset">清空统计</button></div>
+      <div class="card-head"><h2>今日动作分布</h2><button class="btn btn-red btn-sm" data-act="stats-reset">清空统计</button></div>
       <div class="bars" id="actionBars"></div>
     </div>
     <div class="card">
-      <div class="card-head"><h3>失败原因 TOP</h3><span class="muted">最近调用流水聚合</span></div>
+      <div class="card-head"><h2>失败原因 TOP</h2><span class="muted">最近调用流水聚合</span></div>
       <div class="err-list" id="errList"></div>
     </div>
     <div class="card">
-      <div class="card-head"><h3>最近播放（各会话）</h3><button class="btn btn-ghost btn-sm" data-act="history-refresh">刷新</button></div>
+      <div class="card-head"><h2>最近播放（各会话）</h2><button class="btn btn-ghost btn-sm" data-act="history-refresh">刷新</button></div>
       <div class="feed" id="historyFeed"></div>
     </div>
     <div class="card">
-      <div class="card-head"><h3>调用流水</h3></div>
-      <div class="tbl-wrap"><table class="tbl" id="recentTbl"><thead><tr><th>时间</th><th>音源</th><th>动作</th><th>状态</th><th>详情</th></tr></thead><tbody></tbody></table></div>
+      <div class="card-head"><h2>调用流水</h2></div>
+      <div class="tbl-wrap"><table class="tbl" id="recentTbl"><caption class="sr-only">最近 40 条调用流水</caption><thead><tr><th scope="col">时间</th><th scope="col">音源</th><th scope="col">动作</th><th scope="col">状态</th><th scope="col">详情</th></tr></thead><tbody></tbody></table></div>
     </div>
   </section>
 
   <!-- 黑白名单 -->
-  <section class="panel" id="panel-acl">
+  <section class="panel" id="panel-acl" aria-label="黑白名单">
     <div class="card">
-      <div class="card-head"><h3>模式</h3></div>
-      <div class="seg" id="aclModeSeg">
-        <button data-mode="off">关闭</button>
-        <button data-mode="blacklist">黑名单</button>
-        <button data-mode="whitelist">白名单</button>
+      <div class="card-head"><h2>模式</h2></div>
+      <div class="seg" id="aclModeSeg" role="group" aria-label="访问控制模式">
+        <button data-mode="off" aria-pressed="false">关闭</button>
+        <button data-mode="blacklist" aria-pressed="false">黑名单</button>
+        <button data-mode="whitelist" aria-pressed="false">白名单</button>
       </div>
       <div class="hint-bar" id="aclHint" style="margin-bottom:0"></div>
     </div>
     <div class="acl-cols">
       <div class="card">
-        <div class="card-head"><h3>黑名单</h3><span class="muted" id="blackCount"></span><button class="btn btn-ghost btn-sm" data-act="acl-copy-black">导出</button></div>
+        <div class="card-head"><h2>黑名单</h2><span class="muted" id="blackCount"></span><button class="btn btn-ghost btn-sm" data-act="acl-copy-black">导出</button></div>
         <div class="list-editor" id="blackList"></div>
         <div class="form-row">
-          <input id="blackInput" class="input" placeholder="QQ 号 / 群号，多个用逗号分隔" />
+          <label class="sr-only" for="blackInput">要加入黑名单的 QQ 号或群号</label>
+          <input id="blackInput" class="input" placeholder="QQ 号 / 群号，多个用逗号分隔" autocomplete="off" />
           <button class="btn btn-red" data-act="acl-add-black">添加</button>
         </div>
       </div>
       <div class="card">
-        <div class="card-head"><h3>白名单</h3><span class="muted" id="whiteCount"></span><button class="btn btn-ghost btn-sm" data-act="acl-copy-white">导出</button></div>
+        <div class="card-head"><h2>白名单</h2><span class="muted" id="whiteCount"></span><button class="btn btn-ghost btn-sm" data-act="acl-copy-white">导出</button></div>
         <div class="list-editor" id="whiteList"></div>
         <div class="form-row">
-          <input id="whiteInput" class="input" placeholder="QQ 号 / 群号，多个用逗号分隔" />
+          <label class="sr-only" for="whiteInput">要加入白名单的 QQ 号或群号</label>
+          <input id="whiteInput" class="input" placeholder="QQ 号 / 群号，多个用逗号分隔" autocomplete="off" />
           <button class="btn btn-blue" data-act="acl-add-white">添加</button>
         </div>
       </div>
@@ -197,54 +230,59 @@
   </section>
 
   <!-- 插件配置 -->
-  <section class="panel" id="panel-config">
+  <section class="panel" id="panel-config" aria-label="插件配置">
     <div class="hint-bar">改动即时保存到插件配置；<b>WebUI 端口改动需重载插件</b>生效。</div>
     <div id="configBody"></div>
     <div class="config-foot"><button class="btn" data-act="cfg-save">保存全部</button></div>
   </section>
 
   <!-- 链接解析 -->
-  <section class="panel" id="panel-resolve">
+  <section class="panel" id="panel-resolve" aria-label="链接解析">
     <div class="hint-bar">粘贴网易云 / 酷狗 / QQ 音乐的<b>分享链接或口令文本</b>，机器人会自动解析出歌曲/歌单/专辑（聊天里直接发链接也会自动触发点歌）。</div>
     <div class="card">
-      <div class="card-head"><h3>解析工具</h3></div>
+      <div class="card-head"><h2>解析工具</h2></div>
+      <label class="sr-only" for="resolveInput">分享链接或口令文本</label>
       <textarea id="resolveInput" class="input" rows="4" style="min-height:96px" placeholder="例如：https://music.163.com/song?id=186016  或  【周杰伦】晴天 https://c6.y.qq.com/..."></textarea>
       <div class="form-row">
         <button class="btn btn-blue" data-act="do-resolve">解析链接</button>
         <span class="muted small">支持：网易云(163cn.tv 短链) · 酷狗(hash) · QQ音乐(c6 短链/JSON卡片)</span>
       </div>
-      <div class="resolve-result" id="resolveResult" hidden></div>
+      <div class="resolve-result" id="resolveResult" role="status" aria-live="polite" hidden></div>
     </div>
   </section>
 
   <!-- 我的会话 -->
-  <section class="panel" id="panel-sessions">
+  <section class="panel" id="panel-sessions" aria-label="我的会话">
     <div class="card">
-      <div class="card-head"><h3>我的登录会话</h3><button class="btn btn-ghost btn-sm" data-act="revoke-others">下线其他会话</button></div>
-      <div class="tbl-wrap"><table class="tbl" id="sessTbl"><thead><tr><th>会话</th><th>创建时间</th><th>最近活跃</th><th>操作</th></tr></thead><tbody></tbody></table></div>
+      <div class="card-head"><h2>我的登录会话</h2><button class="btn btn-ghost btn-sm" data-act="revoke-others">下线其他会话</button></div>
+      <div class="tbl-wrap"><table class="tbl" id="sessTbl"><caption class="sr-only">当前 WebUI 登录会话列表</caption><thead><tr><th scope="col">会话</th><th scope="col">创建时间</th><th scope="col">最近活跃</th><th scope="col">操作</th></tr></thead><tbody></tbody></table></div>
     </div>
     <div class="card">
-      <div class="card-head"><h3>修改密码</h3></div>
+      <div class="card-head"><h2>修改密码</h2></div>
       <div class="form-row" style="margin-top:0">
-        <input id="oldPwd" class="input" type="password" placeholder="旧密码" />
-        <input id="newPwd" class="input" type="password" placeholder="新密码（≥6 位）" />
+        <label class="sr-only" for="oldPwd">当前密码</label>
+        <input id="oldPwd" class="input" type="password" placeholder="旧密码" autocomplete="current-password" />
+        <label class="sr-only" for="newPwd">新密码（至少 6 位）</label>
+        <input id="newPwd" class="input" type="password" placeholder="新密码（≥6 位）" autocomplete="new-password" />
         <button class="btn" data-act="pwd-change">修改</button>
       </div>
     </div>
   </section>
 
   <!-- 运行日志 -->
-  <section class="panel" id="panel-logs">
+  <section class="panel" id="panel-logs" aria-label="运行日志">
     <div class="card">
-      <div class="card-head"><h3>运行日志</h3>
+      <div class="card-head"><h2>运行日志</h2>
         <button class="btn btn-ghost btn-sm" data-act="logs-clear">清屏</button>
       </div>
-      <div class="log-console" id="logConsole"><div class="empty-state">暂无日志</div></div>
+      <div class="log-console" id="logConsole" role="log" aria-live="polite" aria-label="运行日志输出"><div class="empty-state">暂无日志</div></div>
     </div>
   </section>
 </main>
 
-<div class="toast-box" id="toastBox" role="status" aria-live="polite"></div>
+<!-- aria-live 只在容器上声明一次；逐条 toast 不再各自设 role，
+     否则嵌套 live region 会重复播报 -->
+<div class="toast-box" id="toastBox" role="status" aria-live="polite" aria-atomic="false"></div>
 
 <script src="/webui/app.js"></script>
 </body>

@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import ipaddress
+import re
+
 from aiohttp import web
 
 from .. import SOURCE_NAMES, SOURCES
@@ -102,6 +105,65 @@ _EDITABLE_KEYS = {
     "rateLimitMs": int,
 }
 _EDITABLE_SRC_KEYS = {"apiBase": str, "quality": str, "qualityUnblock": bool, "trialFallback": bool}
+
+# 可写 int 键的合法区间。缺了这里的声明就能被写入越界值：
+# cooldownSec=-1 会让 check_cooldown 恒返回 None（点歌冷却被完全禁用），
+# maxList=-1 会让下游切片行为异常。与 config.py 的 lo/hi 兜底保持一致。
+_INT_RANGES: dict[str, tuple[int, int]] = {
+    "maxList": (1, 20),
+    "compressBitrate": (32, 320),
+    "downloadTimeout": (5000, 600000),
+    "keepFileSec": (5, 3600),
+    "cooldownSec": (0, 600),
+    "rateLimitMs": (0, 5000),
+}
+# 嵌套节点里的 int 键，键名为 "<节点>.<字段>"
+_NESTED_INT_RANGES: dict[str, tuple[int, int]] = {
+    "webui.port": (1, 65535),
+    "scheduler.signinHour": (0, 23),
+}
+
+
+def clamp_int(key: str, value):
+    """按声明的区间夹取 int 配置值；无区间声明时返回转换结果。
+
+    非法值（无法转 int）抛 ValueError/TypeError，由调用方归入 rejected。
+    """
+    result = int(value)
+    bounds = _INT_RANGES.get(key) or _NESTED_INT_RANGES.get(key)
+    if bounds:
+        lo, hi = bounds
+        result = max(lo, min(hi, result))
+    return result
+
+
+def coerce_setting(key: str, expect: type, value):
+    """按 schema 声明类型强转配置值；非法值抛 TypeError/ValueError 由调用方归入 rejected。
+
+    bool 必须严格校验：bool("false") / bool("0") 都是 True，宽松强转会让
+    「关闭某功能」的请求反向把功能打开 —— 对管理面板是严重缺陷。
+    """
+    if expect is bool:
+        if isinstance(value, bool):
+            return value
+        raise TypeError(f"{key} 需要布尔值，收到 {type(value).__name__}")
+    if expect is int:
+        return clamp_int(key, value)
+    return str(value).strip()
+
+
+def _valid_bind_host(raw: str) -> bool:
+    """监听地址是否可绑定：IP 字面量或合法主机名。
+
+    非法值会让重载后 TCPSite 绑定失败 → 面板起不来，且无自救入口，必须拒写。
+    """
+    try:
+        ipaddress.ip_address(raw)
+        return True
+    except ValueError:
+        return bool(re.fullmatch(r"[A-Za-z0-9](?:[A-Za-z0-9.-]{0,251}[A-Za-z0-9])?", raw))
+
+
 _SRC_QUALITY = {
     "ncm": {
         "auto",
@@ -193,7 +255,7 @@ def make_config_save(server):
             if key in _EDITABLE_KEYS:
                 expect = _EDITABLE_KEYS[key]
                 try:
-                    cfg.set(key, expect(value) if expect is not str else str(value))
+                    cfg.set(key, coerce_setting(key, expect, value))
                     applied.append(key)
                 except (TypeError, ValueError):
                     rejected.append(key)
@@ -203,11 +265,15 @@ def make_config_save(server):
                 for skey, sval in value.items():
                     if skey in _EDITABLE_SRC_KEYS:
                         expect = _EDITABLE_SRC_KEYS[skey]
-                        if skey == "quality" and sval not in _SRC_QUALITY[src]:
-                            rejected.append(f"{src}.{skey}")
-                            continue
+                        # 先校验类型：sval 来自 JSON body，传 list 时
+                        # `sval not in set` 会因 list 不可哈希抛 TypeError，
+                        # 穿透到 _handle_errors 变成 500 而非 400
+                        if skey == "quality":
+                            if not isinstance(sval, str) or sval not in _SRC_QUALITY[src]:
+                                rejected.append(f"{src}.{skey}")
+                                continue
                         try:
-                            node[skey] = expect(sval) if expect is not str else str(sval).strip()
+                            node[skey] = coerce_setting(f"{src}.{skey}", expect, sval)
                             applied.append(f"{src}.{skey}")
                         except (TypeError, ValueError):
                             rejected.append(f"{src}.{skey}")
@@ -216,30 +282,39 @@ def make_config_save(server):
                 cfg.set(src, node)
             elif key == "scheduler" and isinstance(value, dict):
                 node = dict(cfg.sched_node())
-                if "enable" in value:
-                    node["enable"] = bool(value["enable"])
+                for skey in ("enable", "ncmSignin", "qqRefresh"):
+                    if skey in value:
+                        try:
+                            node[skey] = coerce_setting(f"scheduler.{skey}", bool, value[skey])
+                        except (TypeError, ValueError):
+                            rejected.append(f"scheduler.{skey}")
                 if "signinHour" in value:
                     try:
-                        node["signinHour"] = max(0, min(23, int(value["signinHour"])))
+                        node["signinHour"] = clamp_int("scheduler.signinHour", value["signinHour"])
                     except (TypeError, ValueError):
                         rejected.append("scheduler.signinHour")
-                if "ncmSignin" in value:
-                    node["ncmSignin"] = bool(value["ncmSignin"])
-                if "qqRefresh" in value:
-                    node["qqRefresh"] = bool(value["qqRefresh"])
                 cfg.set("scheduler", node)
                 applied.append("scheduler")
             elif key == "webui" and isinstance(value, dict):
                 node = dict(cfg.webui_node())
                 if "enable" in value:
-                    node["enable"] = bool(value["enable"])
+                    try:
+                        node["enable"] = coerce_setting("webui.enable", bool, value["enable"])
+                    except (TypeError, ValueError):
+                        rejected.append("webui.enable")
                 if "port" in value:
                     try:
-                        node["port"] = max(1, min(65535, int(value["port"])))
+                        node["port"] = clamp_int("webui.port", value["port"])
                     except (TypeError, ValueError):
                         rejected.append("webui.port")
                 if "host" in value:
-                    node["host"] = str(value["host"]).strip() or "0.0.0.0"
+                    # 必须校验：host 配错会让 start() 绑定失败，面板起不来，
+                    # 而修复它的唯一入口正是这个面板本身 —— 只能手改配置文件
+                    raw = str(value["host"]).strip() or "0.0.0.0"
+                    if _valid_bind_host(raw):
+                        node["host"] = raw
+                    else:
+                        rejected.append("webui.host")
                 cfg.set("webui", node)
                 applied.append("webui")
             else:
@@ -255,7 +330,7 @@ def make_config_save(server):
                 "applied": applied,
                 "rejected": rejected,
                 "saved": saved,
-                "note": "部分改动需重载插件生效" if "webui" in " ".join(applied) else "",
+                "note": "部分改动需重载插件生效" if any(k.startswith("webui") for k in applied) else "",
             }
         )
 

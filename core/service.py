@@ -18,56 +18,44 @@ from pathlib import Path
 from astrbot.api import logger
 from astrbot.api.message_components import Image, Plain
 
-from . import (
-    PLUGIN_NAME,
-    SOURCE_KG,
-    SOURCE_NAMES,
-    SOURCE_NCM,
-    SOURCE_QQ,
-    SOURCES,
-)
+from . import PLUGIN_NAME, SOURCE_KG, SOURCE_NAMES, SOURCES
 from .acl import Acl
-from .api import KugouClient, NeteaseClient, QQClient, close_session
+from .api import close_session
+from .api import create as create_clients
+from .api import verify as verify_contracts
 from .cards import (
     build_detail_card_data,
     build_help_data,
     build_list_card_data,
     build_settings_data,
-    format_detail_text,
-    format_list_text,
 )
 from .config import Config
-from .delivery import (
-    _schedule_cleanup,
-    cancel_cleanup_timers,
-    deliver_song,
-    get_temp_dir,
-    startup_sweep,
-)
-from .errors import ApiError, NotEnabledError
+from .delivery import deliver_song, schedule_cleanup
+from .errors import ApiError, NotEnabledError, TooManyTasks
+from .formatters import format_detail_text, format_list_text
 from .help_data import HELP_SECTIONS, VERSION
 from .history import HistoryStore
-from .login import LoginManager
+from .login import LoginFlows
 from .matching import best_match, pick_version, version_names
+from .media import cancel_cleanup_timers, get_temp_dir, startup_sweep
 from .quality import quality_label, trial_suffix
-from .queue import QueueManager
+from .queue import RequestDesk
 from .ratelimit import limiter
 from .registry import UmoRegistry
 from .remote import send_audio_to
 from .render import (
+    Renderer,
     apply_theme,
     inject_theme_css,
     load_template,
-    render_html_to_png,
     template_path,
     theme_bg,
-    wrap_card_data,
 )
 from .scheduler import Scheduler
-from .search import SearchManager
+from .search import SongSearch
 from .session import SessionStore, scope_of
 from .stats import Stats
-from .subs import SubManager
+from .subs import Subscriptions
 
 TAG = "[music_hub]"
 
@@ -85,26 +73,39 @@ class MusicService:
         self.tmpl_dir = tmpl_dir
         self.log = logger
 
-        self.ncm = NeteaseClient(config)
-        self.kg = KugouClient(config, data_dir / "device_cookies.json")
-        self.qq = QQClient(config, data_dir / "qq_device.json", data_dir / "qq_credential.json")
-        # 音源路由表：client_of 每次调用直查，不再重建 dict
-        self._clients = {"ncm": self.ncm, "kg": self.kg, "qq": self.qq}
-        self.login = LoginManager(self)
+        # 音源实例来自注册表：新增平台只要在 core/api 下实现 SourceClient 并 register，
+        # 这里与 handlers 都不需要改。契约不完整的音源在启动日志里点名，不留到点歌时。
+        problems = verify_contracts(
+            config, device_path=data_dir / "device_cookies.json", cred_path=data_dir / "qq_credential.json"
+        )
+        for src, missing in problems.items():
+            logger.warning(f"{TAG} 音源 {src} 未实现协议方法：{missing}")
+        clients = create_clients(
+            config,
+            device_path=data_dir / "device_cookies.json",
+            cred_path=data_dir / "qq_credential.json",
+        )
+        self.ncm = clients.get("ncm")
+        self.kg = clients.get("kg")
+        self.qq = clients.get("qq")
+        self._clients = clients
+        self.login = LoginFlows(self)
         self.sessions = SessionStore(plugin, data_dir)
         self.acl = Acl(config)
         self.scheduler = Scheduler(self)
         self.stats = Stats(data_dir, retention_days=config.stats_retention_days, enabled=config.stats_enable)
-        self.queue = QueueManager(self)
-        self.subs = SubManager(self)
+        self.queue = RequestDesk(self)
+        self.subs = Subscriptions(self)
 
+        # 浏览器运行时随实例生命周期：close() 会归位 disabled 状态，允许重载后重试
+        self.renderer = Renderer()
         self._bg_tasks: set[asyncio.Task] = set()
         self._cooldowns: dict[str, float] = {}
         # 会话注册表（scope → umo）与播放历史 / 翻页缓存
         self.registry = UmoRegistry(self.get_kv, self.put_kv)
         self.history = HistoryStore()
-        # 搜索编排（单源 / 聚合 / 分类型）
-        self.search = SearchManager(self)
+        # 搜索编排（单源 / 聚合 / 分类型）：注入协作者而非反向持有 service
+        self.search = SongSearch(config, clients, self.stats, self.enabled_sources)
 
     # ──────────── 生命周期 ────────────
     async def initialize(self) -> None:
@@ -114,7 +115,7 @@ class MusicService:
         await self.scheduler.start()
         await self.subs.load()
         await self.registry.load()
-        await self._spawn(self._startup())
+        self.spawn(self._startup())
 
     async def _startup(self) -> None:
         await startup_sweep()
@@ -122,28 +123,58 @@ class MusicService:
         logger.info(f"{TAG} 初始化完成，可用音源：{' / '.join(SOURCE_NAMES[s] for s in enabled) or '无'}")
 
     async def terminate(self) -> None:
+        """逐步清理。每步独立兜底：任一步抛错都不能让后面的资源（Chromium、连接池、
+        定时器）泄漏——插件重载时这些泄漏是累积性的，Windows 上表现为端口占用与 temp 膨胀。
+        """
+
+        async def _safe(label: str, coro) -> None:
+            try:
+                await coro
+            except Exception as e:  # noqa: BLE001
+                logger.warning(f"{TAG} 清理{label}失败：{e}")
+
+        await _safe("点歌台", self.queue.stop_all())
         for t in list(self._bg_tasks):
             t.cancel()
         if self._bg_tasks:
             await asyncio.gather(*self._bg_tasks, return_exceptions=True)
         self._bg_tasks.clear()
-        await cancel_cleanup_timers()
-        await self.scheduler.stop()
-        await self.login.gc()
-        await self.sessions.close()
-        await self.stats.close()
-        await self.qq.close()
-        await close_session()
-        from .render import close as close_browser
-
-        await close_browser()
+        await _safe("临时文件", cancel_cleanup_timers())
+        await _safe("调度器", self.scheduler.stop())
+        await _safe("登录会话", self.login.gc())
+        await _safe("播放历史", self.sessions.close())
+        await _safe("统计", self.stats.close())
+        await _safe("QQ 客户端", self.qq.close())
+        await _safe("HTTP 会话", close_session())
+        await _safe("渲染器", self.renderer.close())
         logger.info(f"{TAG} 已退出")
 
-    async def _spawn(self, coro) -> asyncio.Task:
+    # 后台任务并发上限：超过则拒绝新任务，防止高频调用把内存耗尽
+    MAX_BG_TASKS = 64
+
+    def spawn(self, coro) -> asyncio.Task:
+        """登记后台任务：terminate 时统一取消，避免重载后残留任务继续运行。
+
+        超过 MAX_BG_TASKS 直接拒绝并关闭协程（未 await 的协程会告警），而不是无限累积。
+        """
+        if len(self._bg_tasks) >= self.MAX_BG_TASKS:
+            coro.close()
+            raise TooManyTasks(f"后台任务已达上限 {self.MAX_BG_TASKS}，请稍后再试")
         task = asyncio.create_task(coro)
         self._bg_tasks.add(task)
         task.add_done_callback(self._bg_tasks.discard)
+        # 必须消费异常：否则 KV 落盘、统计写盘等失败会被 asyncio 静默吞掉，
+        # 表现为「数据莫名没存上」且日志无痕
+        task.add_done_callback(self._log_task_error)
         return task
+
+    @staticmethod
+    def _log_task_error(t: asyncio.Task) -> None:
+        if t.cancelled():
+            return
+        exc = t.exception()
+        if exc is not None:
+            logger.warning(f"{TAG} 后台任务异常：{type(exc).__name__}: {exc}")
 
     def on_login_success(self, source: str) -> None:
         """登录成功回调（刷新特权缓存等）。"""
@@ -179,7 +210,7 @@ class MusicService:
         if not umo:
             return
         if self.registry.note(self.scope(event), umo):
-            self._spawn(self.registry.save())
+            self.spawn(self.registry.save())
 
     def umo_of(self, scope: str) -> str:
         return self.registry.umo_of(scope)
@@ -307,6 +338,7 @@ class MusicService:
         return f"VIP{level}" + (f" · 到期 {expire[:10]}" if expire else "")
 
     async def grade_summary(self, source: str) -> str:
+        """听歌等级摘要。仅酷狗提供该能力，其余平台返回空串。"""
         if source != SOURCE_KG:
             return ""
         try:
@@ -363,13 +395,38 @@ class MusicService:
 
     # ──────────── 搜索 ────────────
     def enabled_sources(self) -> list[str]:
-        return self.config.enabled_sources()
+        """可用音源 = 配置里开着且客户端自检通过。
+
+        走客户端的 ready() 而不是只看配置：契约不全或重依赖缺失的音源
+        出现在这里就等于把「点歌失败」推迟到用户点击时才暴露。
+        """
+        return [s for s in self.config.enabled_sources() if self._is_ready(s)]
+
+    def _is_ready(self, source: str) -> bool:
+        client = self._clients.get(source)
+        if client is None:
+            return False
+        ready = getattr(client, "ready", None)
+        try:
+            return bool(ready()) if callable(ready) else True
+        except Exception:  # noqa: BLE001 - 自检异常按不可用处理
+            return False
 
     async def search_songs(
         self, keyword: str, source: str = "auto", limit: int | None = None
     ) -> tuple[list[dict], str]:
         """搜索歌曲。返回 (songs, 实际source)。auto 时三源并行聚合混排。"""
-        return await self.search.songs(keyword, source, limit)
+        return (await self.search.search_full(keyword, source, limit)).as_tuple()
+
+    async def search_with_notices(
+        self, keyword: str, source: str = "auto", limit: int | None = None
+    ) -> tuple[list[dict], str, list[str]]:
+        """同 search_songs，但一并返回本次搜索产生的可操作提示（如「请扫码登录」）。
+
+        提示随结果返回而不是挂在 search 实例上：挂实例上时并发搜索会互相取走对方的提示。
+        """
+        res = await self.search.search_full(keyword, source, limit)
+        return res.songs, res.source, res.notices
 
     async def search_versions(self, keyword: str, limit: int | None = None) -> tuple[list[dict], str]:
         """聚合搜索并按「同名同歌手」分组 → 多音源选择列表。"""
@@ -453,25 +510,17 @@ class MusicService:
 
     # ──────────── 取流 ────────────
     async def resolve_play(self, song: dict) -> dict:
-        """按音源取播放链接（音质阶梯 / 试听 / 解灰兜底）。"""
+        """按音源取播放链接（音质阶梯 / 试听 / 解灰兜底）。
+
+        三个音源客户端遵循同一协议（song dict 进、play dict 出），新增平台无需改这里。
+        """
         source = song.get("source", "")
         client = self.client_of(source)
         preferred = self.config.src_quality(source)
-        play = {}
-        if source == SOURCE_NCM:
-            play = await self.call(source, "url", client.song_url_best(song["sid"], preferred))
-        elif source == SOURCE_KG:
-            play = await self.call(source, "url", client.song_url_best(song, preferred))
-        elif source == SOURCE_QQ:
-            play = await self.call(source, "url", client.song_url_best(song, preferred))
+        play = await self.call(source, "url", client.song_url_best(song, preferred))
         play.setdefault("qualityLabel", quality_label(source, play.get("quality", "")))
         play["label"] = trial_suffix(play)
         play["source"] = source
-
-        def _refetch():
-            return self.resolve_play(song)
-
-        play["refetch"] = _refetch
         return play
 
     # ──────────── 播放 ────────────
@@ -624,9 +673,7 @@ class MusicService:
         """渲染模板 → PNG 路径；失败返回 None（调用方走文本兜底）。"""
         if not self.config.render_list_card:
             return None
-        from . import render as render_mod
-
-        if render_mod._launch_failed:
+        if self.renderer.disabled:
             return None
         await apply_theme(data)
         tpl_path = template_path(self.tmpl_dir, tpl_name)
@@ -635,13 +682,13 @@ class MusicService:
             data = dict(data)
             data.setdefault("version", VERSION)
             # Jinja 渲染是同步 CPU 操作，放线程池避免大模板渲染卡住事件循环
-            html = await asyncio.to_thread(template.render, data=wrap_card_data(data))
+            html = await asyncio.to_thread(template.render, data=data)
             html = inject_theme_css(html, data, tpl_name, source or data.get("source", ""))
             out = os.path.join(
                 await get_temp_dir(), f"mh_{tpl_name}_{int(time.time() * 1000)}_{os.urandom(3).hex()}.png"
             )
             bg = theme_bg(data, source or data.get("source", ""))
-            ok = await render_html_to_png(html, out, bg)
+            ok = await self.renderer.render(html, out, bg)
             if ok:
                 self.schedule_unlink(out, 120)
                 return out
@@ -680,7 +727,7 @@ class MusicService:
 
     def schedule_unlink(self, path: str, sec: int = 120) -> None:
         with contextlib.suppress(Exception):
-            _schedule_cleanup(path, sec)
+            schedule_cleanup(path, sec)
 
     # ──────────── 歌词 / 评论（per-source 细节收进各客户端 song_* 协议） ────────────
     async def fetch_lyric(self, song: dict) -> dict:
@@ -710,20 +757,16 @@ class MusicService:
     async def fetch_comments(self, song: dict, limit: int = 12) -> dict:
         source = song.get("source", "")
         return await self.call(
-            source, "comment", self.client_of(source).song_comments(song, limit), detail=song.get("name", "")[:40]
+            source,
+            "comment",
+            self.client_of(source).song_comments(song, limit),
+            detail=song.get("name", "")[:40],
         )
 
     # ──────────── MV ────────────
     async def fetch_mv_url(self, song: dict) -> dict:
         source = song.get("source", "")
-        client = self.client_of(source)
-        if source == SOURCE_NCM and song.get("mvid"):
-            return await self.call(source, "mv", client.mv_url(song["mvid"]))
-        if source == SOURCE_KG:
-            return await self.call(source, "mv", client.mv_url(song.get("sid", "")))
-        if source == SOURCE_QQ and song.get("mvid"):
-            return await self.call(source, "mv", client.mv_urls(song["mvid"]))
-        return {"url": ""}
+        return await self.call(source, "mv", self.client_of(source).song_mv_url(song))
 
     # ──────────── 网易歌单便捷 ────────────
     async def ncm_playlist_songs(self, pid: str) -> tuple[dict, list[dict]]:
@@ -733,6 +776,8 @@ class MusicService:
 
     # ──────────── 帮助 / 设置数据（展示结构在 core.cards）────────────
     def help_data(self) -> dict:
+        # 统计已注册路由数。astrbot.core 是内部路径（升级可能变），拿不到就退回
+        # 帮助卡实际列出的条目数——报一个编出来的数比报错更糟。
         route_count = 0
         try:
             from astrbot.core.star.star_handler import star_handlers_registry
@@ -744,7 +789,6 @@ class MusicService:
         except Exception:  # noqa: BLE001
             route_count = 0
         if route_count <= 0:
-            # 注册表拿不到（极端时序）时按帮助卡实际列出的条目数报，别编一个数
             route_count = sum(len(sec.get("items", [])) for sec in HELP_SECTIONS)
         return build_help_data(
             stat_commands=route_count,

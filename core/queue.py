@@ -18,9 +18,26 @@ TAG = "[music_hub]"
 MAX_QUEUE = 30
 _GAP_SEC = 3
 _MAX_WAIT_SEC = 900
+# 上游缺时长信息时的估算值（多数流行歌 3~4 分钟）
+_FALLBACK_DUR_SEC = 180
 
 
-class QueueManager:
+def wait_seconds(song: dict, play: dict) -> float:
+    """本曲播完后再等多久接下一首（含间隔，已夹在合理区间内）。
+
+    dtMs 是各源归一化时的可选字段，缺失时不能退化成下限 10 秒 ——
+    那与真实时长无关，会让「30 首连播」变成 30 次 10 秒空转。
+    """
+    if play.get("trial"):
+        dur = 60 + _GAP_SEC  # 试听片段只有 60s
+    elif song.get("dtMs"):
+        dur = int(song["dtMs"] / 1000) + _GAP_SEC
+    else:
+        dur = _FALLBACK_DUR_SEC + _GAP_SEC
+    return min(max(dur, 10), _MAX_WAIT_SEC)
+
+
+class RequestDesk:
     def __init__(self, service):
         self._service = service
         self._queues: dict[str, dict] = {}
@@ -30,6 +47,19 @@ class QueueManager:
 
     def _umo_of(self, scope: str) -> str:
         return self._service.umo_of(scope)
+
+    def _start_or_none(self, scope: str, q: dict):
+        """起播放任务，失败返回 None（不回滚入队——调用方决定）。
+
+        走 service.spawn 以纳入统一生命周期管理——否则裸 create_task 在插件
+        卸载/重载后仍存活，继续向已失效的 umo 发消息。spawn 在超过并发上限时
+        抛 TooManyTasks，调用方必须回滚已入队的条目。
+        """
+        try:
+            return self._service.spawn(self._player(scope))
+        except Exception as e:  # noqa: BLE001
+            logger.warning(f"{TAG} 点歌台启动播放失败（{scope}）：{e}")
+            return None
 
     # ──────────── 对外 ────────────
     async def add(self, scope: str, song: dict, requester: str) -> int:
@@ -43,7 +73,13 @@ class QueueManager:
             if not self._umo_of(scope):
                 q["items"].pop()
                 return -2
-            q["task"] = asyncio.create_task(self._player(scope))
+            task = self._start_or_none(scope, q)
+            if task is None:
+                # 启动失败必须回滚：否则这首歌永远滞留在队列里，
+                # 既不播放也会被 describe() 误标成「排队中」
+                q["items"].pop()
+                return -3
+            q["task"] = task
         return pos
 
     def items(self, scope: str) -> list[dict]:
@@ -52,28 +88,57 @@ class QueueManager:
     def current(self, scope: str) -> dict | None:
         return self._q(scope)["current"]
 
-    def skip(self, scope: str) -> dict | None:
-        """切歌：终止当前播放，返回即将播放的下一首（无则 None）。"""
+    async def skip(self, scope: str) -> dict | None:
+        """切歌：终止当前播放并等待其真正退出，返回即将播放的下一首（无则 None）。
+
+        必须 await 旧任务：cancel() 只投递信号，不等它落地就起新任务会让
+        正在发送的语音被截断、同时下一首已经开始播（两首重叠）。
+        """
         q = self._q(scope)
-        if q["task"] and not q["task"].done():
-            q["task"].cancel()
-        q["task"] = None
+        await self._abort(q)
         nxt = q["items"][0] if q["items"] else None
         if nxt is not None and self._umo_of(scope):
-            q["task"] = asyncio.create_task(self._player(scope))
+            # 启动失败时保持 task=None：队列仍可再 skip/clear，不至于彻底停摆
+            q["task"] = self._start_or_none(scope, q)
         return nxt
 
-    def clear(self, scope: str) -> int:
+    async def clear(self, scope: str) -> int:
         q = self._queues.get(scope)
         if not q:
             return 0
         n = len(q["items"])
-        if q["task"] and not q["task"].done():
-            q["task"].cancel()
+        await self._abort(q)
         q["items"].clear()
         q["current"] = None
-        q["task"] = None
         return n
+
+    @staticmethod
+    async def _abort(q: dict) -> None:
+        """取消当前播放任务并等它真正退出。
+
+        task 引用在 gather **之后**才置 None：_player 的 finally 靠
+        ``q["task"] is me`` 判断自己是否仍是登记中的任务，先置 None 会让旧任务
+        的 finally 跳过状态清理（current 残留、误清掉新任务的引用）。
+        """
+        task = q.get("task")
+        if task and not task.done():
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+        q["task"] = None
+
+    async def stop_all(self) -> None:
+        """插件卸载时取消所有会话的播放任务，避免重载后继续向失效会话推送。"""
+        tasks = []
+        for q in self._queues.values():
+            t = q.get("task")
+            if t and not t.done():
+                t.cancel()
+                tasks.append(t)
+            q["task"] = None
+            q["current"] = None
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+        self._queues.clear()
 
     # ──────────── 播放循环 ────────────
     async def _player(self, scope: str) -> None:
@@ -101,11 +166,7 @@ class QueueManager:
                 )
                 if not result.get("ok"):
                     await self._service.send_to_scope(scope, f"⚠ 点歌台发送「{song.get('name')}」失败，跳过")
-                if play.get("trial"):
-                    dur = 60 + _GAP_SEC  # 试听片段只有 60s，按实际时长等待
-                else:
-                    dur = int((song.get("dtMs") or 0) / 1000) + _GAP_SEC
-                await asyncio.sleep(min(max(dur, 10), _MAX_WAIT_SEC))
+                await asyncio.sleep(wait_seconds(song, play))
         except asyncio.CancelledError:
             raise
         except Exception as e:  # noqa: BLE001

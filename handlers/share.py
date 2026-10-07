@@ -30,7 +30,8 @@ async def run_resolve(service, event):
     service.check_acl(event)
     try:
         handled = await handle_resolve(service, event, text)
-    except Exception:  # noqa: BLE001
+    except Exception as e:  # noqa: BLE001 - handle_resolve 内部已兜底，这里防御 collect_text 之后的意外
+        service.log_warn(f"链接解析路由异常: {e}")
         return
     if handled:
         event.stop_event()

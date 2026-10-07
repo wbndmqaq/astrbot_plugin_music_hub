@@ -21,6 +21,10 @@ class UmoRegistry:
         self._kv_put = kv_put  # async (key, value) -> None
         self._key = key
         self._rows: dict[str, dict] = {}
+        # 并发落盘合并：群内多人同时点歌会 spawn 多个 save()，
+        # 不合并则后写完的任务可能带着更旧的数据覆盖更新的
+        self._saving = False
+        self._dirty = False
 
     async def load(self) -> None:
         """启动时从 KV 恢复（加载失败的条目直接丢弃）。"""
@@ -30,20 +34,42 @@ class UmoRegistry:
 
     def note(self, scope: str, umo: str) -> bool:
         """登记会话的 umo。返回 True 表示落盘内容会变化（首次登记或 umo 变更，
-        如群迁移/平台换号），调用方应安排落盘；仅活跃时间戳刷新不触发。"""
+        如群迁移/平台换号），调用方应安排落盘；仅活跃时间戳刷新不触发。
+
+        ts 每次活跃都刷新：save() 按 ts 倒序截断，不刷新会让长期活跃的会话
+        被钉在首次联系时刻，从而优先于真正陈旧的会话被裁掉。
+        """
         if not umo:
             return False
         row = self._rows.get(scope)
-        if row and row.get("umo") == umo:
-            return False
         changed = row is None or row.get("umo") != umo
         self._rows[scope] = {"umo": umo, "ts": int(time.time())}
+        # 保存进行中登记了新会话：置脏标记，让 save() 的尾随循环补写一次，
+        # 否则 await 期间的变更永远等不到下一次 save
+        if self._saving:
+            self._dirty = True
         return changed
 
     async def save(self) -> None:
-        """按最近活跃截断后落盘。"""
-        trimmed = dict(sorted(self._rows.items(), key=lambda kv: -kv[1].get("ts", 0))[:MAX_SCOPES])
-        await self._kv_put(self._key, trimmed)
+        """按最近活跃截断后落盘。并发调用合并为一次，尾随调用保证最终一致。"""
+        if self._saving:
+            self._dirty = True
+            return
+        self._saving = True
+        try:
+            while True:
+                self._dirty = False
+                trimmed = dict(sorted(self._rows.items(), key=lambda kv: -kv[1].get("ts", 0))[:MAX_SCOPES])
+                await self._kv_put(self._key, trimmed)
+                if not self._dirty:
+                    return
+        finally:
+            self._saving = False
+            # 退出前又有新登记（发生在上面的 _dirty 判定之后、finally 置位之前）：
+            # 不补跑一次这些 umo 就永远不落盘，重启后点歌台/订阅推送会丢目标会话。
+            if self._dirty:
+                self._saving = False
+                await self.save()
 
     def umo_of(self, scope: str) -> str:
         return (self._rows.get(scope) or {}).get("umo", "")

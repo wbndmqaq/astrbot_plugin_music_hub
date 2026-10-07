@@ -4,48 +4,71 @@ from __future__ import annotations
 
 import asyncio
 import time
+from urllib.parse import urlsplit
 
 from aiohttp import web
+from astrbot.api import logger
 
 from .. import SOURCE_NAMES, SOURCES
+from ..errors import ApiError, TooManyTasks
 from ._util import body_json as _body
 from ._util import json_response as _json
+
+TAG = "[music_hub]"
+
+
+def _host_of(url: str) -> str:
+    """只回显 URL 的 host 部分。
+
+    展开后的短链常带签名 token（?sign=...&t=...），原样回显等于把凭证送到浏览器日志里。
+    """
+    try:
+        parts = urlsplit(url.strip())
+        return f"{parts.scheme}://{parts.netloc}{parts.path}" if parts.scheme else url[:200]
+    except ValueError:
+        return url[:200]
 
 
 # ──────────── 账号 ────────────
 def make_accounts(server):
+    """三平台状态并行查询。串行时最坏 9 次上游往返，任一平台挂起拖住整页。"""
+
+    async def _safe(coro, default):
+        try:
+            return await coro
+        except Exception:  # noqa: BLE001 - 单项失败只降级该项
+            return default
+
+    async def _row(service, src: str) -> dict:
+        row = {
+            "source": src,
+            "name": SOURCE_NAMES[src],
+            "enabled": server.config.src_enabled(src),
+            "loggedIn": False,
+            "nickname": "",
+            "uid": "",
+            "avatar": "",
+            "quality": server.config.src_quality(src),
+        }
+        if not row["enabled"]:
+            row["nickname"] = "未配置 API"
+            return row
+        status, vip, grade = await asyncio.gather(
+            _safe(service.client_of(src).login_status(), {"loggedIn": False, "nickname": "查询失败"}),
+            _safe(service.vip_summary(src), ""),
+            _safe(service.grade_summary(src), ""),
+        )
+        row.update(status if isinstance(status, dict) else {})
+        if grade:
+            row["vip"] = f"{vip} · {grade}" if vip else grade
+        elif vip:
+            row["vip"] = vip
+        return row
+
     async def handler(request: web.Request) -> web.Response:
         service = server.service
-        out = []
-        for src in SOURCES:
-            row = {
-                "source": src,
-                "name": SOURCE_NAMES[src],
-                "enabled": server.config.src_enabled(src),
-                "loggedIn": False,
-                "nickname": "",
-                "uid": "",
-                "avatar": "",
-                "quality": server.config.src_quality(src),
-            }
-            if row["enabled"]:
-                try:
-                    status = await service.client_of(src).login_status()
-                    row.update(status if isinstance(status, dict) else {})
-                except Exception as e:  # noqa: BLE001
-                    row["nickname"] = f"查询失败：{e}"
-                try:
-                    row["vip"] = await service.vip_summary(src)
-                except Exception:  # noqa: BLE001
-                    row["vip"] = ""
-                try:
-                    grade = await service.grade_summary(src)
-                    if grade:
-                        row["vip"] = (row["vip"] + " · " + grade) if row.get("vip") else grade
-                except Exception:  # noqa: BLE001
-                    pass
-            out.append(row)
-        return _json({"accounts": out})
+        rows = await asyncio.gather(*(_row(service, src) for src in SOURCES))
+        return _json({"accounts": list(rows)})
 
     return handler
 
@@ -116,15 +139,20 @@ def make_qr_start(server):
     async def handler(request: web.Request) -> web.Response:
         body = await _body(request)
         src = str(body.get("source", ""))
-        login_type = str(body.get("type", "qq")) if src == "qq" else "qq"
+        # login_type 只有 qq 用得上（ncm/kg 是 key-based 扫码），但 LoginFlows.start
+        # 对三者都接受该参数，故直接透传，不做按平台的无效三元
+        login_type = str(body.get("type", "qq"))
         if src not in SOURCES:
             return _json({"error": "未知音源"}, 400)
-        if server.service.login.active_of(src):
-            await server.service.login.gc()
+        # 同源旧会话先取消：active_of + gc 的组合清不掉刚开的待扫码会话，
+        # 反复点扫码会累积轮询任务（LoginFlows.start 内部也会做一次，这里是幂等的）
+        await server.service.login.cancel_source(src)
+        await server.service.login.gc()
         try:
             session = await server.service.login.start(src, login_type)
         except Exception as e:  # noqa: BLE001
-            return _json({"error": f"创建扫码会话失败：{e}"}, 500)
+            logger.warning(f"{TAG} 创建扫码会话失败（{src}）: {e}")
+            return _json({"error": "创建扫码会话失败，请稍后重试"}, 500)
         return _json(
             {
                 "ticket": session.ticket,
@@ -225,8 +253,13 @@ def make_search(server):
                     ],
                 }
             )
+        except ApiError as e:
+            return _json({"error": e.user_msg()}, 502)
         except Exception as e:  # noqa: BLE001
-            return _json({"error": str(e)[:120]}, 502)
+            # 原始异常字符串可能带上游 API 地址与内部 code，不回显浏览器；
+            # 详情只进服务端日志（前端已做 esc，无 XSS，但会泄露内部信息）
+            logger.warning(f"{TAG} 上游调用失败：{e}")
+            return _json({"error": "上游服务异常，请稍后重试"}, 502)
 
     return handler
 
@@ -241,8 +274,13 @@ def make_preview(server):
             return _json({"error": "歌曲缓存已过期，请重新搜索"}, 404)
         try:
             play = await server.service.resolve_play(song)
+        except ApiError as e:
+            return _json({"error": e.user_msg()}, 502)
         except Exception as e:  # noqa: BLE001
-            return _json({"error": str(e)[:120]}, 502)
+            # 原始异常字符串可能带上游 API 地址与内部 code，不回显浏览器；
+            # 详情只进服务端日志（前端已做 esc，无 XSS，但会泄露内部信息）
+            logger.warning(f"{TAG} 上游调用失败：{e}")
+            return _json({"error": "上游服务异常，请稍后重试"}, 502)
         return _json({"url": play.get("url", ""), "label": play.get("label") or play.get("qualityLabel", "")})
 
     return handler
@@ -255,6 +293,17 @@ def make_remote_scopes(server):
     return handler
 
 
+def is_known_umo(umo: str, rows) -> bool:
+    """umo 是否在插件已登记的会话列表里（远程投递白名单）。
+
+    只判「含冒号」会让已认证会话能向任意构造的 unified_msg_origin 投递消息
+    （包括插件从未接触过的群）。rows 来自 umo_rows()。
+    """
+    if not umo or ":" not in umo:
+        return False
+    return any(r.get("umo") == umo for r in rows or () if isinstance(r, dict))
+
+
 def make_remote_play(server):
     async def handler(request: web.Request) -> web.Response:
         service = server.service
@@ -265,9 +314,12 @@ def make_remote_play(server):
         song = server.get_song(source, sid)
         if not song:
             return _json({"error": "歌曲缓存已过期，请重新搜索"}, 404)
-        if not umo or ":" not in umo:
+        if not is_known_umo(umo, service.umo_rows()):
             return _json({"error": "请选择要投递的会话"}, 400)
-        service._spawn(service.remote_play(umo, song))
+        try:
+            service.spawn(service.remote_play(umo, song))
+        except TooManyTasks as e:
+            return _json({"error": str(e)}, 429)
         return _json({"ok": True, "queued": True, "name": song.get("name", "")})
 
     return handler
@@ -329,7 +381,14 @@ def make_resolve(server):
 
         expanded = await expand_short_links(text)
         hits = [src for src in SOURCES if HINTS[src].search(expanded)]
-        result = {"source": "", "type": "", "name": "", "matched": hits, "expanded": expanded[:500]}
+        # expanded 可能带签名 token，回显前只保留 host 部分
+        result = {
+            "source": "",
+            "type": "",
+            "name": "",
+            "matched": hits,
+            "expanded": _host_of(expanded),
+        }
         try:
             if "ncm" in hits:
                 result["source"] = "ncm"
@@ -370,7 +429,7 @@ def make_resolve(server):
                         if song:
                             result["name"] = f"{song.get('name')} - {song.get('artist')}"
         except Exception as e:  # noqa: BLE001
-            result["error"] = str(e)[:120]
+            result["error"] = e.user_msg() if isinstance(e, ApiError) else "投递失败，请稍后重试"
         if result.get("name"):
             result["playable"] = True
         return _json(result)
@@ -387,15 +446,21 @@ def make_service_check(server):
             try:
                 await service.ncm.request("/song/url/v1", {"id": 1, "level": "standard"})
                 return {"ok": True, "msg": "可用"}
+            except ApiError as e:
+                return {"ok": False, "msg": e.user_msg()}
             except Exception as e:  # noqa: BLE001
-                return {"ok": False, "msg": str(e)[:80]}
+                logger.warning(f"{TAG} 服务检查 ncm 失败: {e}")
+                return {"ok": False, "msg": "无法连接服务"}
 
         async def check_kg():
             try:
                 await service.kg.request("/search/hot", {})
                 return {"ok": True, "msg": "可用"}
+            except ApiError as e:
+                return {"ok": False, "msg": e.user_msg()}
             except Exception as e:  # noqa: BLE001
-                return {"ok": False, "msg": str(e)[:80]}
+                logger.warning(f"{TAG} 服务检查 kg 失败: {e}")
+                return {"ok": False, "msg": "无法连接服务"}
 
         async def check_qq():
             try:
@@ -406,13 +471,15 @@ def make_service_check(server):
                 status = await service.qq.login_status()
                 return {"ok": True, "msg": "已登录" if status.get("loggedIn") else "匿名可用"}
             except Exception as e:  # noqa: BLE001
-                return {"ok": False, "msg": str(e)[:80]}
+                logger.warning(f"{TAG} 服务检查 qq 失败: {e}")
+                return {"ok": False, "msg": "库调用失败"}
 
         ncm, kg, qq = await asyncio.gather(check_ncm(), check_kg(), check_qq(), return_exceptions=True)
 
         def _safe(r):
             if isinstance(r, BaseException):
-                return {"ok": False, "msg": str(r)[:80]}
+                logger.warning(f"{TAG} 服务检查异常: {r}")
+                return {"ok": False, "msg": "检查项异常"}
             return r
 
         return _json(

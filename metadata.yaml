@@ -1,34 +1,19 @@
 name: astrbot_plugin_music_hub
 desc: |
-  Music Hub —— QQ / 酷狗 / 网易云三平台聚合点歌插件。
+  Music Hub —— QQ / 酷狗 / 网易云三平台聚合点歌。
 
-  ## 功能
-  - 点歌：`点歌 晴天` 三平台混搜，同名同歌手合并出多音源版本；`点歌 ncm:晴天` 指定音源；取流失败自动换源
-  - 点歌台：群内排队点歌（排队 / 队列 / 切歌），按歌曲时长自动接歌
-  - 歌词：普通与逐字歌词（KRC / QRC），长歌词翻页，带翻译；热门与最新评论，专辑/歌单评论
-  - 发现：排行榜、新歌、歌手、歌手专辑、专辑、歌单、热搜、日推、FM、MV 搜索、AI 推荐、猜你喜欢等
-  - 账号：红心、喜欢列表、我的歌单、关注列表（QQ）、听歌排行（网易云）、云盘（三平台）、已购（酷狗）、本会话播放历史
-  - 订阅推送：每日日推（网易云）、关注的酷狗歌手新歌，定时推送到群
-  - 扫码登录：聊天指令或 WebUI 扫码，凭证自动保存；QQ 凭证每日保活，网易云每日签到
-  - WebUI：搜索（试听 / 投递到群）、调用统计、黑白名单、配置管理、运行日志
-  - 发送：语音 + 群文件双通道，OneBot 直发，失败自动压缩重试
-  - LLM 工具：注册函数工具，对话里直接说"来首晴天"即可点歌
+  点歌（三平台混搜、同名合并多音源、失败自动换源）、歌词（含 KRC/QRC 逐字）、评论、
+  排行榜与歌单等发现类指令、点歌台队列、订阅推送、聊天或 WebUI 扫码登录、LLM 函数
+  工具点歌。WebUI 管理面板：多音源搜索试听、投递到群、调用统计、黑白名单、全量配置、
+  运行日志。完整指令与说明见仓库 README。
 
-  ## 依赖
-  - QQ 音乐：qqmusic-api-python（pip 自动安装）
-  - 酷狗：自建 KuGouMusicApi 服务（https://github.com/MakcRe/KuGouMusicApi）
-  - 网易云：自建 api-enhanced 服务（NeteaseCloudMusicApiEnhanced）
-  - 卡片渲染：Playwright Chromium（可选，未安装自动回退纯文本）
-
-  ## 快速开始
-  1. WebUI 插件配置里填酷狗 / 网易云 API 地址
-  2. WebUI 账号页扫码登录
-  3. 群里发送 `点歌 晴天`
+  依赖：QQ 音乐内置 qqmusic-api-python，开箱即用；网易云 / 酷狗各需一个 HTTP API
+  服务，默认地址已预填（公共实例 / 本机自建），见 README「三音源接入」。
 version: 1.0.0
 author: wbndm
 repo: https://github.com/wbndmqaq/astrbot_plugin_music_hub
 display_name: Music Hub 聚合点歌
-short_desc: QQ/酷狗/网易云三平台聚合点歌，WebUI 扫码登录与统计管理。
+short_desc: QQ/酷狗/网易云三平台聚合点歌，LLM 函数工具点歌，WebUI 扫码登录与统计管理。
 astrbot_version: ">=4.17.0"
 support_platforms:
   - aiocqhttp
@@ -43,3 +28,6 @@ tags:
   - 音乐
   - 点歌
   - 聚合
+  - 歌词
+  - 音乐管理
+  - WebUI

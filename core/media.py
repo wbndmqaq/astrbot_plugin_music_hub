@@ -29,12 +29,11 @@ _BITRATE_MEDIUM = "96k"
 _BITRATE_LARGE = "64k"
 _BITRATE_LOW_QUALITY = "32k"
 _VOCAL_MAX_BYTES = 5 * 1024 * 1024
-_VOCAL_DIRECT_EXT = {"mp3", "silk", "wav", "amr", "m4a", "ogg", "flac"}
+VOCAL_DIRECT_EXT = {"mp3", "silk", "wav", "amr", "m4a", "ogg", "flac"}
 _MIN_KEEP_SEC = 5
-_CANCEL_GRACE_SEC = 5
 
 # qq_official 大文件分片上传阈值（AstrBot ≥4.27.3 适配器 >10MB 自动分片）
-_QQ_CHUNKED_UPLOAD_THRESHOLD = 10 * 1024 * 1024
+QQ_CHUNKED_UPLOAD_THRESHOLD = 10 * 1024 * 1024
 
 # ──────────── ffmpeg ────────────
 _ffmpeg_checked = False
@@ -49,14 +48,57 @@ def _ffmpeg_available() -> bool:
     return _ffmpeg_ok
 
 
+# 产物复用有效期：超过就重压，避免把坏文件（ffmpeg 异常退出的 0 字节产物）永久复用
+_ARTIFACT_TTL_SEC = 300
+
+
+def _reusable_artifact(path: str) -> bool:
+    """已有产物是否可复用：体积达标且未过期。"""
+    try:
+        if os.path.getsize(path) <= _MIN_VALID_BYTES:
+            return False
+        return (time.time() - os.path.getmtime(path)) < _ARTIFACT_TTL_SEC
+    except OSError:
+        return False
+
+
+def _resolve_bitrate(size: int, configured: str | None) -> str:
+    """目标码率：用户配置为基准，体积越大越降一档。
+
+    configured 是 kbps 数字的字符串（如 "128"），None/非法时回落到内置阶梯。
+    """
+    if configured:
+        try:
+            want = int(str(configured).strip().rstrip("kK"))
+        except (TypeError, ValueError):
+            want = 0
+        if want >= 32:
+            base = max(32, min(320, want))
+            if size > _LARGE_AUDIO_BYTES:
+                return f"{max(32, base // 2)}k"
+            if size > _MEDIUM_AUDIO_BYTES:
+                return f"{max(32, (base * 3) // 4)}k"
+            return f"{base}k"
+    if size > _LARGE_AUDIO_BYTES:
+        return _BITRATE_LARGE
+    if size > _MEDIUM_AUDIO_BYTES:
+        return _BITRATE_MEDIUM
+    return _BITRATE_SMALL
+
+
 async def prepare_vocal_file(
     file_path: str,
     *,
     direct_ext: set[str] | None = None,
     max_bytes: int = _VOCAL_MAX_BYTES,
     low_quality: bool = False,
+    bitrate: str | None = None,
 ) -> str:
-    """高音质音频压成紧凑 mp3（语音/OneBot 群文件用），失败回退原文件。"""
+    """高音质音频压成紧凑 mp3（语音/OneBot 群文件用），失败回退原文件。
+
+    ``bitrate`` 是用户配置 ``compressBitrate``（kbps 数字）折算出的目标码率，
+    为 None 时用内置阶梯。体积越大越降一档，避免大文件压完仍超限。
+    """
     if not file_path or not os.path.exists(file_path):
         return file_path
     abs_path = os.path.abspath(file_path)
@@ -65,37 +107,27 @@ async def prepare_vocal_file(
     except OSError:
         return file_path
     ext = os.path.splitext(abs_path)[1].lstrip(".").lower()
-    direct = direct_ext if direct_ext is not None else _VOCAL_DIRECT_EXT
+    direct = direct_ext if direct_ext is not None else VOCAL_DIRECT_EXT
     if not low_quality and ext in direct and size <= max_bytes:
         return abs_path
-    if not _ffmpeg_available():
+    if not await asyncio.to_thread(_ffmpeg_available):
         return file_path
 
+    target = _resolve_bitrate(size, bitrate)
     stem = os.path.splitext(os.path.basename(abs_path))[0]
-    out = os.path.join(
-        os.path.dirname(abs_path), f"{stem}_vocal_low.mp3" if low_quality else f"{stem}_vocal.mp3"
-    )
-    if os.path.exists(out):
-        try:
-            if os.path.getsize(out) > _MIN_VALID_BYTES:
-                return out
-        except OSError:
-            pass
+    # 文件名带上目标码率：用户改配置后旧产物不能被当成命中复用
+    suffix = "_vocal_low" if low_quality else f"_vocal_{target}"
+    out = os.path.join(os.path.dirname(abs_path), f"{stem}{suffix}.mp3")
+    if await asyncio.to_thread(_reusable_artifact, out):
+        return out
     # 先写临时文件再原子替换：并发压同一首（点歌台+手动）时两个 ffmpeg 不会互踩半成品
     tmp = f"{out}.{os.urandom(3).hex()}.part"
 
-    bitrate = (
-        _BITRATE_LARGE
-        if size > _LARGE_AUDIO_BYTES
-        else _BITRATE_MEDIUM
-        if size > _MEDIUM_AUDIO_BYTES
-        else _BITRATE_SMALL
-    )
     common = ["ffmpeg", "-y", "-i", abs_path, "-vn", "-acodec", "libmp3lame"]
     args = (
         common + ["-ar", "16000", "-ac", "1", "-b:a", _BITRATE_LOW_QUALITY, tmp]
         if low_quality
-        else common + ["-ar", "44100", "-ac", "2", "-b:a", bitrate, tmp]
+        else common + ["-ar", "44100", "-ac", "2", "-b:a", target, tmp]
     )
     try:
         res = await asyncio.to_thread(
@@ -133,12 +165,11 @@ async def get_temp_dir() -> str:
     return _temp_dir
 
 
-def reset_temp_dir_cache() -> None:
-    global _temp_dir
-    _temp_dir = ""
-
-
 _cleanup_timers: dict = {}
+# 已被清理定时器触发、但删除动作还在线程池里跑的任务。
+# 事件循环在 to_thread 完成前关闭会导致删除丢失（temp 残留），
+# cancel_cleanup_timers 需要等它们落地。
+_pending_deletes: set = set()
 
 
 def _remove_file(path: str) -> None:
@@ -151,7 +182,7 @@ def _remove_file(path: str) -> None:
         pass
 
 
-def _schedule_cleanup(file_path: str, keep_sec: int):
+def schedule_cleanup(file_path: str, keep_sec: int):
     try:
         delay = max(_MIN_KEEP_SEC, int(keep_sec))
     except (TypeError, ValueError):
@@ -162,9 +193,12 @@ def _schedule_cleanup(file_path: str, keep_sec: int):
         _cleanup_timers.pop(handle, None)
         try:
             # 文件删除走线程池：call_later 回调同样运行在事件循环上
-            asyncio.get_running_loop().create_task(asyncio.to_thread(_remove_file, file_path))
+            task = asyncio.get_running_loop().create_task(asyncio.to_thread(_remove_file, file_path))
         except RuntimeError:  # 事件循环已停（进程退出收尾），直接删
             _remove_file(file_path)
+            return
+        _pending_deletes.add(task)
+        task.add_done_callback(_pending_deletes.discard)
 
     handle = loop.call_later(delay, _rm)
     _cleanup_timers[handle] = (file_path, time.monotonic())
@@ -172,21 +206,24 @@ def _schedule_cleanup(file_path: str, keep_sec: int):
 
 
 async def cancel_cleanup_timers() -> None:
-    """终止前清理：取消未到期定时器并删除已登记的临时文件（删除在线程池）。"""
-    now = time.monotonic()
-    stale: list[str] = []
-    for handle, entry in list(_cleanup_timers.items()):
-        path, registered_at = entry
-        if now - registered_at < _CANCEL_GRACE_SEC:
-            continue
+    """终止前清理：取消未到期定时器并删除所有已登记的临时文件（删除在线程池）。
+
+    不设「刚注册就跳过」的宽限期——跳过会让关机前最后几秒登记的文件既不删也不注销，
+    而 call_later 句柄随事件循环消亡，之后再无人回收。
+    """
+    to_delete: list[str] = []
+    for handle, (path, _registered_at) in list(_cleanup_timers.items()):
         try:
             handle.cancel()
         except Exception:  # noqa: BLE001
             pass
-        stale.append(path)
+        to_delete.append(path)
         _cleanup_timers.pop(handle, None)
-    if stale:
-        await asyncio.to_thread(lambda: [_remove_file(p) for p in stale])
+    # 等已触发但仍在线程池里删的文件真正删完，否则循环一停就永久残留
+    if _pending_deletes:
+        await asyncio.gather(*list(_pending_deletes), return_exceptions=True)
+    if to_delete:
+        await asyncio.to_thread(lambda: [_remove_file(p) for p in to_delete])
 
 
 async def startup_sweep() -> None:
@@ -199,7 +236,9 @@ async def startup_sweep() -> None:
             for name in os.listdir(d):
                 p = os.path.join(d, name)
                 try:
-                    if os.path.isfile(p) and now - os.path.getmtime(p) > 3600:
+                    # abs() 防时钟回拨：NTP 校正后 mtime 可能是未来时间，
+                    # now - mtime 为负会让条件恒假、temp 目录永久增长
+                    if os.path.isfile(p) and abs(now - os.path.getmtime(p)) > 3600:
                         os.remove(p)
                 except OSError:
                     pass
@@ -210,7 +249,7 @@ async def startup_sweep() -> None:
 
 
 # ──────────── 文件名 / 扩展名 ────────────
-def _clean_track_text(s: str, max_len: int = 40) -> str:
+def clean_track_text(s: str, max_len: int = 40) -> str:
     if not s:
         return ""
     s = str(s).replace("【", "(").replace("】", ")").replace("《", "(").replace("》", ")")
@@ -221,8 +260,8 @@ def _clean_track_text(s: str, max_len: int = 40) -> str:
 
 
 def build_music_filename(*, singer: str, title: str, ext: str = "") -> str:
-    s = _clean_track_text(singer, 30)
-    t = _clean_track_text(title, 40)
+    s = clean_track_text(singer, 30)
+    t = clean_track_text(title, 40)
     base = f"{s}-{t}" if (s and t) else (s or t or "MusicHub")
     return f"{base}{ext}"
 
@@ -267,11 +306,6 @@ def _ext_for_quality(quality_hint: str, url: str, ext_hint: str = "") -> str:
 
 
 # ──────────── 下载 ────────────
-def _write_bytes(path: str, data: bytes):
-    with open(path, "wb") as f:
-        f.write(data)
-
-
 def _append_bytes(path: str, data: bytes):
     with open(path, "ab") as f:
         f.write(data)
@@ -328,7 +362,10 @@ async def download_audio(
             if size < _MIN_VALID_BYTES:
                 raise RuntimeError("下载内容过小，可能是无效链接")
     except (Exception, asyncio.CancelledError):
-        _remove_file(file_path)
+        # os.path.exists/os.remove 在网络盘或容器挂载上可阻塞数百 ms，
+        # 放在事件循环里会卡住整个插件。CancelledError 显式列出是对的
+        # （3.8+ 起它继承 BaseException，不被 except Exception 捕获）
+        await asyncio.to_thread(_remove_file, file_path)
         raise
     return {"filePath": file_path, "size": size}
 

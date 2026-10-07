@@ -2,6 +2,7 @@ __pycache__/
 *.pyc
 .ruff_cache/
 .pytest_cache/
+.workbuddy/
 device_cookies.json
 qq_device.json
 qq_credential.json

@@ -11,6 +11,7 @@ from __future__ import annotations
 import asyncio
 import datetime
 import random
+import time
 
 from astrbot.api import logger
 
@@ -20,12 +21,17 @@ CHECK_INTERVAL = 300  # 每 5 分钟检查一次是否到点
 
 
 class Scheduler:
+    # 单日任务失败后的重试间隔下限：_run_daily 失败时不置位 _last_run_date，
+    # 若不额外限流就会每 5 分钟重跑一次，一天最多撞上游 288 次。
+    RETRY_COOLDOWN = 3600.0
+
     def __init__(self, service):
         self._service = service
         self._task: asyncio.Task | None = None
         self._last_run_date: str = ""
         self._minute_date: str = ""
         self._minute: int = 0
+        self._retry_after: float = 0.0
 
     async def start(self) -> None:
         if not self._service.config.scheduler_enable:
@@ -62,18 +68,31 @@ class Scheduler:
                 today = now.strftime("%Y-%m-%d")
                 target = self._target_time(now)
                 if now >= target and self._last_run_date != today:
-                    self._last_run_date = today
-                    await self._run_daily()
+                    if time.monotonic() < self._retry_after:
+                        pass  # 上一轮失败后还在冷却期，本轮不重试
+                    else:
+                        try:
+                            await self._run_daily()
+                        except Exception as e:  # noqa: BLE001
+                            # 不置位 _last_run_date，允许稍后重试；但要限流，
+                            # 否则每 5 分钟一轮会一直撞上游风控。
+                            self._retry_after = time.monotonic() + self.RETRY_COOLDOWN
+                            logger.warning(f"{TAG} 每日任务失败，{self.RETRY_COOLDOWN // 60} 分钟后重试：{e}")
+                        else:
+                            self._last_run_date = today
                 await asyncio.sleep(CHECK_INTERVAL)
             except asyncio.CancelledError:
                 raise
-            except Exception as e:  # noqa: BLE001 - 单日任务失败只记日志，循环保住（明天还要签）
+            except Exception as e:  # noqa: BLE001 - 循环本身不能死，明天还要签
                 logger.warning(f"{TAG} 定时任务异常（继续运行）：{e}")
                 await asyncio.sleep(CHECK_INTERVAL)
 
     async def _run_daily(self) -> None:
         cfg = self._service.config
         results = []
+        # 顺手清掉过期分页缓存：PAGER_TTL 只在读取时惰性生效，
+        # 写入后未再访问的条目会一直留在内存里
+        self._service.history.sweep_pagers()
         # 网易云每日签到
         if cfg.src_enabled("ncm") and cfg.src_cookie("ncm") and cfg.scheduler_ncm_signin:
             try:

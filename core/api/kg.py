@@ -16,18 +16,18 @@ from pathlib import Path
 import aiohttp
 
 from ..errors import KG_ERRORS, ApiError, NotEnabledError
-from ..quality import KG_LABEL, kg_hash_for, ladder_for
+from ..quality import KG_LABEL, first, kg_hash_for, ladder_for
 from .http import (
     API_TIMEOUT_SEC,
     collect,
     data_of,
-    first,
     get_session,
     list_of,
     num,
     opt_int,
     query_safe,
 )
+from .registry import register
 
 
 def _upstream_msg(data: dict) -> str:
@@ -97,7 +97,6 @@ def normalize_song(item: dict, idx: int = 0) -> dict | None:
             or item.get("hash_flac")
             or ""
         ),
-        "hash_super": str(ainfo.get("hash_super") or item.get("hash_super") or ""),
         "raw": {},
     }
 
@@ -246,6 +245,11 @@ class KugouClient:
         self._config = config
         self._device_path = device_path  # device_cookies.json
         self._device_cookie = ""
+        self._device_lock = asyncio.Lock()  # 并发首调只放一个进 /register/dev
+
+    def ready(self) -> bool:
+        """无重依赖（走 HTTP 服务），配置了地址即可用。"""
+        return bool(self.base)
 
     # ──────────── 设备 ────────────
     def load_device(self) -> None:
@@ -273,20 +277,36 @@ class KugouClient:
 
     async def ensure_device(self) -> str:
         """设备 cookie（dfid=... + KUGOU_API_*）。注册接口限频且静默失败：连发只有
-        第一次返回 dfid，其余返回空 data —— 必须判断 dfid 存在并复用缓存。"""
+        第一次返回 dfid，其余返回空 data —— 必须判断 dfid 存在并复用缓存。
+
+        磁盘读写走 to_thread：本方法被大量接口调用，裸同步 IO 会卡住整个事件循环。
+        """
         if self._device_cookie:
             return self._device_cookie
-        self.load_device()
-        if self._device_cookie:
-            return self._device_cookie
-        body = await self.request("/register/dev", {"json": 1}, inject_cookie=False)
-        dfid = str(data_of(body).get("dfid") or "")
-        cookie = self._jar_cookie()
-        if dfid and "dfid=" not in cookie:
-            cookie = f"{cookie}; " if cookie else ""
-            cookie += f"dfid={dfid}"
-        if not cookie:
-            raise ApiError("设备注册失败（上游静默限频），稍后重试", source="kg")
+        async with self._device_lock:
+            if self._device_cookie:  # 双检：等锁期间可能已被并发调用方填好
+                return self._device_cookie
+            await asyncio.to_thread(self.load_device)
+            if self._device_cookie:
+                return self._device_cookie
+            body = await self.request("/register/dev", {}, inject_cookie=False)
+            dfid = str(data_of(body).get("dfid") or "")
+            cookie = self._jar_cookie()
+            if dfid and "dfid=" not in cookie:
+                cookie = f"{cookie}; " if cookie else ""
+                cookie += f"dfid={dfid}"
+            # 上游对每个请求都 Set-Cookie（KUGOU_API_*），jar 里必有非空 cookie；
+            # 注册被静默限频时 dfid 为空。缺 dfid 的设备串一旦持久化，之后每次取流
+            # 都被服务端注入随机 dfid（等于每次换新设备），放大 20028 风控 —— 宁可
+            # 抛错让调用方稍后重试，也不落盘坏缓存。
+            if not cookie or ("dfid=" not in cookie and not dfid):
+                raise ApiError("设备注册失败：未拿到 dfid（上游静默限频），稍后重试", source="kg")
+            await asyncio.to_thread(self._persist_device, cookie, dfid)
+            self._device_cookie = cookie
+            return cookie
+
+    def _persist_device(self, cookie: str, dfid: str) -> None:
+        """落盘设备 cookie（同步，供 to_thread 调用）。"""
         try:
             self._device_path.parent.mkdir(parents=True, exist_ok=True)
             self._device_path.write_text(
@@ -295,8 +315,6 @@ class KugouClient:
             )
         except OSError:
             pass
-        self._device_cookie = cookie
-        return cookie
 
     # ──────────── 基础 ────────────
     @property
@@ -313,14 +331,13 @@ class KugouClient:
             raise NotEnabledError("酷狗 API 未配置", source="kg")
         return base
 
-    def _compose_cookie(self, caller: str, anon: bool) -> str:
+    def _compose_cookie(self, caller: str) -> str:
+        """设备 cookie + 登录 cookie + 调用方补充。匿名请求不带占位 cookie（已失效）。"""
         parts = []
         if self._device_cookie:
             parts.append(self._device_cookie)
         if self.cookie:
             parts.append(self.cookie)
-        elif anon:
-            parts.append("token=kg;userid=1")
         if caller:
             parts.append(caller)
         return "; ".join(p for p in parts if p)
@@ -332,7 +349,6 @@ class KugouClient:
         method: str = "get",
         *,
         inject_cookie: bool = True,
-        anon: bool = False,
     ) -> dict:
         from ..ratelimit import limiter
 
@@ -342,7 +358,7 @@ class KugouClient:
         url = f"{base}{pathname if pathname.startswith('/') else '/' + pathname}"
         if inject_cookie:
             caller = str(params.pop("cookie", "") or "")
-            composed = self._compose_cookie(caller, anon)
+            composed = self._compose_cookie(caller)
             if composed:
                 params["cookie"] = composed
         timeout = aiohttp.ClientTimeout(total=API_TIMEOUT_SEC)
@@ -387,10 +403,19 @@ class KugouClient:
         return out
 
     # ──────────── 搜索 ────────────
+    def require_login(self) -> None:
+        """酷狗已禁止匿名搜索（error_code=152）：占位 cookie 与设备 cookie 均无效。
+
+        未登录时提前拦截，避免发出注定失败的请求，也让上层能给出扫码引导。
+        """
+        if not self.cookie:
+            raise ApiError("酷狗搜索需登录，请先发送「kg登录」扫码", code=20010, source="kg")
+
     async def search(self, keyword: str, limit: int = 10, type_: str = "song", page: int = 1) -> list[dict]:
+        self.require_login()
         await self.ensure_device()
         body = await self.request(
-            "/search", {"keywords": keyword, "type": type_, "pagesize": limit, "page": page}, anon=True
+            "/search", {"keywords": keyword, "type": type_, "pagesize": limit, "page": page}
         )
         lists = data_of(body).get("lists")
         if type_ == "song":
@@ -588,7 +613,8 @@ class KugouClient:
 
     async def ai_recommend(self, mixsongid: str, pagesize: int = 20) -> list[dict]:
         await self.ensure_device()
-        body = await self.request("/ai/recommend", {"album_audio_id": mixsongid, "pagesize": pagesize})
+        # 上游 module 不读 pagesize（返回条数不可控），只用于本地截断
+        body = await self.request("/ai/recommend", {"album_audio_id": mixsongid})
         return collect(data_of(body).get("song_list"), normalize_song, pagesize)
 
     async def related_songs(self, album_audio_id: str) -> list[dict]:
@@ -635,7 +661,7 @@ class KugouClient:
     async def top_card(self, type_: str = "") -> list[dict]:
         await self.ensure_device()
         path = "/top/card" + (f"/{type_}" if type_ else "")
-        body = await self.request(path, {"pagesize": 20})
+        body = await self.request(path, {})
         return collect(list_of(body.get("data")), normalize_song, 20)
 
     async def rank_top(self) -> list[dict]:
@@ -659,7 +685,7 @@ class KugouClient:
     async def top_ip(self) -> list[dict]:
         """编辑精选专题（/top/ip）：卡片列表，只展示不可播。"""
         await self.ensure_device()
-        body = await self.request("/top/ip", {"pagesize": 15})
+        body = await self.request("/top/ip", {})
         items = list_of(data_of(body).get("list"))
         return [
             {
@@ -678,7 +704,7 @@ class KugouClient:
     async def yueku_songs(self, limit: int = 30) -> list[dict]:
         """乐库推荐歌（/yueku）：info.song 只有 1 首，把 vip_music.list 一并合并。"""
         await self.ensure_device()
-        body = await self.request("/yueku", {"pagesize": limit})
+        body = await self.request("/yueku", {})
         info = data_of(body).get("info") if isinstance(data_of(body).get("info"), dict) else {}
         items = list_of(info.get("song"))
         vip = info.get("vip_music") if isinstance(info.get("vip_music"), dict) else {}
@@ -723,7 +749,7 @@ class KugouClient:
 
     async def theme_playlists(self) -> list[dict]:
         await self.ensure_device()
-        body = await self.request("/theme/playlist", {"pagesize": 15})
+        body = await self.request("/theme/playlist", {})
         return collect(list_of(data_of(body).get("lists") or body.get("data")), normalize_playlist, 15)
 
     async def album_songs(self, aid: str, limit: int = 30) -> list[dict]:
@@ -814,11 +840,17 @@ class KugouClient:
         node = data.get(str(hash_).lower()) if isinstance(data.get(str(hash_).lower()), dict) else {}
         return {"url": str(node.get("downurl") or "")}
 
+    async def song_mv_url(self, song: dict) -> dict:
+        """统一协议：酷狗歌曲结果不携带 MV 标识（normalize_song 的 mvid 恒空），
+        无法由歌曲反查 MV —— 返回空 url 让上层走「没有关联 MV」文案。
+        能取到 MV 流的只有 MV 搜索结果（explore 的 mv 条目自带 MVHash，直接调 mv_url）。
+        """
+        return {"url": ""}
+
     async def mv_search(self, keyword: str, limit: int = 8) -> list[dict]:
+        self.require_login()
         await self.ensure_device()
-        body = await self.request(
-            "/search", {"keywords": keyword, "type": "mv", "pagesize": limit}, anon=True
-        )
+        body = await self.request("/search", {"keywords": keyword, "type": "mv", "pagesize": limit})
         out = []
         for i, it in enumerate(list_of(data_of(body).get("lists"))):
             if not isinstance(it, dict):
@@ -923,7 +955,7 @@ class KugouClient:
 
     async def purchased_songs(self, limit: int = 30) -> list[dict]:
         await self.ensure_device()
-        body = await self.request("/user/purchased/songs", {"pagesize": limit})
+        body = await self.request("/user/purchased/songs", {})
         return collect(
             list_of(data_of(body).get("lists") or data_of(body).get("song_list")), normalize_song, limit
         )
@@ -935,7 +967,7 @@ class KugouClient:
 
     async def followed_new_songs(self, limit: int = 30) -> list[dict]:
         await self.ensure_device()
-        body = await self.request("/artist/follow/newsongs", {"pagesize": limit})
+        body = await self.request("/artist/follow/newsongs", {})
         return collect(list_of(data_of(body).get("songs") or body.get("data")), normalize_song, limit)
 
     # ──────────── 登录 ────────────
@@ -988,3 +1020,6 @@ class KugouClient:
             return True
         except ApiError:
             return False
+
+
+register("kg", lambda config, device_path=None, **kw: KugouClient(config, device_path))
