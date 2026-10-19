@@ -31,6 +31,7 @@ HELP_SECTIONS = [
             {"name": "逐字歌词 [关键词]", "desc": "逐字歌词（KRC/QRC）", "example": "逐字歌词"},
             {"name": "评论 [关键词]", "desc": "热门评论", "example": "评论"},
             {"name": "评论下页", "desc": "看最新评论（网易云/QQ）", "example": "评论下页"},
+            {"name": "评论上页", "desc": "评论翻页（回热门）", "example": "评论上页"},
             {"name": "专辑评论 / 歌单评论", "desc": "按名定位后看评论", "example": "歌单评论 私藏"},
             {"name": "相似 [关键词]", "desc": "相似歌曲推荐", "example": "相似"},
             {"name": "相似歌单 [关键词]", "desc": "相似歌单（网易云）", "example": "相似歌单"},
@@ -75,6 +76,8 @@ HELP_SECTIONS = [
             {"name": "MV榜", "desc": "MV 榜（网易云）", "example": "MV榜"},
             {"name": "电台", "desc": "精选电台（网易云）", "example": "电台"},
             {"name": "热门歌手", "desc": "热门歌手（网易云）", "example": "热门歌手"},
+            {"name": "歌手榜", "desc": "歌手排行榜（默认音源）", "example": "歌手榜"},
+            {"name": "新碟 [地区]", "desc": "新碟上架", "example": "新碟 华语"},
             {"name": "热搜", "desc": "热搜榜", "example": "热搜"},
             {"name": "搜索建议 关键词", "desc": "搜索联想词", "example": "搜索建议 晴天"},
             {"name": "来首歌", "desc": "随机来一首", "example": "来首歌"},
@@ -83,8 +86,11 @@ HELP_SECTIONS = [
         ],
     },
     {
-        "title": "账号（需登录）",
-        "tag": "全员",
+        "title": "账号（需登录 · 管理员）",
+        # 与 handlers/account.py 的 admin=True 一致：非管理员触发这些指令会被
+        # permission_type 静默跳过（不回复），标「全员」会让普通用户照帮助操作
+        # 后石沉大海、误以为插件坏了
+        "tag": "管理员",
         "items": [
             {"name": "日推", "desc": "每日推荐歌曲", "example": "日推"},
             {"name": "历史日推", "desc": "往期日推（网易云黑胶/酷狗登录）", "example": "历史日推"},
@@ -97,21 +103,27 @@ HELP_SECTIONS = [
             {"name": "云盘", "desc": "我的云盘歌曲", "example": "云盘"},
             {"name": "已购", "desc": "已购音乐（酷狗）", "example": "已购"},
             {"name": "最近在听", "desc": "最近播放记录", "example": "最近在听"},
-            {"name": "历史", "desc": "本会话播放历史（可重播）", "example": "历史"},
+            {"name": "历史", "desc": "本会话播放历史（可重播 · 全员可用）", "example": "历史"},
         ],
     },
     {
-        "title": "订阅推送（管理员）",
-        "tag": "管理员",
+        # 订阅/退订是管理员（写操作影响整个会话的推送目标）；「我的订阅」纯读
+        # 本地 KV 无 admin 闸门（handlers/subscribe.py），标题与 desc 按此区分
+        "title": "订阅推送",
+        "tag": "订阅 / 退订为管理员",
         "items": [
-            {"name": "订阅 日推", "desc": "每天定时推送网易云日推", "example": "订阅 日推"},
+            {"name": "订阅 日推", "desc": "每天定时推送网易云日推（管理员）", "example": "订阅 日推"},
             {
                 "name": "订阅新歌 歌手名",
-                "desc": "关注歌手并每日推送新歌（酷狗）",
+                "desc": "关注歌手并每日推送新歌（酷狗 · 管理员）",
                 "example": "订阅新歌 周杰伦",
             },
-            {"name": "退订 日推 / 退订新歌 歌手名", "desc": "取消订阅", "example": "退订 日推"},
-            {"name": "我的订阅", "desc": "查看订阅列表", "example": "我的订阅"},
+            {
+                "name": "退订 日推 / 退订新歌 歌手名",
+                "desc": "取消订阅（管理员）",
+                "example": "退订 日推",
+            },
+            {"name": "我的订阅", "desc": "查看当前会话的订阅列表（全员可用）", "example": "我的订阅"},
         ],
     },
     {
@@ -136,6 +148,7 @@ HELP_SECTIONS = [
         "items": [
             {"name": "设置", "desc": "查看当前配置", "example": "音乐设置"},
             {"name": "音质 [档位]", "desc": "设置最高音质", "example": "音质 lossless"},
+            {"name": "ncm api / kg api 地址", "desc": "设置音源 API 服务地址", "example": "ncm api http://x"},
             {"name": "开启 / 关闭 功能", "desc": "临时开关 点歌/解析/卡片/语音/文件", "example": "关闭 语音"},
             {"name": "统计", "desc": "调用统计（WebUI 图表更全）", "example": "统计"},
             {"name": "测试", "desc": "三平台 API 连通性检查", "example": "音乐测试"},

@@ -34,7 +34,7 @@
   .row:last-child{border-bottom:none}
   .row-idx{width:30px;text-align:center;font-size:15px;font-weight:800;color:var(--mh-muted);
     font-variant-numeric:tabular-nums;flex:none}
-  .row-idx.top{color:var(--mh-nm);font-size:17px}
+  .row-idx.top{color:var(--mh-nm-deep);font-size:17px}
   .row-cover{width:46px;height:46px;border-radius:11px;object-fit:cover;flex:none;
     box-shadow:0 3px 10px rgba(0,0,0,.14)}
   .row-cover-ph{width:46px;height:46px;border-radius:11px;flex:none;display:grid;place-items:center;
@@ -46,16 +46,24 @@
   .row-dur{font-size:11.5px;color:var(--mh-muted);font-variant-numeric:tabular-nums}
   .row-badges{display:flex;gap:5px}
   .badge{font-size:10px;font-weight:800;padding:2.5px 8px;border-radius:999px;letter-spacing:.5px}
-  .badge-vip{background:linear-gradient(135deg,#f7b733,#e8892c);color:#fff}
+  .badge-vip{background:linear-gradient(135deg,#f7b733,#e8892c);color:#5c3a00}
   .badge-trial{background:rgba(0,0,0,.10);color:var(--mh-muted)}
-  .src-dot{display:inline-flex;align-items:center;gap:5px;font-size:10.5px;font-weight:800;color:var(--sc)}
+  /* 音源名用深色 ink（对齐 WebUI 的 --*-ink）：品牌原色压浅卡底只有 2.2-3.3:1，
+     图形圆点仍用品牌色 --sc，文字用 --sc-ink */
+  .src-dot{display:inline-flex;align-items:center;gap:5px;font-size:10.5px;font-weight:800;color:var(--sc-ink)}
   .src-dot::before{content:"";width:7px;height:7px;border-radius:50%;background:var(--sc);box-shadow:0 0 6px var(--sc)}
-  .src-ncm{--sc:var(--src-ncm)}.src-kg{--sc:var(--src-kg)}.src-qq{--sc:var(--src-qq)}
+  .src-ncm{--sc:var(--src-ncm);--sc-ink:#b3123f}
+  .src-kg{--sc:var(--src-kg);--sc-ink:#0b6ea8}
+  .src-qq{--sc:var(--src-qq);--sc-ink:#0a7a52}
   .vchip{display:inline-grid;place-items:center;width:19px;height:19px;border-radius:7px;
-    font-size:10px;font-weight:900;color:#fff;box-shadow:0 2px 5px rgba(0,0,0,.16)}
+    font-size:10px;font-weight:900;color:#0b0b0b;box-shadow:0 2px 5px rgba(0,0,0,.16)}
   .v-ncm{background:linear-gradient(135deg,#ff6b81,#ec4141)}
   .v-kg{background:linear-gradient(135deg,#5bb8ff,#2ca6e0)}
   .v-qq{background:linear-gradient(135deg,#3ed598,#1fae72)}
+  /* 未知音源的回退类：模板内插 .get(source,'other') 的兜底键，缺失时 chip 变
+     无底色方块、圆点无色——给中性灰兜底而非裸类名 */
+  .v-other{background:linear-gradient(135deg,#b9c2cf,#8f9aab)}
+  .src-other{--sc:#8f9aab;--sc-ink:#4a5462}
 
   .tip{margin-top:14px;display:flex;align-items:center;gap:9px;padding:12px 15px;border-radius:14px;
     background:var(--mh-chip);color:var(--mh-muted);font-size:12.5px;font-weight:600;line-height:1.6}
@@ -86,7 +94,8 @@
     <div class="rows">
       {% for s in data.songs or [] %}
       <div class="row">
-        <div class="row-idx{% if s.index <= 3 %} top{% endif %}">{{ s.index }}</div>
+        {# index 先判存在再比较：ChainableUndefined 参与比较会抛 UndefinedError 整卡崩溃（缺失时徽章不渲染） #}
+        <div class="row-idx{% if s.index and s.index <= 3 %} top{% endif %}">{{ s.index }}</div>
         {% if s.cover %}
         <img class="row-cover" src="{{ s.cover }}" referrerpolicy="no-referrer" onerror="var d=document.createElement('div');d.className='row-cover-ph';d.textContent='♪';this.replaceWith(d)" />
         {% else %}
@@ -100,10 +109,10 @@
           <div class="row-dur">{{ s.duration }}</div>
           <div class="row-badges">
             {% if s.versions %}
-            {% for v in s.versions %}<span class="vchip v-{{ v.source }}" title="{{ v.sourceName }}">{{ {'ncm':'网','kg':'狗','qq':'Q'}.get(v.source, '?') }}</span>{% endfor %}
+            {% for v in s.versions %}<span class="vchip v-{{ {'ncm':'ncm','kg':'kg','qq':'qq'}.get(v.source, 'other') }}" title="{{ v.sourceName }}">{{ {'ncm':'网','kg':'狗','qq':'Q'}.get(v.source, '?') }}</span>{% endfor %}
             {% if s.payplay %}<span class="badge badge-vip">VIP</span>{% endif %}
             {% else %}
-            {% if data.source == 'auto' %}<span class="src-dot src-{{ s.source }}">{{ s.sourceName }}</span>{% endif %}
+            {% if data.source == 'auto' and s.sourceName %}<span class="src-dot src-{{ {'ncm':'ncm','kg':'kg','qq':'qq'}.get(s.source, 'other') }}">{{ s.sourceName }}</span>{% endif %}
             {% if s.payplay %}<span class="badge badge-vip">VIP</span>{% endif %}
             {% if s.trial %}<span class="badge badge-trial">试听</span>{% endif %}
             {% endif %}

@@ -4,21 +4,28 @@ from __future__ import annotations
 
 import asyncio
 import re
+import time
 from pathlib import Path
 
 from astrbot.api.message_components import Image
 
 from ..core import SOURCE_NAMES, SOURCES
 from ..core.cards import build_status_card_data
-from ..core.errors import ApiError, TooManyTasks
+from ..core.errors import ApiError, NotEnabledError, TooManyTasks
 from ..core.sources import token_to_source
 from .base import Route
 
 _SRC = r"(ncm|kg|qqm|qq)"
 
-_RE_LOGIN = rf"^\s*#?{_SRC}\s*(?:扫码)?登录\s*(qq|微信|wx|app)?\s*$"
-_RE_LOGOUT = rf"^\s*#?{_SRC}\s*(?:登出|注销|解绑)\s*$"
-_RE_STATUS = rf"^\s*#?(?:音乐|mh)?\s*({_SRC})?\s*(?:登录)?状态\s*$"
+# 音源可选：裸「登录」也要路由进来给用法提示（原先整条不匹配静默无响应，
+# run_login 的用法分支成了死代码）
+_RE_LOGIN = rf"^\s*[#＃]?(?:{_SRC}\s*)?(?:扫码)?登录\s*(qq|微信|wx|app)?\s*$"
+_RE_LOGOUT = rf"^\s*[#＃]?{_SRC}\s*(?:登出|注销|解绑)\s*$"
+_RE_STATUS = rf"^\s*[#＃]?(?:音乐|mh)?\s*({_SRC})?\s*(?:登录)?状态\s*$"
+
+# 「状态」结果缓存：三源九请求且无节流，管理员连发会重复全量打上游
+_STATUS_CACHE_TTL = 8.0
+_status_cache: dict[str, tuple[float, list[dict]]] = {}
 
 
 async def _login_finish(service, src: str, umo: str, session) -> None:
@@ -49,24 +56,38 @@ async def run_login(service, event):
     except ApiError as e:
         await service.reply(event, e.with_source())
         return
-    # 发二维码
-    if session.qr_b64:
+    # 发二维码。dingtalk/webchat 等平台 local_image=False，本地图片必发送失败：
+    # 前置跳过并在下方降级补发 qr_url 文本，否则用户既看不到图也拿不到链接
+    from ..core.platform_caps import caps_of
+
+    caps = caps_of(event)
+    sent_image = False
+    if session.qr_b64 and caps.local_image:
         import base64
 
         from ..core.delivery import get_temp_dir
 
+        # ticket 直接来自上游，先白名单清洗再拼文件名：异常 ticket 带路径分隔符
+        # 会写穿 temp 目录
+        safe_ticket = re.sub(r"[^A-Za-z0-9_-]", "", str(session.ticket))[:64] or "session"
         try:
-            path = str(Path(await get_temp_dir()) / f"qr_{session.ticket}.png")
+            path = str(Path(await get_temp_dir()) / f"qr_{safe_ticket}.png")
             # 二维码几十 KB，落盘走线程池，不占事件循环
             await asyncio.to_thread(Path(path).write_bytes, base64.b64decode(session.qr_b64))
             # 清理先于发送登记：send_chain 对含媒体链失败会重新抛出，若把登记放在
             # 发送之后，失败路径这张 PNG 永远不会被清
             service.schedule_unlink(path, 180)
             await service.send_chain(event, Image.fromFileSystem(path))
+            sent_image = True
         except Exception as e:  # noqa: BLE001
             service.log_warn(f"二维码图片发送失败: {e}")
-    if session.qr_url and not session.qr_b64:
+    if session.qr_url and not sent_image:
         await service.reply(event, f"请打开链接扫码登录：{session.qr_url}")
+    if not sent_image and not session.qr_url:
+        # 图片发送失败且没有 qr_url 时无码可扫，后台等待也永远不会出结果：
+        # 当面说明并终止，不启动 5 分钟等待（等待任务只放在确认有码之后）
+        await service.reply(event, "未获取到二维码，请稍后重试")
+        return
     await service.reply(
         event, f"[{SOURCE_NAMES[src]}] 请使用手机 App 扫码，超时 5 分钟。登录完成后自动提示。"
     )
@@ -80,22 +101,32 @@ async def run_login(service, event):
 
 async def run_logout(service, event):
     m = re.search(_RE_LOGOUT, event.message_str, re.IGNORECASE)
+    # _RE_LOGOUT 的音源组是必选组，匹配成功则 src 必非空，无需判空分支
     src = token_to_source(m.group(1) if m else "", default="")
-    if not src:
-        return
+    # 远端登出失败不得阻断本地清理：音源未配置时 client_of 抛 NotEnabledError，
+    # 若整条失败，本地残留的 cookie 永远清不掉（此时远端本就无会话可登出）
+    local_only = False
     try:
         client = service.client_of(src)
         if hasattr(client, "logout"):
             await client.logout()
-        service.config.clear_src_cookie(src)
-        await service.config.save_async()
-        await service.reply(event, f"[{SOURCE_NAMES[src]}] 已退出登录")
+    except NotEnabledError as e:
+        local_only = True
+        service.log_warn(f"登出({src})跳过远端登出：{e.user_msg()}")
     except ApiError as e:
-        # user_msg 是面向聊天的文案；原始异常串可能带上游细节，不回群聊
+        # 远端失败（网络/风控）：本地 cookie 保留，重试还能再登出一次
         await service.reply(event, f"退出登录失败：{e.user_msg()}")
+        return
     except Exception as e:  # noqa: BLE001
         service.log_warn(f"登出({src})失败: {e}")
         await service.reply(event, f"退出登录失败：{type(e).__name__}")
+        return
+    service.config.clear_src_cookie(src)
+    await service.config.save_async()
+    if local_only:
+        await service.reply(event, f"[{SOURCE_NAMES[src]}] 已清除本地登录态")
+    else:
+        await service.reply(event, f"[{SOURCE_NAMES[src]}] 已退出登录")
 
 
 async def _safe(coro, default=""):
@@ -140,8 +171,14 @@ async def run_status(service, event):
     # 不查总开关：与 run_login 同一 schema 承诺（登录类指令不受影响）
     m = re.search(_RE_STATUS, event.message_str, re.IGNORECASE)
     only = token_to_source(m.group(1) if m else "", default="")
-    targets = [s for s in SOURCES if not only or s == only]
-    rows = await asyncio.gather(*(_status_row(service, s) for s in targets))
+    now = time.monotonic()
+    cached = _status_cache.get(only)
+    if cached and now - cached[0] < _STATUS_CACHE_TTL:
+        rows = cached[1]
+    else:
+        targets = [s for s in SOURCES if not only or s == only]
+        rows = await asyncio.gather(*(_status_row(service, s) for s in targets))
+        _status_cache[only] = (now, list(rows))
     data = build_status_card_data(list(rows))
     await service.reply_card_or_text(event, data, "status", only or "auto", _format_status_text)
 

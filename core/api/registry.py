@@ -1,7 +1,7 @@
 """音源客户端注册表：source id → 工厂。
 
 新增平台只需两步：
-1. 在 core/constants.py 的 SOURCES 加常量；
+1. 在 core/__init__.py 的 SOURCES 加常量；
 2. 在本文件加一行 ``register("xx", XClient)``。
 
 core / search / handlers 不再出现任何字面量 "ncm"/"kg"/"qq" 分支。
@@ -38,5 +38,6 @@ def create(config, **kwargs) -> dict[str, SourceClient]:
         try:
             out[src] = factory(config, **kwargs)
         except Exception as e:  # noqa: BLE001
-            logger.warning(f"[music_hub] 音源 {src} 初始化失败：{e}")
+            # 异常类型名进文案：单看 str(e)（可能是空串）排障时无从定位异常类
+            logger.warning(f"[music_hub] 音源 {src} 初始化失败：{type(e).__name__}: {e}")
     return out

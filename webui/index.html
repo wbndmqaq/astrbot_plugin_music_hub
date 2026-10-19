@@ -4,33 +4,43 @@
 <meta charset="UTF-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
 <meta name="referrer" content="no-referrer" />
+<!-- 移动端浏览器地址栏随主题变色；两套 media 与亮/暗主题变量对应 -->
+<meta name="theme-color" content="#fff0f6" media="(prefers-color-scheme: light)" />
+<meta name="theme-color" content="#171129" media="(prefers-color-scheme: dark)" />
 <title>Music Hub · 聚合音乐面板</title>
 <script src="/webui/theme-boot.js"></script>
-<link rel="icon" href="/webui/logo.png" type="image/png" />
+<link rel="icon" href="/webui/favicon.svg" type="image/svg+xml" />
 <link rel="stylesheet" href="/webui/style.css" />
 </head>
 <body>
+<!-- JS 禁用时面板完全不可用（数据全靠 fetch 拉取），必须显式告知而不是白屏 -->
+<noscript>
+  <p style="margin:18px;padding:16px 20px;border-radius:16px;background:#fff0f6;color:#8a4a66;font-weight:600">
+    Music Hub 管理面板需要启用 JavaScript 才能运行，请在浏览器设置中开启后刷新。
+  </p>
+</noscript>
 <a class="skip-link" href="#main">跳到主内容</a>
 <!-- 花瓣飘落 + 渐变云雾 -->
 <div class="bg-wash" aria-hidden="true"></div>
 <div class="petal-layer" id="petalLayer" aria-hidden="true"></div>
 <div class="scroll-progress" id="scrollProgress" aria-hidden="true"></div>
 
-<!-- 登录遮罩 -->
+<!-- 登录遮罩：全屏模态要有 dialog 语义，读屏才知道进入了需要输入的界面 -->
 <div class="login-mask" id="loginMask" hidden>
-  <div class="login-box">
+  <div class="login-box" role="dialog" aria-modal="true" aria-label="登录 Music Hub 管理面板">
     <div class="login-icon" aria-hidden="true">
       <img src="/webui/logos/qq.png" alt="" />
       <img src="/webui/logos/kg.png" alt="" />
       <img src="/webui/logos/ncm.png" alt="" />
     </div>
-    <h1 class="login-title">Music <b>Hub</b></h1>
+    <!-- h1 已被主内容 hero 占用：登录框降为 h2，避免页面大纲出现两个一级标题 -->
+    <h2 class="login-title">Music <b>Hub</b></h2>
     <div class="login-sub">三平台聚合点歌 · 管理面板</div>
     <label class="sr-only" for="loginPwd">管理密码</label>
     <input id="loginPwd" class="input" type="password" placeholder="请输入管理密码" autocomplete="current-password" />
     <div class="login-err" id="loginErr" role="alert" hidden></div>
     <button class="btn btn-login" id="loginBtn">进入面板</button>
-    <div class="login-hint">默认密码见插件配置 <code>webui.password</code></div>
+    <div class="login-hint">首次启动的随机密码见插件数据目录 <code>webui_initial_password.txt</code>；或自行在插件配置 <code>webui.password</code> 中设置（改完重载生效）</div>
   </div>
 </div>
 
@@ -48,7 +58,7 @@
   </div>
   <nav class="side-list" id="sideList" aria-label="面板导航"></nav>
   <div class="side-foot">
-    <button class="theme-toggle" data-act="theme" title="切换主题" aria-label="切换主题（跟随系统 / 夜间 / 樱花粉）">
+    <button class="theme-toggle" data-act="theme" data-tip="切换主题" aria-label="切换主题（跟随系统 / 夜间 / 樱花粉）">
       <svg class="ico-auto" viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="1.8" aria-hidden="true"><circle cx="12" cy="12" r="8.5"/><path d="M12 3.5v17A8.5 8.5 0 0 0 12 3.5z" fill="currentColor" stroke="none"/></svg>
       <svg class="ico-sun" viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="1.8" aria-hidden="true"><circle cx="12" cy="12" r="4.2"/><path d="M12 2.5v2.4M12 19.1v2.4M2.5 12h2.4M19.1 12h2.4M4.9 4.9l1.7 1.7M17.4 17.4l1.7 1.7M19.1 4.9l-1.7 1.7M6.6 17.4l-1.7 1.7"/></svg>
       <svg class="ico-moon" viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="1.8" aria-hidden="true"><path d="M20 13.5A8.5 8.5 0 0 1 10.5 4 7.5 7.5 0 1 0 20 13.5z"/></svg>
@@ -59,12 +69,13 @@
 
 <!-- 移动端底栏：只 5 项（总览/搜索/账号/统计/更多），其余进「更多」抽屉 -->
 <nav class="bottom-nav" id="bottomNav" aria-label="面板导航（精简）"></nav>
-<!-- 移动端「更多」抽屉：承载另外 4 个面板 + 主题切换 + 退出登录 -->
-<div class="more-sheet" id="moreSheet" aria-label="更多面板" hidden></div>
+<!-- 移动端「更多」抽屉：承载另外 5 个面板 + 主题切换 + 退出登录 -->
+<div class="more-sheet" id="moreSheet" role="dialog" aria-modal="true" aria-label="更多面板" hidden></div>
 
 <main class="wrap" id="main" tabindex="-1">
   <div class="topbar">
-    <div class="chip" id="chipVersion"><span class="dot"></span>v--</div>
+    <!-- 版本芯片初始 hidden：拿到版本号前不闪现「v--」（app.js init 取到后移除） -->
+    <div class="chip" id="chipVersion" hidden><span class="dot"></span>v--</div>
     <!-- 未知状态：中性灰点，不能用绿色（假阳性） -->
     <div class="chip" id="chipMaster"><span class="dot"></span>加载中</div>
     <div class="chip" id="chipAcl"><span class="dot"></span>ACL</div>
@@ -113,6 +124,9 @@
       <button class="sfilter" data-f="qq" aria-pressed="false">QQ</button>
       <button class="sfilter" data-f="multi" aria-pressed="false">多音源</button>
     </div>
+    <!-- aria-live 只放摘要节点：整表替换进 live region 会让读屏把几十条结果整段播报。
+         结果列表本身移出 live 语义，摘要由 app.js 在搜索完成时写入 -->
+    <div class="sr-only" id="searchLive" aria-live="polite"></div>
     <div class="result-list" id="searchResults"></div>
   </section>
 
@@ -175,7 +189,7 @@
            塞进 #trendChart 不会渲染 -->
       <div class="chart-wrap" id="chartWrap">
         <div class="chart-skeleton" id="chartSkeleton" aria-hidden="true"></div>
-        <svg id="trendChart" viewBox="0 0 720 220" preserveAspectRatio="xMidYMid meet" role="img" aria-labelledby="trendA11y"></svg>
+        <svg id="trendChart" viewBox="0 0 720 220" preserveAspectRatio="xMidYMid meet" role="img" aria-labelledby="trendA11y"><title id="trendA11y">调用趋势图（加载中）</title></svg>
       </div>
     </div>
     <div class="card">
@@ -275,7 +289,9 @@
       <div class="card-head"><h2>运行日志</h2>
         <button class="btn btn-ghost btn-sm" data-act="logs-clear">清屏</button>
       </div>
-      <div class="log-console" id="logConsole" role="log" aria-live="polite" aria-label="运行日志输出"><div class="empty-state">暂无日志</div></div>
+      <!-- 高频日志不对读屏逐条播报（aria-live=polite 会连播每批新增行，反而不可用）；
+           role=log 保留日志语义，读屏用户可按虚拟光标浏览 -->
+      <div class="log-console" id="logConsole" role="log" aria-live="off" aria-label="运行日志输出"><div class="empty-state">暂无日志</div></div>
     </div>
   </section>
 </main>

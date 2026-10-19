@@ -6,6 +6,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import re
 from urllib.parse import urlsplit
 
@@ -44,6 +45,8 @@ _EXPAND_TIMEOUT = aiohttp.ClientTimeout(total=8)
 # 超出部分原样保留（下游已有「短链解析失败，请发完整链接」提示兜底）。
 _EXPAND_MAX = 5
 _EXPAND_TEXT_MAX = 2000
+# 单条短链的连环展开上限（163cn.tv→url.cn→最终页这类多跳链）
+_EXPAND_MAX_HOPS = 5
 
 
 def is_allowed_redirect(loc: str) -> bool:
@@ -71,26 +74,51 @@ async def expand_short_links(text: str) -> str:
     """
 
     async def _expand(url: str) -> str:
-        try:
-            async with get_session().get(
-                url, timeout=_EXPAND_TIMEOUT, allow_redirects=False, headers={"User-Agent": USER_AGENT}
-            ) as resp:
-                loc = resp.headers.get("Location", "")
-                if resp.status in _REDIRECT_STATUS and is_allowed_redirect(loc):
-                    return loc
-        except Exception:  # noqa: BLE001
-            pass
-        return url
+        current = url
+        # 短链可能连环跳（163cn.tv→url.cn→最终页）：Location 仍是已知短链域就
+        # 继续展开（fullmatch 保证整个 Location 是短链，不是 URL 里恰好含短链串）；
+        # 非短链 Location 照旧返回。逐跳都过白名单校验，跳数受 _EXPAND_MAX_HOPS
+        # 约束，每跳请求各自的超时由 _EXPAND_TIMEOUT 兜底
+        for _ in range(_EXPAND_MAX_HOPS):
+            try:
+                async with get_session().get(
+                    current,
+                    timeout=_EXPAND_TIMEOUT,
+                    allow_redirects=False,
+                    headers={"User-Agent": USER_AGENT},
+                ) as resp:
+                    loc = resp.headers.get("Location", "")
+                    if resp.status in _REDIRECT_STATUS and is_allowed_redirect(loc):
+                        if SHORT_LINK_RE.fullmatch(loc):
+                            current = loc
+                            continue
+                        return loc
+            except Exception:  # noqa: BLE001
+                pass
+            break
+        return current
 
-    # 匹配窗口限长：1MB 文本先截前 2000 字符再找短链，窗口外的原样保留
-    matches = list(SHORT_LINK_RE.finditer((text or "")[:_EXPAND_TEXT_MAX]))
+    # 匹配窗口限长：1MB 文本先截前 2000 字符再找短链，窗口外的原样保留。
+    # 恰好结束在窗口末端的匹配疑似被截出半截 URL，展开前丢弃
+    window = (text or "")[:_EXPAND_TEXT_MAX]
+    full_len = len(text or "")
+    matches = [m for m in SHORT_LINK_RE.finditer(window) if not (m.end() == len(window) < full_len)]
     if not matches:
         return text or ""
     out = text or ""
-    for m in matches[:_EXPAND_MAX]:
-        expanded = await _expand(m.group(0))
+    # 按 span 分段重组（str.replace 会把窗口外同一短链一并替换）；前面的替换
+    # 会改变后面 span 的位置，用 drift 累计长度变化修正。
+    # 各短链展开相互独立，gather 并行：串行时最坏 _EXPAND_MAX×_EXPAND_MAX_HOPS×8s
+    # = 200s 全堵在单条消息管线里（短链服务整体劣化的场景），并行后收敛为单链
+    # 最坏 40s
+    picked = matches[:_EXPAND_MAX]
+    expanded_list = await asyncio.gather(*(_expand(m.group(0)) for m in picked))
+    drift = 0
+    for m, expanded in zip(picked, expanded_list, strict=True):
         if expanded != m.group(0):
-            out = out.replace(m.group(0), expanded)
+            start, end = m.start() + drift, m.end() + drift
+            out = out[:start] + expanded + out[end:]
+            drift += len(expanded) - (m.end() - m.start())
     return out
 
 
@@ -129,14 +157,35 @@ def collect_text(event, *, include_json: bool = True) -> str:
 
 
 def is_plugin_command(text: str) -> bool:
-    return bool(
-        re.match(r"^\s*#?\s*(mh|ncm|kg|qqm|qq|点歌|音乐|听|播放|歌词|登录|帮助)", (text or "").strip())
-    )
+    text = (text or "").strip()
+    # qq(?!(?:music)?:?//)：排除 qqmusic:// 深链——前缀表命中它会让 share.py 的
+    # 「qqmusic:// in text」预过滤永远走不到，深链解析静默失效
+    if not re.match(
+        r"^\s*#?\s*(mh|ncm|kg|qqm(?!usic:)|qq(?!music?:?//)|点歌|音乐|听|播放|歌词|登录|帮助)",
+        text,
+    ):
+        return False
+    # 以口令词开头的真实分享（「听听这个 https://163cn.tv/xxx」）不是命令：按命令
+    # 放行会让分享石沉大海（各路由正则都锚定 ^，没有谁能接住它）。含链接特征时
+    # 交回解析流程——后续还有 HINTS 预过滤 + _looks_like_share 双重把关，误放行
+    # 的普通聊天不会被当成分享
+    return not re.search(r"https?://|qqmusic://", text)
 
 
 # ──────────── 链接特征提取（handle_resolve 与 WebUI 解析工具共用） ────────────
+# 提取窗口：三平台提取正则的真实需求远小于此（真实分享链接都在链接行内），
+# 1MB 级构造文本先截窗再匹配，提取层的回溯成本与文本长度解耦（ReDoS 纵深，
+# 正则本身的量词上界是第一道防线）
+_EXTRACT_TEXT_MAX = 4096
+
+
+def _extract_window(text: str) -> str:
+    return (text or "")[:_EXTRACT_TEXT_MAX]
+
+
 def extract_ncm_target(text: str) -> tuple[str, str] | None:
     """网易云：返回 (kind, id)，kind ∈ playlist / album / song。"""
+    text = _extract_window(text)
     for pat, kind in (
         (r"playlist\?(?:[^&\s]*&)*id=(\d+)|playlist/(\d+)", "playlist"),
         (r"album\?(?:[^&\s]*&)*id=(\d+)|album/(\d+)", "album"),
@@ -150,6 +199,7 @@ def extract_ncm_target(text: str) -> tuple[str, str] | None:
 
 def extract_kg_target(text: str) -> tuple[str, str] | None:
     """酷狗：返回 (kind, value)，kind ∈ song(hash) / mixsong(id)。"""
+    text = _extract_window(text)
     m = re.search(r"hash[=/]([0-9A-Fa-f]{32})", text) or re.search(r"/song/([0-9A-Fa-f]{32})", text)
     if m:
         return "song", m.group(1).upper()
@@ -161,13 +211,17 @@ def extract_kg_target(text: str) -> tuple[str, str] | None:
 
 def extract_qq_target(text: str) -> tuple[str, str] | None:
     """QQ 音乐：返回 (kind, value)，kind ∈ song(mid) / album(mid) / playlist(id)。"""
+    text = _extract_window(text)
     m = re.search(
-        r"songDetail/([0-9A-Za-z]+)|song/([0-9A-Za-z]+)|playsong\.html\?.*?songmid=([0-9A-Za-z]+)",
+        # 懒扫描必须设上界（ReDoS）：`.*?` 无界时「多处 playsong.html? 且全文无
+        # songmid=」的文本整体 O(n²)，1MB 内可拖住事件循环数百秒（实测平方级）。
+        # songmid 总在 ? 后查询串近处，300 字符窗口足够覆盖真实分享链接
+        r"songDetail/([0-9A-Za-z]+)|song/([0-9A-Za-z]+)|playsong\.html\?[^#\s\"']{0,300}?songmid=([0-9A-Za-z]+)",
         text,
     )
     if m:
         return "song", next(g for g in m.groups() if g)
-    m = re.search(r"album/([0-9A-Za-z]{8,})", text)
+    m = re.search(r"album(?:Detail)?/([0-9A-Za-z]{8,})", text)
     if m:
         return "album", m.group(1)
     m = re.search(r"playlist/(\d+)|disstid=(\d+)", text)
@@ -176,28 +230,17 @@ def extract_qq_target(text: str) -> tuple[str, str] | None:
     return None
 
 
-def _looks_like_share(text: str) -> bool:
-    """能进「冷却 + 解析」流程的最低门槛。
-
-    share.py 的 HINTS 预过滤只认平台名，闲聊里提一句「酷狗」也会命中；冷却章与
-    任何回复都必须盖在确认「这真的是一条分享」之后，否则普通聊天会被回
-    「冷却中」并吞掉事件（stop_event）。判定口径：带链接 /「分享」/《歌名》
-    / 可提取出具体目标 / qqmusic:// 深链。
-    """
-    text = text or ""
-    if "qqmusic://" in text or SHORT_LINK_RE.search(text) or _SHARE_FEATURE_RE.search(text):
-        return True
-    return bool(extract_ncm_target(text) or extract_kg_target(text) or extract_qq_target(text))
-
-
 async def handle_resolve(service, event, text: str) -> bool:
     """解析分享链接/卡片。返回是否已处理。
 
     与点歌共用同一冷却章：连发分享链接会连环触发取流 + 下载 + 发送，必须频控。
     未接管（返回 False）或只回了提示（如短链失败）时退还，不占用接下来的点歌冷却。
     异常兜底在 _resolve_inner 内部，这里不再包一层（原先的外层 except 是死代码）。
+
+    置信度分级：strong（链接/「分享」/深链/可提取目标）才进解析流程；weak
+    （纯《歌名》引用的闲聊）直接放行——不盖冷却、不回复、不吞事件。
     """
-    if not _looks_like_share(text):
+    if _share_strength(text) != "strong":
         return False
     reason = service.check_cooldown(event)
     if reason:
@@ -226,16 +269,21 @@ async def _resolve_inner(service, event, text: str) -> bool:
                         await service.list_to_session(
                             event, f"链接解析 · {pl.get('name') or '网易云歌单'}", songs, source=SOURCE_NCM
                         )
+                        # 只出了列表、未播出任何媒体：退还入口盖的冷却章（对齐 play.py
+                        # 的同款纪律），「分享 → 听1」主流程不被冷却打断
+                        service.release_cooldown(event)
                         return True
                 elif kind == "album":
                     detail = await service.client_of(SOURCE_NCM).album_detail(tid)
                     if detail.get("songs"):
                         await service.list_to_session(
                             event,
-                            f"链接解析 · {detail['album'].get('name') or '专辑'}",
+                            # album 键缺失时不让 KeyError 顶掉本来可用的曲目列表
+                            f"链接解析 · {(detail.get('album') or {}).get('name') or '专辑'}",
                             detail["songs"],
                             source=SOURCE_NCM,
                         )
+                        service.release_cooldown(event)
                         return True
                 else:
                     lst = await service.client_of(SOURCE_NCM).song_detail([tid])
@@ -276,6 +324,7 @@ async def _resolve_inner(service, event, text: str) -> bool:
                     songs = await service.client_of(SOURCE_QQ).album_songs(value)
                     if songs:
                         await service.list_to_session(event, "链接解析 · QQ专辑", songs, source=SOURCE_QQ)
+                        service.release_cooldown(event)
                         return True
                 else:
                     meta, songs = await service.client_of(SOURCE_QQ).songlist_songs(value)
@@ -283,6 +332,7 @@ async def _resolve_inner(service, event, text: str) -> bool:
                         await service.list_to_session(
                             event, f"链接解析 · {meta.get('name') or 'QQ歌单'}", songs, source=SOURCE_QQ
                         )
+                        service.release_cooldown(event)
                         return True
             if "qqmusic://" in text:
                 await service.reply(
@@ -312,9 +362,42 @@ async def _resolve_inner(service, event, text: str) -> bool:
         return False
 
 
-# 认定「这是一条分享/口令」的特征：带链接、「分享」字样或《歌名》引用。
-# 普通聊天里偶然提到「酷狗」「网易云音乐」不该触发关键词点歌兜底。
-_SHARE_FEATURE_RE = re.compile(r"分享|《[^》]+》|https?://", re.IGNORECASE)
+# 认定「这是一条分享/口令」的特征。分两级置信度：
+_STRONG_SHARE_RE = re.compile(r"分享|https?://", re.IGNORECASE)
+_BOOK_TITLE_RE = re.compile(r"《[^》]+》")
+
+
+def _share_strength(text: str) -> str:
+    """「这是一条分享」的置信度分级：strong / weak / ""。
+
+    strong：带链接 / qqmusic:// 深链 /「分享」动词 / 可提取出具体目标（含 JSON
+    卡片）——真实分享或口令，进「冷却 + 解析」流程。
+
+    weak：仅有《歌名》引用（如闲聊「我在酷狗听《晴天》呢」）——**不进流程**：
+    误接管面太大（直接播放 + 盖冷却章 + stop_event 吞掉消息，其他插件失声），
+    而真实分享文本必带链接或「分享」动词；想听《歌名》请用「点歌 歌名」。
+    """
+    text = text or ""
+    if (
+        "qqmusic://" in text
+        or SHORT_LINK_RE.search(text)
+        or _STRONG_SHARE_RE.search(text)
+        or extract_ncm_target(text)
+        or extract_kg_target(text)
+        or extract_qq_target(text)
+    ):
+        return "strong"
+    if _BOOK_TITLE_RE.search(text):
+        return "weak"
+    return ""
+
+
+def _looks_like_share(text: str) -> bool:
+    """文本带任何分享特征（strong 或 weak，见 _share_strength）。
+
+    share.py 的 HINTS 预过滤只认平台名，闲聊里提一句「酷狗」也会命中；这里
+    只做「有分享特征」的粗判，强弱分级由 handle_resolve 按级处置。"""
+    return bool(_share_strength(text))
 
 
 def _keyword_from_share(text: str, source: str) -> str:
@@ -343,20 +426,36 @@ def _keyword_from_share(text: str, source: str) -> str:
 
 
 async def _keyword_fallback(service, event, text: str, source: str) -> bool:
-    """分享文案关键词兜底：首个命中直接播放。
+    """分享文案关键词兜底。
 
     仅对有分享特征（链接 /「分享」/《歌名》）的文本生效，闲聊提及平台名不触发。
-    """
-    if not _SHARE_FEATURE_RE.search(text or ""):
+    纯《歌名》的 weak 文本在 handle_resolve 已被拦下，走不到这里。
+
+    不再无条件播首个结果：残留关键词可能来自噪声剔除后的广告片段（新链接形态/
+    口令变体下首结果可以是毫不相关的歌），盲播既放错歌又占冷却。首个结果歌名
+    与关键词有包含关系才直接播；否则出候选列表让用户「听N」自选。"""
+    if not (_STRONG_SHARE_RE.search(text or "") or _BOOK_TITLE_RE.search(text or "")):
         return False
     kw = _keyword_from_share(text, source)
     if not kw:
         return False
     try:
-        songs, _real = await service.search_songs(kw, source, limit=1)
-    except Exception:  # noqa: BLE001
+        songs, _real = await service.search_songs(kw, source, limit=3)
+    except Exception as e:  # noqa: BLE001 - 兜底失败不让主链路崩，但必须留痕
+        # 原先无日志静默吞掉：分享链接目标失效落到关键词兜底后，搜索再抛
+        # ApiError（如「搜索需要登录 152」）时用户零反馈、日志无痕——
+        # handle_resolve 只看到 False 会退还冷却并当无事发生
+        service.log_warn(f"链接解析关键词兜底搜索失败: {e!r}")
         return False
     if not songs:
         return False
-    await service.play_song(event, songs[0], source_label="链接解析")
+    first = songs[0]
+    kw_norm = re.sub(r"[\s()（）\[\]【】]", "", kw).lower()
+    name_norm = re.sub(r"[\s()（）\[\]【】]", "", first.get("name") or "").lower()
+    if kw_norm and name_norm and (kw_norm in name_norm or name_norm in kw_norm):
+        await service.play_song(event, first, source_label="链接解析")
+        return True
+    await service.list_to_session(event, f"链接解析 · {kw}", songs, source=source)
+    # 只出了列表、未播出任何媒体：退章（对齐歌单/专辑解析出口的同一纪律）
+    service.release_cooldown(event)
     return True

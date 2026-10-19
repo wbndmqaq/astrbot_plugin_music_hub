@@ -106,6 +106,9 @@ def best_match(cands: list[dict], name: str, artist: str) -> dict:
         sa = re.sub(r"[\s/、,，&]", "", (s.get("artist") or "")).lower()
         return (2 if sn == n else (1 if n and n in sn else 0)) * 10 + (2 if a and (a in sa or sa in a) else 0)
 
+    # 空入参防御：公开纯函数，测试/新调用方直接传空列表时 max() 会抛 ValueError
+    if not cands:
+        return {"name": name or "", "artist": artist or ""}
     return max(cands, key=score)
 
 

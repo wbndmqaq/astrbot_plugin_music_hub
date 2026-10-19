@@ -12,6 +12,8 @@ from __future__ import annotations
 import asyncio
 import colorsys
 import time
+from collections import OrderedDict
+from urllib.parse import urlsplit
 
 import aiohttp
 
@@ -76,6 +78,29 @@ _TTL = 600
 _MAX = 128
 _DOWNLOAD_TIMEOUT = aiohttp.ClientTimeout(total=8)
 _MAX_BYTES = 8 * 1024 * 1024
+_MAX_REDIRECTS = 5
+# 解压炸弹阈值：4096×4096，远超任何正常封面分辨率
+_MAX_PIXELS = 4096 * 4096
+
+
+def _public_http_url(url: str) -> bool:
+    """封面 URL 的内网预检：host 字面是回环/私网/链路本地地址时拒绝。
+
+    封面字段来自音源 API / 分享链接解析（半可信第三方，恶意歌单可自定义封面），
+    与 download_audio 是同一威胁模型：裸 IP 直链必须拦，DNS rebinding 残面与
+    download_audio 同口径接受（host 字面校验，不解析 DNS）。"""
+    from .media import _is_internal_host
+
+    if not url.startswith(("http://", "https://")):
+        return False
+    try:
+        hostname = urlsplit(url).hostname
+    except ValueError:
+        # 畸形 URL（如括号不配对的 IPv6 「http://[::1/x.jpg」）urlsplit 直接抛
+        # ValueError——消费方（_fetch_bytes 逐跳预检、cards 构造、render 内联
+        # 兜底）都没有对应兜底面，任一畸形封面就能炸掉整条链路。按「非公网」拒绝
+        return False
+    return not _is_internal_host(hostname)
 
 
 async def palette_for(cover_url: str, session: aiohttp.ClientSession) -> dict | None:
@@ -93,33 +118,53 @@ async def palette_for(cover_url: str, session: aiohttp.ClientSession) -> dict | 
     # shield：单个等待者被取消时不要连带取消共享的 Future，否则其他人也拿不到结果。
     # 清理与写缓存都在 _compute_tracked 内部完成 —— 放调用方 finally 会在取消时二次抛
     # CancelledError，反而掩盖真实异常。
-    return await asyncio.shield(fut)
+    try:
+        return await asyncio.shield(fut)
+    except asyncio.CancelledError:
+        # close()（插件重载）取消共享 Future 时，所有等待者都会收到 CancelledError：
+        # 它是 BaseException，穿出去会崩掉与关闭无关的渲染路径（render 的
+        # except Exception 接不住）。等待者自身被取消时不吞——共享 Future 仍
+        # pending（shield 保护着），据 done()/cancelled() 区分两种来源
+        if fut.done() and fut.cancelled():
+            return None
+        raise
 
 
 async def close() -> None:
-    """取消在途取色任务（插件重载/停用时调用）。
+    """取消在途取色/内联任务（插件重载/停用时调用）。
 
-    在途任务挂在模块级 _INFLIGHT 上、不经 service.spawn，terminate 拿不到引用；
-    不取消的话旧任务会拿着已关闭的 aiohttp 会话继续跑（异常被吞、无害但白耗）。
+    在途任务挂在模块级 _INFLIGHT/_URI_INFLIGHT 上、不经 service.spawn，
+    terminate 拿不到引用；不取消的话旧任务会拿着已关闭的 aiohttp 会话继续跑
+    （异常被吞、无害但白耗）。
     """
     async with _LOCK:
-        tasks = [f for f in _INFLIGHT.values() if isinstance(f, asyncio.Task) and not f.done()]
+        futs = [
+            f
+            for f in (*_INFLIGHT.values(), *_URI_INFLIGHT.values())
+            if isinstance(f, asyncio.Task) and not f.done()
+        ]
         _INFLIGHT.clear()
-    for task in tasks:
+        _URI_INFLIGHT.clear()
+    for task in futs:
         task.cancel()
-    if tasks:
-        await asyncio.gather(*tasks, return_exceptions=True)
+    if futs:
+        await asyncio.gather(*futs, return_exceptions=True)
 
 
 async def _compute_tracked(url: str, session: aiohttp.ClientSession) -> dict | None:
-    """执行取色并负责 in-flight 登记的清理与结果缓存。"""
+    """执行取色并负责 in-flight 登记的清理与结果缓存。
+
+    None（下载失败/非图片）不写缓存：瞬时网络抖动不该让主题色回退品牌默认色
+    整整一个 TTL 窗口（对齐 _compute_cover_uri 的「失败不缓存」策略）；
+    in-flight 合并仍保留，同 URL 的并发调用只算一次。"""
     try:
         palette = await _compute(url, session)
-        async with _LOCK:
-            if len(_CACHE) >= _MAX:
-                for k in sorted(_CACHE, key=lambda k: _CACHE[k][0])[: len(_CACHE) - _MAX + 1]:
-                    _CACHE.pop(k, None)
-            _CACHE[url] = (time.time(), palette)
+        if palette is not None:
+            async with _LOCK:
+                if len(_CACHE) >= _MAX:
+                    for k in sorted(_CACHE, key=lambda k: _CACHE[k][0])[: len(_CACHE) - _MAX + 1]:
+                        _CACHE.pop(k, None)
+                _CACHE[url] = (time.time(), palette)
         return palette
     finally:
         # 失败也要清：否则这个 URL 会永远命中同一个已异常的 Future
@@ -130,16 +175,128 @@ async def _compute_tracked(url: str, session: aiohttp.ClientSession) -> dict | N
 
 async def _compute(url: str, session: aiohttp.ClientSession) -> dict | None:
     try:
-        async with session.get(url, timeout=_DOWNLOAD_TIMEOUT) as resp:
-            if resp.status != 200:
-                return None
-            # 先限长再读：全量 resp.read() 要把整张图拉进内存才能判超限
-            raw = await resp.content.read(_MAX_BYTES + 1)
-        if not raw or len(raw) > _MAX_BYTES:
+        raw = await _fetch_bytes(url, session)
+        if not raw:
             return None
     except Exception:  # noqa: BLE001 — 封面下载失败只回退品牌色
         return None
     return await asyncio.to_thread(_palette_from_bytes, raw)
+
+
+async def _fetch_bytes(url: str, session: aiohttp.ClientSession) -> bytes:
+    """带逐跳内网复检的封面下载：手动跟随重定向（每跳过 _public_http_url），
+    响应体循环 readany 读到 EOF、超限即断。取色与渲染内联（cover_data_uri）共用。
+
+    aiohttp 默认自动跟随（最多 10 跳），跳数不归我们管时首跳预检挡不住
+    「公网封面 URL 302 到内网」的绕行——渲染通道的 Chromium 同样自动跟随，
+    唯有插件自己代理下载才能把复检落到每一跳。失败返回空 bytes。"""
+    current = url
+    for _ in range(_MAX_REDIRECTS + 1):
+        if not _public_http_url(current):
+            return b""
+        try:
+            async with session.get(current, timeout=_DOWNLOAD_TIMEOUT, allow_redirects=False) as resp:
+                if resp.status in (301, 302, 303, 307, 308):
+                    loc = resp.headers.get("Location", "")
+                    if not loc:
+                        return b""
+                    current = str(resp.url.join(loc))
+                    continue
+                if resp.status != 200:
+                    return b""
+                # read(n) 缓冲区一有数据就返回（不凑满 n），大图会被截断；
+                # 循环 readany 读到 EOF，超限即断（不把整张大图拉进内存）
+                chunks: list[bytes] = []
+                got = 0
+                while True:
+                    chunk = await resp.content.readany()
+                    if not chunk:
+                        break
+                    got += len(chunk)
+                    if got > _MAX_BYTES:
+                        return b""
+                    chunks.append(chunk)
+                return b"".join(chunks)
+        except Exception:  # noqa: BLE001 — 网络失败按「无封面」处理
+            return b""
+    return b""
+
+
+# 渲染内联（data URI）缓存：与取色缓存同 TTL，条目与单图字节双上限（base64 后
+# 膨胀 1.33 倍，正常封面 ~200KB；32 张 × 2MB × 1.33 ≈ 85MB 是硬上限的最坏值，
+# 正常远低于此）。in-flight 合并与取色路径同款：多群并发渲染同一张未命中封面
+# 只发一次下载，不各自完整拉一遍
+_URI_CACHE: OrderedDict[str, tuple[float, str]] = OrderedDict()
+_URI_INFLIGHT: dict[str, asyncio.Future] = {}
+_URI_TTL = 600
+_URI_MAX = 32
+_URI_MAX_BYTES = 2 * 1024 * 1024
+
+
+async def _cover_uri_tracked(url: str, session: aiohttp.ClientSession) -> str:
+    """执行封面内联下载并负责 in-flight 登记的清理与结果缓存。"""
+    try:
+        uri = await _compute_cover_uri(url, session)
+        if uri:
+            async with _LOCK:
+                while len(_URI_CACHE) >= _URI_MAX:
+                    _URI_CACHE.popitem(last=False)
+                _URI_CACHE[url] = (time.time(), uri)
+        return uri
+    finally:
+        # 失败也要清：否则这个 URL 会永远命中同一个已异常的 Future
+        async with _LOCK:
+            if _URI_INFLIGHT.get(url) is asyncio.current_task():
+                _URI_INFLIGHT.pop(url, None)
+
+
+async def _compute_cover_uri(url: str, session: aiohttp.ClientSession) -> str:
+    raw = await _fetch_bytes(url, session)
+    if not raw or len(raw) > _URI_MAX_BYTES:
+        # 失败/超限不缓存：瞬时网络抖动不该让封面缺席整个 TTL 窗口
+        return ""
+    mime = ""
+    if raw[:8] == b"\x89PNG\r\n\x1a\n":
+        mime = "image/png"
+    elif raw[:2] == b"\xff\xd8":
+        mime = "image/jpeg"
+    elif raw[:4] == b"GIF8":
+        mime = "image/gif"
+    elif raw[:4] == b"RIFF" and raw[8:12] == b"WEBP":
+        mime = "image/webp"
+    if not mime:
+        # 非图片（上游把 HTML 错误页当 200 返回等）：内联进 data URI 只会渲染出
+        # 破图，按失败处理
+        return ""
+    import base64
+
+    return f"data:{mime};base64," + base64.b64encode(raw).decode("ascii")
+
+
+async def cover_data_uri(url: str, session: aiohttp.ClientSession) -> str:
+    """封面 → ``data:image/...;base64`` URI（带缓存），失败返回空串。
+
+    供渲染层把卡片里的图片 URL 内联：Chromium 对 ``<img src>``/hero 背景自动
+    跟随重定向，公网封面 302 到内网可绕过构造层的字面预检。内联后 Chromium
+    对封面零网络请求，渲染通道与下载/取色通道的威胁模型对齐。"""
+    if not url or not url.startswith(("http://", "https://")):
+        return ""
+    async with _LOCK:
+        hit = _URI_CACHE.get(url)
+        if hit is not None and time.time() - hit[0] < _URI_TTL:
+            _URI_CACHE.move_to_end(url)
+            return hit[1]
+        fut = _URI_INFLIGHT.get(url)
+        if fut is None:
+            fut = asyncio.ensure_future(_cover_uri_tracked(url, session))
+            _URI_INFLIGHT[url] = fut
+    # shield 语义与 palette_for 相同：单个等待者被取消不连带取消共享 Future
+    try:
+        return await asyncio.shield(fut)
+    except asyncio.CancelledError:
+        if fut.done() and fut.cancelled():
+            return ""
+        raise
 
 
 def _palette_from_bytes(raw: bytes) -> dict | None:
@@ -149,7 +306,13 @@ def _palette_from_bytes(raw: bytes) -> dict | None:
 
         from PIL import Image
 
-        im = Image.open(io.BytesIO(raw)).convert("RGB")
+        im = Image.open(io.BytesIO(raw))
+        # 解压炸弹预检：8MB PNG 可声明上亿像素，convert("RGB") 会真实分配约
+        # 3 字节/像素（最大 ~500MB），且每个封面 URL 各触发一次。Pillow 默认
+        # MAX_IMAGE_PIXELS 在 1~2 倍区间只告警不拦截，这里按尺寸硬拒
+        if im.width * im.height > _MAX_PIXELS:
+            return None
+        im = im.convert("RGB")
         im = im.resize((48, 48))
         q = im.quantize(colors=6)
         pal = q.getpalette() or []

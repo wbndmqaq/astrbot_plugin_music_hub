@@ -11,9 +11,9 @@ AstrBot 聚合点歌插件：QQ / 酷狗 / 网易云三平台搜歌、点歌、�
 - **歌曲扩展**：`评论`（`评论下页` 看最新，网易云/QQ）、`专辑评论` / `歌单评论`、`相似`、`相似歌单`（网易云）、`MV搜 关键词`、`高潮` / `版本`（酷狗/QQ）、`AI推荐`（酷狗）
 - **发现**：排行榜、新歌、歌手/专辑/歌单、热搜、日推、FM、MV 等浏览类指令，三平台各有特色入口，完整清单见下方指令表
 - **账号**：`喜欢`（红心列表）、`红心` / `取消红心` 当前歌曲、`关注列表`、`听歌排行`、`我的歌单`、`云盘`、`已购`（酷狗）、`最近在听`、`历史`
-- **订阅推送**：`订阅 日推`、`订阅新歌 歌手名`（自动关注酷狗歌手），每天定时推送到群；`退订 日推` / `退订新歌 歌手名`，`我的订阅` 查看全部（订阅指令均为管理员权限）
+- **订阅推送**：`订阅 日推`、`订阅新歌 歌手名`（自动关注酷狗歌手），每天定时推送到群；`退订 日推` / `退订新歌 歌手名` 为管理员指令，`我的订阅` 全员可用（查看当前会话的订阅）
 - **登录**：`ncm登录 / kg登录 / qq登录` 或 WebUI 扫码，凭证自动保存；QQ 凭证每日保活，网易云每日签到
-- **发送**：语音 + 群文件双通道，OneBot base64 直发，失败自动 ffmpeg 压缩重试；OneBot 平台可发原生音乐卡片
+- **发送**：语音 + 群文件双通道，OneBot base64 直发，OneBot 文件通道超 5MB 自动发 ffmpeg 压缩版（失败亦有压缩重试兜底）；OneBot 平台可发原生音乐卡片
 - **链接解析**：三平台分享链接和 JSON 音乐卡片自动识别点歌
 - **LLM 工具**：注册 `music_hub_play` / `music_hub_lyric` / `music_hub_search` 三个函数工具（同样受总开关/黑白名单/冷却约束），开了函数调用的会话里直接说"来首晴天"就能点歌
 - **管理**：黑白名单、点歌冷却、音源限速、调用统计、`音质 <档位>` 设置最高音质、`开启/关闭 点歌|解析|卡片|语音|文件` 临时开关
@@ -47,14 +47,18 @@ QQ 音乐走插件依赖内置库，不需要任何外部服务。网易云与�
   注意：酷狗已限制匿名搜索（上游错误码 152），服务启动后请执行 `kg登录` 扫码，再正常使用。
   
 
-- **群公开API** —— 群已配置公益API：[QQ群](https://qm.qq.com/q/8sOZdZTnaw)
-  , 群里API公开地装时在配置面板填好A勿高频调用。插件已内置每源 250ms 请求间隔限速（`rateLimitMs`），请勿调低。
-> 网易云 APII 以 query 参数传递 Cookie，插件日志已做脱敏处理；自行排查时不要把配置文件外发。
+- **群公开 API** —— 社群提供的公益 API：[QQ 群](https://qm.qq.com/q/8sOZdZTnaw)
+  进群获取公共实例地址，在配置面板填入即可使用；公共实例请勿高频调用。插件已内置每源 250ms 请求间隔限速（`rateLimitMs`），请勿调低。
+> 网易云 API 以 query 参数传递 Cookie，插件日志已做脱敏处理；自行排查时不要把配置文件外发。
 
 ## WebUI
 
 默认 `http://127.0.0.1:17818`（仅本机访问），密码在插件配置 `webui.password`（留空则首次启动随机生成）。
-需要局域网其他设备访问时把 `webui.host` 改为 `0.0.0.0`；用域名访问需在 `webui.hostAllowlist` 登记（面板有严格的 Host 白名单校验，未登记的域名会被拒绝）。
+需要局域网其他设备访问时把 `webui.host` 改为 `0.0.0.0`；用域名访问需在 `webui.hostAllowlist` 登记完整主机名（精确匹配，不含子域名；面板有严格的 Host 白名单校验，未登记的域名会被拒绝）。
+
+**安全提示**：面板仅支持 HTTP 直连（未做 TLS / 反向代理适配，https 反代下写请求会被 Origin 校验拒绝）。登录密码、面板内容与平台凭证都以明文传输——请勿把面板端口暴露到不可信网络，远程使用建议走 SSH 隧道或 VPN；经 https 反代访问时可开启 `webui.secureCookie` 让会话 Cookie 仅经加密连接发送（开启后响应自动附带 HSTS）。另请注意：插件配置文件（`data/config/astrbot_plugin_music_hub_config.json`）里**明文**保存着面板密码与三平台的登录 Cookie，请确保宿主机磁盘与备份的访问权限，任何能读到该文件的进程/人都等价于拿到全部凭证。
+
+**反代 / NAT 部署**：面板推荐直连（默认只听 `127.0.0.1`，远程经 SSH 隧道访问）。经反向代理或 NAT 暴露面板时，所有访问者在面板看来共享代理的同一个来源 IP——5 次登录失败会把这个 IP 上的全部管理员锁在门外，`MAX_SESSIONS_PER_IP` 的会话上限也会互相挤占。此时需在插件配置 `webui.trustedProxy` 填写代理的 IP 或 CIDR 段（多个用逗号分隔），且反代必须设置 `X-Forwarded-For` 头，面板才会按转发头里的真实客户端 IP 做登录限速、会话上限与来源 IP 告警；留空表示面板直连，`X-Forwarded-For` 一律忽略（该头客户端可伪造，直连场景采信它等于限速失效）。`webui.secureCookie` 需与 https 部署配合开启。
 
 功能：多音源搜索（单曲/歌单/专辑/歌手分栏，可试听、可投递到指定群）、扫码登录、调用统计（含失败原因聚合）、黑白名单、全量配置编辑、链接解析、运行日志。
 
@@ -117,28 +121,40 @@ astrbot_plugin_music_hub/
 | `热搜` / `来首歌` / `搜索建议 X` / `日推` / `历史日推` / `FM` / `新碟 [地区]` / `歌手榜` | 更多发现 |
 | `MV榜 / 电台 / 热门歌手 / banner`（网易云）、`排行推荐 / 编辑精选 / 乐库 / 主题歌单 / 好歌精选`（酷狗）、`歌手MV / 相似歌手 / 猜你喜欢`（QQ） | 音源特色 |
 | `歌单推荐 [分类]` / `相关歌单 X` / `精品歌单 [分类]` / `歌单分类` | 歌单发现 |
-| `订阅 日推` / `订阅新歌 歌手名` / `退订 日推 / 退订新歌 歌手名` / `我的订阅` | 订阅推送管理（管理员） |
+| `订阅 日推` / `订阅新歌 歌手名` / `退订 日推 / 退订新歌 歌手名` | 订阅推送管理（管理员） |
+| `我的订阅` | 查看当前会话的订阅（全员） |
 | `排队 关键词` / `队列` / `切歌` / `清空队列` | 点歌台队列（切歌/清空为管理员） |
 | `ncm登录 / kg登录 / qq登录` | 扫码登录（管理员） |
 | `状态` / `ncm登出` 等 | 登录状态 / 退出（管理员） |
 | `帮助` | 本帮助（全员） |
-| `设置` / `音质 <档位>` / `统计` / `测试` / `WebUI` | 系统管理（管理员） |
+| `设置` / `音质 <档位>` / `统计` / `测试` / `WebUI` / `ncm api 地址` / `开启 / 关闭 功能` | 系统管理（管理员） |
 
-所有指令支持 `#` 前缀（如 `#点歌 晴天`）。
+所有指令支持 `#` 前缀（全角 `＃` 亦可，如 `＃点歌 晴天`）。常用指令另有多个等价
+别名：`点歌` = `音乐` / `music` / `mh`，`换源` = `音源`，`切歌` = `跳过` / `下一首`，
+`队列` = `播放队列` / `播放列表` / `点歌台`，`登出` = `注销` / `解绑`，`MV搜` = `搜MV`，
+`来首歌` = `随机` / `来一首` / `放一首`；翻页类均有 `XX上一页`。完整别名清单
+以各 handler 的路由正则为准。
+
+> 注：账号数据类指令（红心列表 / 听歌排行 / 我的歌单 / 云盘 / 已购 / 最近在听 /
+> 关注列表 / 红心 / 取消红心）与账号个性化内容（每日推荐 / 私人电台 / 历史日推）
+> 均为**管理员限定**——它们浏览或操作的是扫码登录账号的数据。
+> 「历史 / 队列 / 随机 / 菜单 / 音乐 / 播放」等裸词已被本插件注册为指令，同群
+> 其他插件无法再响应这些单词。
 
 ## 配置（节选）
 
 | 配置 | 默认 | 说明 |
 |---|---|---|
 | `defaultSource` | `auto` | 不带前缀点歌的默认音源；auto = 三平台混搜 |
-| `ncm.apiBase` | `http://120.26.120.184:3000` | 网易云 API 服务地址，留空停用网易云音源 |
-| `kg.apiBase` | `http://127.0.0.1:4000` | 酷狗 API 服务地址，留空停用酷狗音源 |
+| `ncm.apiBase` | 留空（停用） | 网易云 API 服务地址，填入 api-enhanced 服务地址后启用 |
+| `kg.apiBase` | 留空（停用） | 酷狗 API 服务地址，填入 KuGouMusicApi 服务地址后启用 |
 | `*.quality` | `auto` | 各音源最高音质，取不到自动降级 |
 | `ncm.qualityUnblock` | true | VIP 歌 unblock 解灰兜底 |
 | `sendVocal` / `uploadFile` | true | 语音 / 文件双通道 |
 | `ffmpegCompress` | true | OneBot 文件通道 >5MB 文件直接发压缩版（并非失败后才重试；需系统 ffmpeg） |
 | `compressBitrate` | 128 | 压缩版 mp3 的码率（kbps），与语音压制共用 |
-| `rateLimitMs` | 250 | 音源请求最小间隔，0 = 关闭。**改完需重载插件**（限速器是模块级单例，只在启动时按配置初始化） |
+| `rateLimitMs` | 250 | 音源请求最小间隔，0 = 关闭。任何入口修改均即时生效（限速器每次现读配置） |
+| `apiTimeoutSec` | 20 | 音源请求超时（秒，5-120），弱网或自建上游响应慢时调大，修改即时生效 |
 | `acl.mode` | `off` | 黑白名单模式（WebUI 可视化管理） |
 | `stats.enable` | true | 调用统计开关，关掉后不记录天/音源/动作计数，`统计` 指令与 WebUI 图表无数据 |
 | `webui.host` | `127.0.0.1` | 面板监听地址，局域网访问改 `0.0.0.0` |
@@ -146,14 +162,18 @@ astrbot_plugin_music_hub/
 
 完整配置在 WebUI「插件配置」页编辑。
 
+> 安全提示：ncm / kg 的登录 Cookie 会随每个请求以 URL query 传给你填的 API 服务
+> （上游接口设计如此），服务端访问日志会记录完整 URL——**公益/第三方实例的运营者
+> 等于长期持有你的登录态**，敏感账号建议自建实例或经 HTTPS 反代访问。
+
 ## 平台支持
 
-| 能力 | aiocqhttp | QQ官方 | Telegram | Kook/Discord | 微信个人 | 飞书 | 钉钉 |
-|---|---|---|---|---|---|---|---|
-| 文本/卡片 | 是 | 是 | 是 | 是 | 是 | 是 | 是（图片仅 http 链接） |
-| 语音 | 是 | 是 (silk) | 是 | 是 | 否 | 否 | 否 |
-| 群文件 | 是 | 是（>10MB 分片） | 是 | 是 | 是 | 否 | 否 |
-| 原生音乐卡 | 是 | 否 | 否 | 否 | 否 | 否 | 否 |
+| 能力 | aiocqhttp | QQ官方 | Telegram | Kook/Discord | 微信个人 | 飞书 | 钉钉 | Satori | WebChat |
+|---|---|---|---|---|---|---|---|---|---|
+| 文本/卡片 | 是 | 是 | 是 | 是 | 是 | 是 | 是（图片仅 http 链接） | 是 | 是 |
+| 语音 | 是 | 是 (silk) | 是 | 是 | 否 | 否 | 否 | 是 | 否 |
+| 群文件 | 是 | 是（>10MB 分片） | 是 | 是 | 是 | 否 | 否 | 否 | 否 |
+| 原生音乐卡 | 是 | 否 | 否 | 否 | 否 | 否 | 否 | 否 | 否 |
 
 钉钉等不支持本地图片/语音的平台，列表卡片自动回退纯文本，歌曲以直链文本投递。
 不支持语音的平台（微信个人、钉钉）走群文件通道投递；语音与文件都不支持的（飞书）只发文本提示；文件通道也关闭时同样只发文本提示。
@@ -162,9 +182,10 @@ astrbot_plugin_music_hub/
 ## 致谢
 
 - QQ 音乐接口：[qqmusic-api-python](https://github.com/L-1124/QQMusicApi)（GPLv3）
-- 酷狗接口：自部署 [KuGouMusicApi](https://github.com/MakcRe/KuGouMusicApi)（
-- 网易云接口署 [NeteaseCloudMusicApiEnhanced](https://github.com/neteaudmusicapienhanced/api-enhanced)(MIT)
-）   [KuG uNeteaseCloudMusicApiEnhanced](https://github.com/neteasecloudmusicapienhanced/api-enhanced)
+- 酷狗接口：自部署 [KuGouMusicApi](https://github.com/MakcRe/KuGouMusicApi)
+- 网易云接口：自部署 [api-enhanced（NeteaseCloudMusicApiEnhanced）](https://github.com/NeteaseCloudMusicApiEnhanced/api-enhanced)（MIT，基于 Binaryify/NeteaseCloudMusicApi 增强重构）
+
+灵感来源与实现参考以上项目，感谢上游作者的贡献。
 
 
 
@@ -175,3 +196,5 @@ astrbot_plugin_music_hub/
 MIT，见 [LICENSE](LICENSE)。依赖的 qqmusic-api-python 为 GPLv3。
 
 [qqmusic-api-python](https://github.com/L-1124/QQMusicApi)
+
+[![Architecture diagram of wbndmqaq/astrbot_plugin_music_hub](https://gitdiagram.com/wbndmqaq/astrbot_plugin_music_hub/diagram.png)](https://gitdiagram.com/wbndmqaq/astrbot_plugin_music_hub?utm_source=readme&utm_medium=picture)

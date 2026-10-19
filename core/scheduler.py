@@ -34,6 +34,10 @@ class Scheduler:
         self._last_run_date: str = ""
         self._minute_date: str = ""
         self._minute: int = 0
+        # 失败冷却只存内存（monotonic）：重载即清零，失败日恰逢重载会多发一轮
+        # 占位请求。不落盘是有意取舍——每日任务自身有当日去重兜底（签到/推送
+        # 各自记 seen），重复的只是一轮「获取失败」占位与探测请求，不值得为此
+        # 加 KV 读写和 wall-clock 换算
         self._retry_after: float = 0.0
 
     async def start(self) -> None:
@@ -47,9 +51,19 @@ class Scheduler:
         if self._task:
             self._task.cancel()
             try:
-                await self._task
+                await asyncio.shield(self._task)
             except asyncio.CancelledError:
-                pass
+                # 两种取消源要区分：循环任务吸收自己的 cancel 是常规收尾路径
+                # （shield 因内层任务取消而抛），吞掉让 stop 正常返回；shield
+                # 被外层取消（terminate 被撤）打破时子任务可能还没退出，等它
+                # 收尾再把取消上抛——吞掉外层取消会让 terminate 清理链脱节
+                if not self._task.done():
+                    try:
+                        await self._task
+                    except asyncio.CancelledError:
+                        pass
+                    self._task = None
+                    raise
             self._task = None
 
     def _target_time(self, now: datetime.datetime) -> datetime.datetime:

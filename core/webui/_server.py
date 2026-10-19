@@ -29,8 +29,7 @@ PUBLIC_PATHS = {
     "/webui/style.css",
     "/webui/app.js",
     "/webui/theme-boot.js",
-    "/webui/logo.png",
-    "/webui/logos/ncm.svg",
+    "/webui/favicon.svg",
     "/webui/logos/ncm.png",
     "/webui/logos/kg.png",
     "/webui/logos/qq.png",
@@ -58,7 +57,9 @@ class WebUIServer:
         self.config = service.config
         self.log = service.log
         self.dir = Path(__file__).resolve().parent.parent.parent / "webui"
-        self.auth = AuthManager(service.data_dir, lambda: self.config.webui_password)
+        # AuthManager 惰性到 start()：密钥文件读写与 Windows icacls（最坏 5s 子进程）
+        # 都是同步阻塞，放线程池执行，不在事件循环里冷启动卡住 AstrBot 全部协程
+        self.auth: AuthManager | None = None
         self._runner: web.AppRunner | None = None
         self.host = self.config.webui_host
         self.port = self.config.webui_port
@@ -66,6 +67,12 @@ class WebUIServer:
         self._song_cache: OrderedDict[str, tuple[float, dict]] = OrderedDict()
         # 静态资源缓存：fname → (mtime, body, etag)
         self._file_cache: dict[str, tuple[float, bytes, str]] = {}
+        # 并发连接闸（conn_limit_mw 用）：面板是单管理员工具，64 个在途请求远超
+        # 任何真实用法；超限 503 快速拒绝而非排队。必须是普通计数而非
+        # asyncio.Semaphore——acquire 耗尽时排队无限挂起，慢速 POST（headers 收完
+        # 后滴漏 body）每连接钉死一槽即可让面板所有请求永久等待
+        self._conn_max = 64
+        self._conn_active = 0
 
     # ──────────── 歌曲缓存 ────────────
     def cache_song(self, song: dict) -> None:
@@ -130,10 +137,17 @@ class WebUIServer:
         if "@" in h:
             h = h.rsplit("@", 1)[1]
         if h.startswith("["):  # IPv6 字面量（[::1]:17818）
+            if "]" not in h:
+                # 畸形 IPv6（"[::1"）：静默截断会把 "::" 当合法主机名放行
+                return False
             netloc = h[1 : h.find("]")].lower()
         else:
             netloc = h.split(":", 1)[0].lower()
-        if not netloc or netloc == "localhost":
+        if not netloc:
+            # ":8080" / "::"（非方括号）这类空主机名形态：字面严格性要求拒绝
+            # （可利用面为零，但放行与白名单声明不符）
+            return False
+        if netloc == "localhost":
             return True
         try:
             ipaddress.ip_address(netloc)
@@ -141,22 +155,35 @@ class WebUIServer:
         except ValueError:
             pass
         allowed = self.config.webui_host_allowlist
-        return any(netloc == d or netloc.endswith("." + d) for d in allowed)
+        # 精确匹配不做子域放行：登记宽泛域名（如裸注册域）会把面板暴露面
+        # 扩大到其全部子域，多级子域/仿冒主机名都会被连带放行
+        return netloc in allowed
 
     def _origin_ok(self, origin: str, host: str) -> bool:
-        """Origin 必须与 Host 完全一致：scheme + hostname + port 三者全等。
+        """Origin 必须与 Host 同源：hostname 必须全等，scheme/port 按部署形态比对。
 
         只比 hostname 会被端口差异绕过 —— SameSite 的同站点判定同样忽略端口，
         `localhost:3000` 与 `localhost:17818` 互为同站点，Lax cookie 照常携带，
         本机任意 web 服务都能发起带凭据的写请求（改 apiBase 即等于外泄平台 cookie）。
         用 urlparse 而非 split(":"):0 以正确剥离 IPv6 方括号。
+
+        https 反代部署下浏览器的 Origin 是 https://，而 Host 头是反代原样透传的
+        内网形态（http://127.0.0.1:17818）——scheme 严格比对会让所有 POST 必 403，
+        把管理员推回 http 直连。故 secureCookie 开启（部署形态即 https）或登记了
+        trustedProxy 时对 https 的 Origin 放行。放宽是安全的：CSRF 威胁模型里
+        Origin 头由浏览器背书不可伪造，hostname 全等已挡住跨站；非浏览器工具
+        本可同时伪造 Origin 与 Host，scheme 比对对它不构成额外成本。
         """
         try:
             o = urlparse(origin)
             h = urlparse(f"http://{host or ''}")
             if not o.hostname or not h.hostname:
                 return False
-            if o.scheme != h.scheme or o.hostname.lower() != h.hostname.lower():
+            if o.hostname.lower() != h.hostname.lower():
+                return False
+            if o.scheme == "https" and (self.config.webui_secure_cookie or self.config.webui_trusted_proxy):
+                return True
+            if o.scheme != h.scheme:
                 return False
             # 无显式端口时按 scheme 取默认端口，http/https 混用也要挡住
             o_port = o.port or (443 if o.scheme == "https" else 80)
@@ -167,7 +194,10 @@ class WebUIServer:
 
     def _authed(self, request: web.Request) -> bool:
         token = request.cookies.get(COOKIE_NAME, "")
-        payload = self.auth.verify(token)
+        # 会话归属与 IP 变化告警用登录限速的同一来源口径（见 _auth.client_ip）：
+        # 反代下不一致会让告警比对「代理 IP vs 真实客户端 IP」永远失配
+        ip = self.auth.client_ip(request.remote or "", request.headers.get("X-Forwarded-For", ""))
+        payload = self.auth.verify(token, ip)
         if payload:
             request["jti"] = payload.get("jti", "")
             request["user"] = payload.get("sub", "")
@@ -186,6 +216,26 @@ class WebUIServer:
             self.log.error(f"[music_hub] WebUI 请求异常：\n{tb}")
             return _json({"error": "服务器内部错误"}, 500)
 
+    def _apply_security_headers(self, resp: web.Response) -> None:
+        """统一注入安全头。三条响应路径共用：常规路由、HTTPException 兜底渲染、
+        conn_limit 的 503 快速拒绝（最外层中间件的响应不经过 security_headers_mw，
+        不补头就会裸奔——漏 nosniff/XFO 且暴露 aiohttp 默认 Server 指纹）。"""
+        # secureCookie 只在 https 部署下开启：此时补 HSTS 让浏览器首次响应后
+        # 强制走 https（http 直连严禁下发——浏览器会把后续 http 访问硬升级，
+        # 面板直接打不开）。逐请求读取：改配置重载插件重建 app 前后口径一致
+        resp.headers.setdefault("X-Content-Type-Options", "nosniff")
+        resp.headers.setdefault("X-Frame-Options", "DENY")
+        resp.headers.setdefault("Referrer-Policy", "no-referrer")
+        # JSON/静态资源禁止被任意站点以 <img>/<script> 跨站嵌入探测
+        resp.headers.setdefault("Cross-Origin-Resource-Policy", "same-origin")
+        # 单管理员工具的纵深：隔离 window.opener 引用（v3 实测表曾误列 COOP，
+        # 实际此前从未下发——现为真实启用）
+        resp.headers.setdefault("Cross-Origin-Opener-Policy", "same-origin")
+        # 覆盖 aiohttp 默认的 "Python/x aiohttp/y"：版本指纹对定向攻击是免费情报
+        resp.headers.setdefault("Server", "MusicHub")
+        if bool(self.config.webui_secure_cookie):
+            resp.headers.setdefault("Strict-Transport-Security", "max-age=31536000")
+
     # ──────────── 应用 ────────────
     def _build_app(self) -> web.Application:
         @web.middleware
@@ -197,27 +247,49 @@ class WebUIServer:
             return await self._handle_errors(request, handler)
 
         @web.middleware
+        async def conn_limit_mw(request, handler):
+            # 并发连接上限：改监听地址到非回环后，慢速连接（慢速读/慢速 POST）
+            # 可以低成本占满协议端的连接槽。默认 127.0.0.1 时攻击者需先在本机，
+            # 该限制是纵深而非主防线——超限快速 503，绝不排队（检查与自增之间无
+            # await，事件循环单线程模型下没有竞态）
+            if self._conn_active >= self._conn_max:
+                resp = _json({"error": "服务器繁忙，请稍后重试"}, 503)
+                self._apply_security_headers(resp)
+                return resp
+            self._conn_active += 1
+            try:
+                return await handler(request)
+            finally:
+                self._conn_active -= 1
+
+        @web.middleware
         async def security_headers_mw(request, handler):
             # 统一注入：原先安全头只挂在 _file 上，所有 /api/* JSON 响应都没有，
             # 新增路由很容易漏挂
-            resp = await handler(request)
-            resp.headers.setdefault("X-Content-Type-Options", "nosniff")
-            resp.headers.setdefault("X-Frame-Options", "DENY")
-            resp.headers.setdefault("Referrer-Policy", "no-referrer")
+            try:
+                resp = await handler(request)
+            except web.HTTPException as e:
+                # 路由层抛出的 404/405 由 aiohttp 兜底渲染，不补头就会裸奔
+                # （无 nosniff/DENY）；HTTPException 本身是 Response，直接改头再抛
+                self._apply_security_headers(e)
+                raise
+            self._apply_security_headers(resp)
             return resp
 
         # client_max_size 显式钉在与 aiohttp 默认一致的 1MB：body_json 的 413 语义、
         # /api/resolve 的文本量级都建立在这条契约上，隐式依赖默认值容易被无意改掉
-        app = web.Application(middlewares=[security_headers_mw, errors_mw, guard_mw], client_max_size=1024**2)
+        # 中间件顺序：conn_limit 最外层（超限请求不进后续任何处理）
+        app = web.Application(
+            middlewares=[conn_limit_mw, security_headers_mw, errors_mw, guard_mw], client_max_size=1024**2
+        )
         r = app.router
         # 静态
         r.add_get("/", self._index)
         r.add_get("/webui/style.css", self._static("style.css", "text/css"))
         r.add_get("/webui/app.js", self._static("app.js", "application/javascript"))
         r.add_get("/webui/theme-boot.js", self._static("theme-boot.js", "application/javascript"))
-        r.add_get("/webui/logo.png", self._static("logo.png", "image/png"))
+        r.add_get("/webui/favicon.svg", self._static("favicon.svg", "image/svg+xml"))
         # 三平台官方标识（侧边栏 / 音源标签用）
-        r.add_get("/webui/logos/ncm.svg", self._static("logos/ncm.svg", "image/svg+xml"))
         for _name in ("ncm", "kg", "qq"):
             r.add_get(f"/webui/logos/{_name}.png", self._static(f"logos/{_name}.png", "image/png"))
         # 元信息 / 认证
@@ -259,9 +331,22 @@ class WebUIServer:
         r.add_get("/api/logs", _api.make_logs(self))
         return app
 
+    async def _ensure_auth(self) -> None:
+        if self.auth is None:
+            self.auth = await asyncio.to_thread(
+                AuthManager,
+                self.service.data_dir,
+                lambda: self.config.webui_password,
+                # 来源 IP 解析的可信反代配置：惰性读取，改配置无需重建 AuthManager
+                lambda: self.config.webui_trusted_proxy,
+                # 会话有效期（webui.sessionHours）：同上惰性读取，改完对后续登录生效
+                lambda: self.config.webui_session_hours,
+            )
+
     async def start(self) -> None:
         if self._runner is not None:
             return
+        await self._ensure_auth()
         app = self._build_app()
         self._runner = web.AppRunner(
             app, access_log=None, shutdown_timeout=SHUTDOWN_TIMEOUT, keepalive_timeout=15
@@ -333,12 +418,15 @@ class WebUIServer:
             return _json({"error": "面板资源缺失，请检查插件安装完整性"}, 500)
 
     async def _meta(self, request: web.Request) -> web.Response:
+        authed = self._authed(request)
         return _json(
             {
                 "name": DISPLAY_NAME,
                 "plugin": "astrbot_plugin_music_hub",
-                "version": self._version(),
-                "authed": self._authed(request),
+                # 版本号只对已登录会话暴露：/api/meta 是公开路由，未登录即可查询
+                # 的精确版本等于给「对照已知漏洞定向攻击」递情报；登录页只用 name
+                "version": self._version() if authed else "",
+                "authed": authed,
             }
         )
 

@@ -6,6 +6,7 @@ WebUI 管理面板（扫码 / 配置 / 统计 / 黑白名单）。
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from pathlib import Path
 
@@ -22,6 +23,15 @@ from .handlers import all_routes, install
 
 PLUGIN_DIR = Path(__file__).resolve().parent
 _log_buffer = LogBuffer()
+
+# play_song 失败 reason → LLM 工具回传文案：内部枚举码与下载错误原文不交模型
+# 转述（原文可能带直链，见 core.delivery 的 sanitize_message 口径）
+_PLAY_REASON_LABELS = {
+    "no_channel": "当前会话不支持语音或文件发送",
+    "no_url": "未能获取播放链接",
+    "download_fail": "音频下载失败，可稍后重试或换一首歌",
+    "send_fail": "消息发送失败，可稍后再试",
+}
 
 
 class MusicHubPlugin(Star):
@@ -51,9 +61,20 @@ class MusicHubPlugin(Star):
         self.service = MusicService(self, self.config, self._data_dir, self._tmpl_dir)
         self.service.log_buffer = _log_buffer
         await self.service.initialize()
+        # 初始化窗口的去重集已完成使命（service 就绪后 handler 不再进入该分支）：
+        # 置空释放窗口期积累的 umo 引用（规模有上界，纯卫生收口）
+        scopes = getattr(type(self), "_init_notice_scopes", None)
+        if scopes is not None:
+            scopes.clear()
+        # 明文口令迁移与面板开关解耦：禁用面板时配置里的明文 password 也要落成
+        # 哈希——否则配置文件（含备份）持续持有明文口令，下次启用面板即生效
+        try:
+            await self._ensure_webui_password()
+        except Exception as e:  # noqa: BLE001 - 迁移失败不阻断插件加载
+            logger.error(f"[music_hub] WebUI 口令迁移失败：{e}")
         if self.config.webui_enable:
             try:
-                await self._ensure_webui_password()
+                self._warn_insecure_webui()
                 from .core.webui import WebUIServer
 
                 self._webui = WebUIServer(self.service)
@@ -62,26 +83,67 @@ class MusicHubPlugin(Star):
                 logger.error(f"[music_hub] WebUI 启动失败：{e}")
                 self._webui = None
 
-    async def _ensure_webui_password(self) -> None:
-        """未设置密码时生成随机密码写回配置（不落日志）。
+    def _warn_insecure_webui(self) -> None:
+        """非回环监听 + 未开 Secure Cookie 的组合在 http 直连时凭证明文过网，提醒一句。"""
+        try:
+            host = str(self.config.webui_host or "").lower()
+            loopback = host in ("127.0.0.1", "::1", "localhost")
+            if loopback or self.config.webui_secure_cookie:
+                return
+            # 端口从配置取：写死默认值的话，用户改过 webui.port 后提示失真
+            logger.warning(
+                "[music_hub] WebUI 监听在非回环地址且 secureCookie 未开启："
+                "http 直连时登录密码与会话 Cookie 明文传输；仅经 https 反代访问可开启 "
+                f"webui.secureCookie，或用防火墙限制 {self.config.webui_port} 端口的来源。裸暴露（无反代）"
+                "还暴露在慢速连接的资源堆积风险下（aiohttp 对半截请求头无读取超时），"
+                "公网可达时建议前置反向代理"
+            )
+        except Exception:  # noqa: BLE001 - 提醒失败不影响启动
+            pass
 
-        Schema 默认值为空串；AstrBot 加载配置时会按 Schema 补默认值，因此新装的
-        配置里 password 为空 —— 在这里生成，用户到 AstrBot 配置面板查看。
+    async def _ensure_webui_password(self) -> None:
+        """未设置密码时生成随机密码；任何明文形式的口令在启动时迁移为 PBKDF2 哈希。
+
+        配置里只存哈希：配置文件被同机其他进程读到也拿不到口令本身（面板可导出
+        三平台登录态，明文落盘等于交出账号）。首启生成的随机口令写入独立收紧
+        权限的告知文件——存哈希后配置面板无从「查看」，那是用户得知初始口令的
+        唯一途径；登录改密后该文件自动删除。
         """
-        if self.config.webui_password:
+        from .core.webui._auth import hash_password_async, is_password_hash, write_initial_password_file
+
+        pwd = str(self.config.webui_password or "")
+        if pwd and is_password_hash(pwd):
             return
         import secrets
 
-        self.config.set_webui_password(secrets.token_hex(8))
-        await self.config.save_async()
-        logger.info(
-            "[music_hub] WebUI 首次启动已生成随机登录密码，请在 AstrBot 插件配置（webui.password）中查看"
-        )
+        if not pwd:
+            # 128 bit 随机口令：登录口已有全局闸门限速，这里提高的是「永不更换的
+            # 静态口令」的整体安全边际（成本为零）
+            new_pwd = secrets.token_hex(16)
+            self.config.set_webui_password(await hash_password_async(new_pwd))
+            await self.config.save_async()
+            # write_initial_password_file 内含 icacls 子进程（最坏 5s）+ 文件写入：
+            # 同步调用会卡住整个事件循环（对齐 _server._ensure_auth 的 to_thread 口径）
+            await asyncio.to_thread(write_initial_password_file, self._data_dir, new_pwd)
+            logger.info(
+                "[music_hub] WebUI 首次启动已生成随机登录密码，见插件数据目录下的 "
+                "webui_initial_password.txt；登录后请修改密码（文件会自动删除）"
+            )
+        else:
+            # 旧配置 / AstrBot 主面板写入的明文：迁移成哈希。用户自行设置的口令
+            # 其本人知晓，无需告知文件
+            self.config.set_webui_password(await hash_password_async(pwd))
+            await self.config.save_async()
+            logger.info("[music_hub] 已将 webui.password 迁移为哈希存储")
 
     # ──────────── LLM 函数工具（自然语言点歌） ────────────
-    # 注意：工具不走聊天路由的闸门，这里要手动过 开关/黑白名单/冷却
+    # 注意：工具不走聊天路由的闸门，这里要手动过 开关/黑白名单/冷却/频控
     def _llm_guard(self, event: AstrMessageEvent, *, song_request: bool = False) -> str | None:
-        """LLM 工具前置闸门：总开关（点歌类另受点歌开关）+ 黑白名单。返回拒绝文案或 None。"""
+        """LLM 工具前置闸门：总开关（点歌类另受点歌开关）+ 黑白名单 + browse 节流。
+
+        聊天路由对直刷上游的指令挂 2s 轻频控（check_browse），LLM 工具入口不补上
+        同款节流的话，模型被诱导连续调用时可绕过聊天端频控直刷上游。
+        """
         if not self.service:
             return "音乐插件尚未初始化完成"
         reason = self.service.check_song_request() if song_request else self.service.check_playable()
@@ -91,6 +153,8 @@ class MusicHubPlugin(Star):
             self.service.check_acl(event)
         except AclDeniedError:
             return "当前用户/群无权使用音乐功能"
+        if reason := self.service.check_browse(event, 2.0):
+            return reason
         return None
 
     @filter.llm_tool(name="music_hub_play")
@@ -119,9 +183,12 @@ class MusicHubPlugin(Star):
                     f"已播放：{songs[0].get('name')} - {songs[0].get('artist')}"
                     f"（{real_src} 音源，已发到当前会话）"
                 )
-            err = result.get("error") or result.get("reason") or ""
-            # NotEnabledError 路径 result 没有 error 文案（play_song 已当面回复），别留悬空冒号
-            return f"「{songs[0].get('name')}」播放失败" + (f"：{err}" if err else "")
+            # 内部 reason 枚举/下载错误原文不交给模型转述：枚举码模型会原样念出
+            # （用户收到双份且第二份不可读），下载错误原文可能带直链——与下方
+            # except 分支的脱敏纪律同口径，按 reason 查表给固定中文文案
+            reason = str(result.get("reason") or "")
+            detail = _PLAY_REASON_LABELS.get(reason)
+            return f"「{songs[0].get('name')}」播放失败" + (f"：{detail}" if detail else "")
         except Exception as e:  # noqa: BLE001
             # 工具入口盖了冷却章但没播出任何内容：无论异常类型都退章（对齐聊天路由的退章纪律）
             self.service.release_cooldown(event)

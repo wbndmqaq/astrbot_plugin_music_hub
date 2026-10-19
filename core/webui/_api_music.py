@@ -10,7 +10,8 @@ from aiohttp import web
 from astrbot.api import logger
 
 from .. import SOURCE_NAMES, SOURCES
-from ..errors import ApiError, TooManyTasks
+from ..errors import ApiError, NotEnabledError, TooManyTasks
+from ._api_auth import _client_ip_of
 from ._util import body_json as _body
 from ._util import json_response as _json
 
@@ -107,10 +108,13 @@ def make_account_logout(server):
                 client = server.service.client_of(src)
                 if hasattr(client, "logout"):
                     await client.logout()
-        except Exception:  # noqa: BLE001
-            pass
+        except Exception as e:  # noqa: BLE001
+            # 本地 cookie 清除不受影响，但上游登出失败完全无线索会难排障
+            logger.warning(f"[music_hub] {src} 上游登出失败（本地凭证仍清除）: {e}")
         server.config.clear_src_cookie(src)
         saved = await server.config.save_async()
+        # 审计：凭证清除与改密同口径记动作（记音源不记值）
+        logger.info("[music_hub] WebUI 凭证清除：%s（落盘 %s）", src, "成功" if saved else "失败")
         return _json({"ok": True, "saved": saved})
 
     return handler
@@ -127,9 +131,19 @@ def make_account_refresh(server):
         if server.service.qq is None:
             return _json({"error": "未安装 qqmusic-api-python，无法刷新"}, 400)
         ok = await server.service.qq.refresh_credential()
+        # 审计留痕（对齐凭证粘贴/清除口径）：凭证刷新动的是平台登录态。
+        # IP 用 client_ip 口径（XFF + trustedProxy）：反代部署下裸 remote 记的是
+        # 代理 IP，被窃会话刷新凭证的溯源就断在代理层
+        peer = _client_ip_of(request, server)
+        logger.info(f"{TAG} WebUI QQ 凭证刷新（{'成功' if ok else '失败'}，{peer or '未知来源'}）")
         return _json({"ok": ok, "msg": "刷新成功" if ok else "刷新失败（可能需要重新扫码）"})
 
     return handler
+
+
+# 手动粘贴 cookie 的长度上限：真实 cookie 最长几 KB，超出必是误粘贴
+# （无上限时可把近 1MB 的 body 原样写进配置文件）
+_COOKIE_MAX_LEN = 8192
 
 
 def make_account_cookie(server):
@@ -143,6 +157,12 @@ def make_account_cookie(server):
             return _json({"error": "未知音源"}, 400)
         if not value:
             return _json({"error": "内容不能为空"}, 400)
+        if len(value) > _COOKIE_MAX_LEN:
+            return _json({"error": "内容超长（上限 8KB），请检查是否粘贴了多余内容"}, 400)
+        if any(c in value for c in "\r\n\t") or any(ord(c) < 32 for c in value):
+            # 误粘贴的报错页/多行文本会静默落盘进配置，直到下次请求上游才失败：
+            # cookie 是单行 k=v; k=v 串（QQ 是单行 JSON），控制字符必属粘贴事故
+            return _json({"error": "内容含换行或控制字符，请检查是否粘贴了多余内容"}, 400)
         if src == "qq":
             import json as _json_mod
 
@@ -154,12 +174,25 @@ def make_account_cookie(server):
                 return _json({"error": "QQ 凭证需为 JSON（扫码登录可自动获取）"}, 400)
         server.config.set_src_cookie(src, value)
         saved = await server.config.save_async()
+        # 审计：被窃会话把平台 cookie 换成攻击者的需留痕（只记音源与长度，不记值）
+        logger.info(
+            "[music_hub] WebUI 手动写入凭证：%s（%d 字节，落盘 %s）",
+            src,
+            len(value),
+            "成功" if saved else "失败",
+        )
         return _json({"ok": True, "saved": saved})
 
     return handler
 
 
 # ──────────── 扫码登录 ────────────
+# 扫码登录类型白名单：与 core/api/qq.py qr_start 的映射键一致（wx/mobile 是
+# 官方枚举别名，"微信"/"app" 是库侧兼容写法）——不校验就透传第三方库，
+# 任意字符串会被库静默当成 QQ 扫码，面板与实际登录方式出现假象偏差
+_QR_LOGIN_TYPES = {"qq", "wx", "微信", "mobile", "app"}
+
+
 def make_qr_start(server):
     async def handler(request: web.Request) -> web.Response:
         body = await _body(request)
@@ -169,12 +202,19 @@ def make_qr_start(server):
         # login_type 只有 qq 用得上（ncm/kg 是 key-based 扫码），但 LoginFlows.start
         # 对三者都接受该参数，故直接透传，不做按平台的无效三元
         login_type = str(body.get("type", "qq"))
+        if login_type not in _QR_LOGIN_TYPES:
+            return _json({"error": f"type 仅支持 {'/'.join(sorted(_QR_LOGIN_TYPES))}"}, 400)
         # 同源旧会话先取消：active_of + gc 的组合清不掉刚开的待扫码会话，
         # 反复点扫码会累积轮询任务（LoginFlows.start 内部也会做一次，这里是幂等的）
         await server.service.login.cancel_source(src)
         await server.service.login.gc()
         try:
             session = await server.service.login.start(src, login_type)
+        except NotEnabledError as e:
+            # 音源未就绪是固定配置问题而非瞬时故障：混进 500 的「稍后重试」会让
+            # 用户对着一个永不成功的按钮反复重试，按音源给可操作提示
+            hint = "请先安装 qqmusic-api-python" if src == "qq" else "请先在插件配置填写该音源 API 地址"
+            return _json({"error": f"{e.user_msg()}：{hint}"}, 400)
         except Exception as e:  # noqa: BLE001
             logger.warning(f"{TAG} 创建扫码会话失败（{src}）: {e}")
             return _json({"error": "创建扫码会话失败，请稍后重试"}, 500)
@@ -381,10 +421,15 @@ def make_logs(server):
         if buf is None:
             return _json({"entries": [], "seq": 0})
         try:
-            after = int(request.query.get("after", "0") or 0)
+            after = int(request.query.get("after", "") or -1)
         except ValueError:
-            after = 0
-        entries, seq = buf.after(after, 200)
+            after = -1
+        if after < 0:
+            # 首载（无 after）取缓冲区最新一段：走 after(0) 拿到的是「最旧」200 条，
+            # 500 条缓冲填满后每次打开面板先看到的都是几小时前的日志
+            entries, seq = buf.latest(200)
+        else:
+            entries, seq = buf.after(after, 200)
         return _json({"entries": entries, "seq": seq})
 
     return handler

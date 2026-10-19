@@ -6,6 +6,7 @@ body.code=301 都抛 ApiError。接口缓存 2 分钟，登录/轮询类请求�
 
 from __future__ import annotations
 
+import asyncio
 import re
 import time
 
@@ -45,7 +46,22 @@ def _err_msg(code, status: int = 0) -> str:
 def _pic_url(raw, size: str = "300y300") -> str:
     """封面地址拼 CDN 尺寸参数；字段缺失返回空串，不产出只有 ?param= 的垃圾地址。"""
     base = str(raw or "").strip()
-    return f"{base}?param={size}" if base else ""
+    if not base:
+        return ""
+    # 部分上游封面 URL 自带 query（?v=...）：再拼 ?param 会产出 ...?v=1?param=... 坏地址
+    sep = "&" if "?" in base else "?"
+    return f"{base}{sep}param={size}"
+
+
+# HTTP 200 包裹下的业务错误码（api-enhanced 的 SPECIAL_STATUS_CODES 会把
+# 400/402/460/502/503 等以 HTTP 200 下发）。1101 = 登录过期/cookie 失效，
+# 同样能以 HTTP 200 形态出现——不拦会被吞进字段解析，归因退化成「获取失败」
+# 而非 errors 表里已有的「登录已过期，请重新登录」
+_NCM_BIZ_ERROR_CODES = {400, 402, 403, 404, 405, 406, 460, 501, 502, 503, 1101}
+
+# 会话级/全局级失败码：301 登录失效、1101 cookie 过期、460 cheating 风控、
+# 503 高频限制——换音质档重试同样必失败，取流阶梯遇之直接上抛
+_NCM_SESSION_ERROR_CODES = {301, 1101, 460, 503}
 
 
 def normalize_song(item: dict, idx: int = 0) -> dict | None:
@@ -95,6 +111,7 @@ def normalize_playlist(item: dict, idx: int = 0) -> dict | None:
     creator = item.get("creator") if isinstance(item.get("creator"), dict) else {}
     return {
         "index": idx + 1,
+        "source": "ncm",
         "id": str(item.get("id") or ""),
         "name": str(name),
         "cover": _pic_url(item.get("picUrl") or item.get("coverImgUrl")),
@@ -114,6 +131,7 @@ def normalize_album(item: dict, idx: int = 0) -> dict | None:
     artist = " / ".join(a.get("name") or "" for a in artists if isinstance(a, dict))
     return {
         "index": idx + 1,
+        "source": "ncm",
         "id": str(item.get("id") or ""),
         "name": str(name),
         "cover": _pic_url(item.get("picUrl") or item.get("pic")),
@@ -130,6 +148,7 @@ def normalize_artist(item: dict, idx: int = 0) -> dict | None:
         return None
     return {
         "index": idx + 1,
+        "source": "ncm",
         "id": str(item.get("id") or ""),
         "name": str(name),
         "cover": _pic_url(item.get("picUrl") or item.get("img1v1Url")),
@@ -143,6 +162,7 @@ class NeteaseClient:
     def __init__(self, config):
         self._config = config  # core.config.Config
         self._vip_cache: tuple[float, bool] = (0.0, False)  # (检查时刻, 是否有特权)
+        self._vip_lock = asyncio.Lock()  # 并发取流时 VIP 特权检查只打一次 /vip/info
 
     def ready(self) -> bool:
         """无重依赖（走 HTTP 服务），配置了地址即可用。"""
@@ -166,6 +186,11 @@ class NeteaseClient:
     async def request(self, pathname: str, params: dict | None = None, *, with_cookie: bool = True) -> dict:
         base = self._require_base()
         params = dict(params or {})
+        # 与 kg.request 同款收口：noCookie=true 抑制上游把登录态写进响应
+        # Set-Cookie。本插件 cookie 全走 query 显式传入、从不消费响应 Set-Cookie，
+        # 放任回写会让共享 CookieJar（unsafe、按 host 不分端口）收录 ncm 的
+        # MUSIC_U，此后每个 kg 请求被 aiohttp 自动附上该头、凭证随请求外发
+        params["noCookie"] = "true"
         if with_cookie:
             extra = params.pop("cookie", "")
             merged = merge_cookie(self.cookie, extra)
@@ -177,11 +202,22 @@ class NeteaseClient:
     def _handle(self, body: dict, status: int, pathname: str) -> dict:
         """业务级错误映射。传输/解析层（网络异常、非 JSON）在 http.request_json。"""
         if status >= 400:
-            code = body.get("code")
+            # code 归一为 int：上游分叉回字符串 code（"402"/"301"）时，int 键的
+            # NCM_ERRORS 查表必然 miss，user_msg 退化成「音源返回异常」丢掉真实原因
+            code = opt_int(body.get("code"))
             msg = body.get("msg") or body.get("message") or ""
             raise ApiError(str(msg) or _err_msg(code, status), code=code, source="ncm", payload=body)
-        if body.get("code") == 301 and not pathname.startswith("/login"):
+        # 301 用宽松整型比较：上游分叉返回 "301"（字符串）时严格 == 会漏判，
+        # 登录失效被当成正常响应走进字段解析
+        code = opt_int(body.get("code"))
+        if code == 301 and not pathname.startswith("/login"):
             raise ApiError(NCM_ERRORS[301], code=301, source="ncm", payload=body)
+        # HTTP 200 + 业务错误码：api-enhanced 的 SPECIAL_STATUS_CODES 会把 402/460/502/503
+        # 等以 HTTP 200 下发（模块化端点常见形态）。不拦会把错误体放进字段解析，
+        # 归因变成「无 xx 音质」之类。只拦明确错误码：201/302（部分端点的成功/跳转
+        # 形态）与二维码 800-803 三态放行，login/register 域的码由各端点自行消费
+        if code in _NCM_BIZ_ERROR_CODES and not pathname.startswith(("/login", "/register")):
+            raise ApiError(_err_msg(code, status), code=code, source="ncm", payload=body)
         return body
 
     # with_ts 的语义与旧 _ts 一致（调用点全传新造的字面量 dict），实现收敛到 http 单处
@@ -211,7 +247,10 @@ class NeteaseClient:
             return collect(items, normalize_playlist, limit)
         if type_ == 10:
             return collect(items, normalize_album, limit)
-        return collect(items, normalize_artist, limit)
+        if type_ == 100:
+            return collect(items, normalize_artist, limit)
+        # 未识别的 type 不再兜底按歌手归一：上游扩展类型时会把错的结构吐给上层
+        return []
 
     async def suggest(self, keyword: str) -> list[dict]:
         # 不带 type=mobile 走 web 端（mobile 端只回 allMatch 关键词，拿不到分类）
@@ -221,6 +260,10 @@ class NeteaseClient:
         seen = set()
         for key in ("artists", "albums", "songs"):
             for it in list_of(result.get(key)):
+                # 上游形态漂移时元素可能不是 dict：同文件其余 20+ 处循环均有守卫，
+                # 此处缺失会让裸 AttributeError 穿透 ApiError 体系
+                if not isinstance(it, dict):
+                    continue
                 name = it.get("name") or ""
                 extra = ""
                 if key == "songs":
@@ -267,6 +310,13 @@ class NeteaseClient:
             "code": d0.get("code"),
             "fee": d0.get("fee"),
             "type": d0.get("type") or "",
+            # freeTrialInfo 是试听区间数组（[start, duration]）才表示试听片段：
+            # 解灰模式下上游回的是字符串 'null'（不是 null），bool("null")==True
+            # 会把解灰整曲误标成 60s 试听，队列提前切歌（队列等待时长与卡片标注
+            # 都依赖该字段，缺失会把 60s 试听当整曲等——与 kg/qq 的 trial 契约对齐）
+            "trial": isinstance(d0.get("freeTrialInfo"), (list, tuple)),
+            # ext 统一无点小写，与 qq/kg 的同名字段同格式
+            "ext": str(d0.get("type") or "").lstrip(".").lower(),
             "raw": d0,
         }
 
@@ -287,24 +337,43 @@ class NeteaseClient:
             except ApiError as e:
                 if e.timeout:
                     raise
+                # 会话级/全局级失败（登录失效、cheating 风控、高频限制）换档重试
+                # 同样必失败：full 阶梯最多 11 发，过期凭证点一首歌空烧约 3 秒——
+                # 对齐 qq 侧 RatelimitedError/CredentialExpiredError 的短路口径
+                if opt_int(e.code) in _NCM_SESSION_ERROR_CODES:
+                    raise
                 last_err = e
                 last_code = opt_int(e.code) or last_code
                 continue
             if r.get("url"):
-                r["quality"] = lv
-                r["qualityLabel"] = NCM_LABEL.get(lv, lv)
+                # 上游请求档不可用会降档交付（data.level < 请求 level）：以实际交付档
+                # 标注，否则详情卡/识别文本会把 lossless 虚标成 hires 等高档
+                r["quality"] = r.get("level") or lv
+                r["qualityLabel"] = NCM_LABEL.get(r["quality"], r["quality"])
                 return r
-            last_code = opt_int(r.get("code")) or last_code
+            # code=200 是成功码：url 为空时把 last_code 覆写成 200 会让之前某档
+            # 真正拿到的 402（需 VIP）归因丢失，只记失败语义的 code
+            c = opt_int(r.get("code"))
+            if c and c != 200:
+                last_code = c
             last_err = ApiError(f"无 {NCM_LABEL.get(lv, lv)} 音质", source="ncm")
         if unblock_fallback and self._config.src_quality_unblock("ncm"):
             try:
                 r = await self.song_url(sid, "lossless", unblock=True)
                 if r.get("url"):
-                    r.update({"quality": "lossless", "qualityLabel": "解灰音源", "unblocked": True})
+                    # 解灰模式下音质设置不生效，实际交付档由解灰服务决定：
+                    # 上游若带 level 以其为准，否则不虚标档位
+                    actual = r.get("level") or ""
+                    r["quality"] = actual if actual and actual != "lossless" else "unblocked"
+                    r["qualityLabel"] = "解灰音源"
+                    r["unblocked"] = True
                     return r
-                last_code = opt_int(r.get("code")) or last_code
+                c = opt_int(r.get("code"))
+                if c and c != 200:
+                    last_code = c
             except ApiError as e:
-                last_err = e
+                # 解灰失败不覆盖阶梯阶段的归因（last_err 更具体），只补记 code：
+                # NCM_ERRORS 查表给出带码因文案，比「解灰服务失败」对用户更有用
                 last_code = opt_int(e.code) or last_code
         if last_code is not None and last_code in NCM_ERRORS:
             raise ApiError(NCM_ERRORS[last_code], code=last_code, source="ncm")
@@ -316,16 +385,18 @@ class NeteaseClient:
         """auto 时是否从最高档起试：需登录且任一 VIP 未过期。
 
         结果按 5 分钟缓存——每次取流都调一次 /vip/info，连播/换源时纯属浪费；
-        扫码登录换凭证后由 TTL 自然过期，无需手动失效。
+        扫码登录换凭证后由 TTL 自然过期，无需手动失效。锁保证并发取流同时 miss
+        时只打一次 /vip/info（幂等 GET，不加锁也只是重复请求，这里图个干净）。
         """
         if not self.cookie:
             return False
-        now = time.monotonic()
-        if now - self._vip_cache[0] < _VIP_CACHE_TTL:
-            return self._vip_cache[1]
-        privileged = await self._check_vip_privilege()
-        self._vip_cache = (now, privileged)
-        return privileged
+        async with self._vip_lock:
+            now = time.monotonic()
+            if now - self._vip_cache[0] < _VIP_CACHE_TTL:
+                return self._vip_cache[1]
+            privileged = await self._check_vip_privilege()
+            self._vip_cache = (now, privileged)
+            return privileged
 
     async def _check_vip_privilege(self) -> bool:
         try:
@@ -354,7 +425,9 @@ class NeteaseClient:
         return {"lrc": lrc or "", "tlyric": tly or "", "yrc": ""}
 
     async def lyric_yrc(self, sid: str) -> dict:
-        """逐字歌词（/lyric/new yrc）；失败回退普通歌词。"""
+        """逐字歌词（/lyric/new yrc）；失败回退普通歌词。缺 id 直接回空。"""
+        if not sid:
+            return {"lrc": "", "tlyric": "", "yrc": ""}
         try:
             body = await self.request("/lyric/new", {"id": sid})
             yrc = (body.get("yrc") or {}).get("lyric") if isinstance(body.get("yrc"), dict) else ""
@@ -367,15 +440,27 @@ class NeteaseClient:
         return await self.lyric(sid)
 
     # ──────────── song 协议 ────────────
+    # sid 取值与 song_url_best 同口径（sid 优先、sid2 兜底）；缺键时直接返回空结果
+    # ——/lyric 对缺 id 的请求 api-enhanced 会本地回 HTTP 400 上抛，拿不到「无歌词」，
+    # 协议契约（base.SourceClient.song_lyric）要求无歌词返回空串而非抛错
     async def song_lyric(self, song: dict) -> dict:
-        return await self.lyric(song["sid"])
+        sid = song.get("sid") or song.get("sid2") or ""
+        if not sid:
+            return {"lrc": "", "tlyric": "", "yrc": ""}
+        return await self.lyric(sid)
 
     async def song_lyric_karaoke(self, song: dict) -> dict:
-        """逐字歌词；lyric_yrc 内部已含失败回退普通歌词。"""
-        return await self.lyric_yrc(song["sid"])
+        """逐字歌词；lyric_yrc 内部已含失败回退普通歌词。缺 sid 同 song_lyric 回空。"""
+        sid = song.get("sid") or song.get("sid2") or ""
+        if not sid:
+            return {"lrc": "", "tlyric": "", "yrc": ""}
+        return await self.lyric_yrc(sid)
 
     async def song_comments(self, song: dict, limit: int = 12) -> dict:
-        return await self.comments(song["sid"], limit)
+        # 与 kg 同口径：缺定位 id 返回空结果（不发空 id 请求吃上游 400）
+        if not (song.get("sid") or song.get("sid2")):
+            return {"hot": [], "new": [], "total": 0}
+        return await self.comments(song.get("sid") or song.get("sid2") or "", limit)
 
     async def simi_songs(self, sid: str, limit: int = 10) -> list[dict]:
         body = await self.request("/simi/song", {"id": sid, "limit": limit})
@@ -533,6 +618,11 @@ class NeteaseClient:
         body = await self.request("/artist/top/song", {"id": artist_id})
         return collect(body.get("songs"), normalize_song, limit)
 
+    async def artist_songs(self, artist_id: str, limit: int = 30) -> list[dict]:
+        """歌手热门歌曲。artist_top_songs 的协议别名，与 kg/qq 的 artist_songs 对齐：
+        候选展开（explore_common.expand_candidate）按统一方法名直调。"""
+        return await self.artist_top_songs(artist_id, limit)
+
     async def artist_albums(self, artist_id: str, limit: int = 15) -> list[dict]:
         body = await self.request("/artist/album", {"id": artist_id, "limit": limit})
         node = body.get("artist") if isinstance(body.get("artist"), dict) else {}
@@ -628,7 +718,11 @@ class NeteaseClient:
 
     # ──────────── 评论 / MV ────────────
     async def comments(self, sid: str, limit: int = 12, kind: str = "music") -> dict:
-        path = {"music": "/comment/music", "playlist": "/comment/playlist", "album": "/comment/album"}[kind]
+        path = {"music": "/comment/music", "playlist": "/comment/playlist", "album": "/comment/album"}.get(
+            kind
+        )
+        if not path:
+            raise ApiError(f"不支持的评论类型：{kind}", source="ncm")
         body = await self.request(path, {"id": sid, "limit": limit})
         # 热评只能按来源打标：hotComments 条目并不带 hotComment 字段（按字段判定恒 False）
         hot = collect(body.get("hotComments"), lambda it, i: self._norm_comment(it, i, hot=True), limit)
@@ -716,7 +810,21 @@ class NeteaseClient:
         body = await self.request("/vip/info", self._ts({}))
         data = data_of(body)
         red = data.get("redVipLevel") if isinstance(data.get("redVipLevel"), (int, float)) else 0
-        return {"vipLevel": int(num(red)), "vipType": int(num(data.get("redVipType")))}
+        # 与 qq/kg 同契约：补 expire，否则 service.vip_summary 拼的「VIPn · 到期 …」
+        # 在网易云永远缺到期日。上游 data 无 redVip 键（旧结构体字段），到期时间在
+        # redplus/associator/musicPackage 各节的 expireTime（毫秒）——取三者最大值
+        # 覆盖黑胶/音乐包任一在期套餐
+        ts = 0
+        for key in ("redplus", "associator", "musicPackage"):
+            node = data.get(key)
+            if isinstance(node, dict):
+                ts = max(ts, num(node.get("expireTime")))
+        expire = ""
+        if ts > 0:
+            if ts > 10**12:
+                ts /= 1000
+            expire = time.strftime("%Y-%m-%d", time.localtime(ts))
+        return {"vipLevel": int(num(red)), "vipType": int(num(data.get("redVipType"))), "expire": expire}
 
     async def like_list(self, uid: str) -> list[str]:
         body = await self.request("/likelist", self._ts({"uid": uid}))
@@ -780,6 +888,8 @@ class NeteaseClient:
         return out
 
     async def recent_songs(self, limit: int = 30) -> list[dict]:
+        # 固定请求 100 条而非透传 limit：list 里混有解析不出歌曲的条目（下方过滤
+        # 丢弃），按 limit 精确请求会在过滤后缺额，超量取回再本地截断补足
         body = await self.request("/record/recent/song", self._ts({"limit": 100}))
         data = body.get("data") if isinstance(body.get("data"), dict) else {}
         items = list_of(data.get("list"))
@@ -812,9 +922,13 @@ class NeteaseClient:
         if like and already:
             return "这首歌已经在红心列表里啦"
         body = await self.request("/like", self._ts({"id": sid, "like": "true" if like else "false"}))
-        if opt_int(body.get("code")) == 200:
+        code = opt_int(body.get("code"))
+        if code == 200:
             return "已加入红心 ❤" if like else "已取消红心"
-        raise ApiError("红心操作失败", source="ncm")
+        # 透传上游 code：与同层其他方法口径一致，WebUI「失败原因 TOP」才能归因
+        raise ApiError(
+            f"红心操作失败（code={code if code is not None else '未知'}）", code=code, source="ncm"
+        )
 
     async def history_recommend(self) -> list[dict]:
         body = await self.request("/history/recommend/songs", self._ts({}))
@@ -839,14 +953,14 @@ class NeteaseClient:
 
     async def qr_check(self, key: str) -> dict:
         """800 过期 / 801 待扫 / 802 已扫待确认 / 803 成功（带 cookie）。"""
-        body = await self.request("/login/qr/check", self._ts({"key": key, "noCookie": "true"}))
+        body = await self.request("/login/qr/check", self._ts({"key": key}))
         code = opt_int(body.get("code"))
         data = body.get("data") if isinstance(body.get("data"), dict) else {}
         out = {
             "code": code,
             "cookie": "",
             "msg": {800: "二维码已过期", 801: "等待扫码", 802: "已扫码，请在手机上确认", 803: "登录成功"}.get(
-                code, f"状态 {code}"
+                code, "未知状态" if code is None else f"状态 {code}"
             ),
         }
         if code == 803:

@@ -5,8 +5,10 @@
 <meta charset="UTF-8" />
 <style>
   .head{display:flex;align-items:center;gap:12px;padding:4px 6px 14px}
+  {# 头部图标/提示条跟随音源品牌色（--mh-nm-deep 由 render 按音源注入，默认网易云红），
+     写死 #c62f2f 时酷狗/QQ 音源下会呈「蓝→红/绿→红」混色渐变 #}
   .head-icon{width:40px;height:40px;border-radius:13px;display:grid;place-items:center;color:#fff;
-    background:linear-gradient(135deg,var(--mh-nm),#c62f2f);box-shadow:0 6px 18px rgba(236,65,65,.35)}
+    background:linear-gradient(135deg,var(--mh-nm),var(--mh-nm-deep));box-shadow:0 6px 18px rgba(0,0,0,.18)}
   .head-title{font-size:21px;font-weight:900}
   .head-ver{margin-left:auto;font-size:11px;font-weight:800;padding:5px 12px;border-radius:999px;
     background:var(--mh-card-b);color:var(--mh-muted)}
@@ -22,13 +24,13 @@
   .name{font-size:15px;font-weight:900}
   .sub{font-size:11px;color:var(--mh-muted);margin-top:4px;min-height:15px}
   .badge{display:inline-block;margin-top:10px;font-size:10.5px;font-weight:800;padding:5px 14px;border-radius:999px}
-  .badge.ok{background:rgba(34,197,94,.14);color:#16a34a}
+  .badge.ok{background:rgba(34,197,94,.14);color:#0b6b4c}
   .badge.off{background:rgba(125,140,163,.15);color:var(--mh-muted)}
   .meta{margin-top:11px;padding-top:11px;border-top:1px dashed var(--mh-line);
     font-size:10.5px;color:var(--mh-muted);font-weight:700;display:flex;justify-content:center;gap:12px}
   .vip{margin-top:7px;font-size:10.5px;font-weight:800;color:var(--mh-nm)}
   .tip{margin-top:14px;display:flex;align-items:center;gap:9px;padding:12px 15px;border-radius:14px;
-    background:rgba(236,65,65,.07);color:var(--mh-muted);font-size:12.5px;font-weight:600;line-height:1.7}
+    background:var(--mh-soft,rgba(125,140,163,.08));color:var(--mh-muted);font-size:12.5px;font-weight:600;line-height:1.7}
   .footer{display:flex;justify-content:space-between;padding:12px 6px 2px;color:var(--mh-muted);
     font-size:11px;font-weight:700;letter-spacing:.6px}
 </style>
@@ -44,9 +46,9 @@
   </div>
   <div class="cards">
     {% for s in data.sources or [] %}
-    <div class="acct" style="--sc:var(--src-{{ s.source }})">
+    <div class="acct" style="--sc:var(--src-{{ {'ncm':'ncm','kg':'kg','qq':'qq'}.get(s.source, 'other') }})">
       <div class="ava{% if not s.loggedIn %} guest{% endif %}">
-        {% if s.loggedIn and s.avatar %}<img src="{{ s.avatar }}" referrerpolicy="no-referrer" />{% else %}{{ s.name[0] }}{% endif %}
+        {% if s.loggedIn and s.avatar %}<img src="{{ s.avatar }}" referrerpolicy="no-referrer" data-fb="{{ (s.name or '·')[0:1] }}" onerror="this.replaceWith(document.createTextNode(this.dataset.fb))" />{% else %}{{ (s.name or '·')[0:1] }}{% endif %}
       </div>
       <div class="name">{{ s.name }}</div>
       <div class="sub">{{ s.nickname if s.nickname else (s.uid or '') }}</div>
@@ -56,7 +58,7 @@
     </div>
     {% endfor %}
   </div>
-  <div class="tip">{{ data.tip }}</div>
+  {% if data.tip %}<div class="tip">{{ data.tip }}</div>{% endif %}
   <div class="footer">
     <span>♪ Music Hub 聚合点歌</span>
     <span>WebUI 也可扫码</span>

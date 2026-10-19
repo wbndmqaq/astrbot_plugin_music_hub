@@ -5,6 +5,8 @@
 
 from __future__ import annotations
 
+import re
+
 
 def first(*vals) -> str:
     """宽松取首个非空值（上游字段形态不稳定，缺字段层层兜底）。"""
@@ -14,7 +16,18 @@ def first(*vals) -> str:
     return ""
 
 
+def norm_quality(q: str) -> str:
+    """手填档位归一：统一小写并去掉 -/_/空格/点 分隔符。
+
+    用户手写 ``hi-res``/``HiRes``/``ex_high`` 时不去漂移，会静默回落到更低档
+    （ncm 回 lossless、kg/qq 回全阶梯）且无任何提示。归一只做这一步，
+    不做同义词映射（"320k" 之类留给配置层白名单拦）。"""
+    return re.sub(r"[\s\-_.]", "", str(q or "").lower())
+
+
 # ── 网易云（song/url/v1 level）──
+# vivid（臻音全景声）为 api-enhanced 新增档（module/song_url_v1.js 有处理分支），
+# 位于 sky 与 jyeffect 之间
 NCM_LADDER = [
     "jymaster",
     "dolby",
@@ -83,24 +96,35 @@ def ladder_for(source: str, preferred: str = "auto", *, full: bool = False) -> l
     - kg / qq：auto 从最高档起试（VIP 档失败自动降级，代价可接受）
     """
     if source == "ncm":
-        q = (preferred or "auto").lower()
+        q = norm_quality(preferred) or "auto"
         if q in ("auto", "adaptive", "best"):
             start = 0 if full else NCM_LADDER.index(NCM_AUTO_START)
             return list(NCM_LADDER[start:])
         idx = NCM_LADDER.index(q) if q in NCM_LADDER else NCM_LADDER.index(NCM_AUTO_START)
         return NCM_LADDER[idx:]
     if source == "kg":
-        q = (preferred or "auto").lower()
+        q = norm_quality(preferred) or "auto"
         if q in ("auto", "adaptive", "best"):
             return list(KG_LADDER)
-        idx = KG_LADDER.index(q) if q in KG_LADDER else 0
+        # 未知档位与 ncm 同口径钳到中档起试：回退到 index 0（最高档）会先白打
+        # 一发注定失败的 VIP 档请求再降级
+        idx = KG_LADDER.index(q) if q in KG_LADDER else KG_LADDER.index("320")
         return KG_LADDER[idx:]
     if source == "qq":
-        q = (preferred or "auto").lower()
+        q = norm_quality(preferred) or "auto"
         names = [item[0] for item in QQ_LADDER]
         if q in ("auto", "adaptive", "best"):
             return names
-        idx = names.index(q) if q in names else 0
+        # 原值直查先行：atmos_db 是阶梯里唯一带分隔符的档名，会被 norm_quality
+        # 剥成 atmosdb 而查表失败 → 面板显式选「杜比全景声」静默回落 320 档
+        # （且 _conf_schema 的 options 里登记的就是 atmos_db）。
+        # 原值不中再按归一值对归一名表比对，救 atmos-db / ATMOS-DB 手写形态；
+        # 未知档位与 ncm/kg 同口径钳到中档起试
+        raw = str(preferred or "").strip().lower()
+        if raw in names:
+            return names[names.index(raw) :]
+        norm_names = [norm_quality(n) for n in names]
+        idx = norm_names.index(q) if q in norm_names else names.index("320")
         return names[idx:]
     return []
 

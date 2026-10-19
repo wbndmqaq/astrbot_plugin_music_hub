@@ -17,7 +17,7 @@
     "description": "点歌列表数量",
     "type": "int",
     "default": 10,
-    "hint": "1-20。聚合模式下为每个平台各取的数量。"
+    "hint": "1-20。列表类结果的总条数上限；点歌聚合时也是每个音源至少取的数量（不足 6 按 6 取，保证同名合并后有得选）。"
   },
   "enableSongRequest": {
     "description": "允许点歌",
@@ -60,8 +60,8 @@
       "apiBase": {
         "description": "api-enhanced 服务地址",
         "type": "string",
-        "default": "http://120.26.120.184:3000",
-        "hint": "网易云 API 服务地址（api-enhanced），默认公共实例 http://120.26.120.184:3000 开箱即用；自建改为自己的地址，如 http://127.0.0.1:3000。留空则停用网易云音源。"
+        "default": "",
+        "hint": "网易云 API 服务地址（api-enhanced），留空则停用网易云音源。"
       },
       "cookie": {
         "description": "登录 Cookie",
@@ -99,8 +99,8 @@
       "apiBase": {
         "description": "KuGouMusicApi 服务地址",
         "type": "string",
-        "default": "http://127.0.0.1:4000",
-        "hint": "酷狗 API 服务地址（KuGouMusicApi，默认端口 4000），默认已填本机自建 http://127.0.0.1:4000；服务在别处时改成实际地址。留空则停用酷狗音源。"
+        "default": "",
+        "hint": "酷狗 API 服务地址（KuGouMusicApi），留空则停用酷狗音源。"
       },
       "cookie": {
         "description": "登录 Cookie",
@@ -238,6 +238,12 @@
     "default": 250,
     "hint": "0-5000。网易云/酷狗每个请求之间的最小间隔，防止突发触发风控。0 = 关闭。"
   },
+  "apiTimeoutSec": {
+    "description": "音源请求超时 (秒)",
+    "type": "int",
+    "default": 20,
+    "hint": "5-120。搜索、取播放链接等音源请求的超时秒数；自建 API 服务或弱网下上游响应慢时可调大。修改即时生效。"
+  },
   "cooldownSec": {
     "description": "点歌冷却 (秒)",
     "type": "int",
@@ -294,7 +300,8 @@
       "whitelist": {
         "description": "白名单",
         "type": "list",
-        "default": []
+        "default": [],
+        "hint": "白名单模式下名单为空 = 所有人不可用，填入用户 ID / 群号后才会放行。"
       }
     }
   },
@@ -317,7 +324,7 @@
         "description": "域名访问白名单",
         "type": "list",
         "default": [],
-        "hint": "用域名（而非 IP）访问面板时在此登记，如 panel.example.com，子域名自动放行；留空则只允许 IP / localhost 访问。面板仅支持 http 直连访问（未做 TLS/反向代理适配，https 反代下写请求会被拒）。"
+        "hint": "用域名（而非 IP）访问面板时在此登记完整主机名（精确匹配，不含子域名），如 panel.example.com；留空则只允许 IP / localhost 访问。只登记自己掌控 DNS 解析的域名——他人可 DNS 劫持的域名会绕过 Host 校验。"
       },
       "port": {
         "description": "端口",
@@ -330,7 +337,25 @@
         "default": "",
         "secret": true,
         "obvious_hint": true,
-        "hint": "WebUI 登录密码（≥6 位，建议 12 位以上随机串——面板可改全部插件配置与投递消息）。留空则首次启动自动生成随机密码并写回此处。会话有效期 12 小时。"
+        "hint": "WebUI 登录密码（≥6 位，建议 12 位以上随机串——面板可改全部插件配置与投递消息）。留空则首次启动自动生成随机密码（见插件数据目录 webui_initial_password.txt）。此处展示的是落盘的 PBKDF2 哈希而非明文；在此填入新明文并重载插件即完成改密。会话有效期默认 12 小时（可用下方「会话有效期」调整）。"
+      },
+      "sessionHours": {
+        "description": "会话有效期 (小时)",
+        "type": "int",
+        "default": 12,
+        "hint": "1-168。WebUI 登录会话的有效时长，过期后需重新登录；改密或手动下线会话可立即吊销既有会话。"
+      },
+      "secureCookie": {
+        "description": "Cookie Secure 标志",
+        "type": "bool",
+        "default": false,
+        "hint": "经 https 反代访问面板时开启（会话 Cookie 仅经加密连接发送，响应附带 HSTS），反代必须原样透传 Host 头（Host 校验 + Origin 校验三元比对都依赖它）；http 直连访问必须保持关闭，否则无法登录。"
+      },
+      "trustedProxy": {
+        "description": "可信反代地址",
+        "type": "string",
+        "default": "",
+        "hint": "仅在面板经反向代理访问且反代设置了 X-Forwarded-For 头时填写：代理的 IP 或 CIDR 段，多个用逗号分隔。填写后登录限速、会话数上限与来源 IP 变化告警按转发头中的真实客户端 IP 计算（否则反代下所有访问者共享代理 IP，几次登录失败就会互相封锁）；留空表示面板直连，一律忽略 X-Forwarded-For（该头可被客户端伪造）。"
       }
     }
   },

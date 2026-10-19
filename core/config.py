@@ -6,6 +6,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from typing import Any
 
 from . import SOURCES
@@ -47,19 +48,25 @@ def as_str(value: Any, default: str = "") -> str:
 
 
 def as_list(value: Any) -> list:
+    """条目宽容归一为字符串列表：YAML 手写名单裸数字（`- 123456` 是 int）很常见，
+    严格只收 str 会把这类条目静默丢弃——黑名单「配了但不生效」且无任何日志。
+    两侧口径对齐：acl 的 candidates 侧本就做 str() 归一。"""
     if isinstance(value, list):
-        return [v for v in value if isinstance(v, str) and v.strip()]
+        return [v if isinstance(v, str) else str(v) for v in value if str(v).strip()]
     if isinstance(value, tuple):
-        return [v for v in value if isinstance(v, str)]
+        return [str(v) for v in value if str(v).strip()]
     return []
 
 
 def normalize_base(url: str) -> str:
     """规范化 API base：去尾部斜杠，补 http:// 前缀（用户常忘写协议）。"""
-    url = as_str(url).strip().rstrip("/")
-    if not url:
+    url = as_str(url).strip()
+    # 只写了协议头的输入必须在 rstrip("/") 之前判断：rstrip 会把 "http://" 削成
+    # "http:"，绕过下方哨兵比较后拼出 "http://http:"
+    if not url or url in ("http://", "https://", "http:", "https:"):
         return ""
-    if url == "http://" or url == "https://":
+    url = url.rstrip("/")
+    if not url:
         return ""
     if "://" not in url:
         url = "http://" + url
@@ -71,6 +78,8 @@ class Config:
 
     def __init__(self, raw: Any):
         self._raw = raw  # AstrBotConfig（dict 子类）；测试环境传 dict
+        # save_async 低版本回退路径的实例级串行锁（惰性创建，见 save_async）
+        self._save_lock: asyncio.Lock | None = None
 
     # ──────────── 基础 ────────────
     def get(self, key: str, default: Any = None) -> Any:
@@ -80,11 +89,17 @@ class Config:
             return default
         return default if value is None else value
 
-    def set(self, key: str, value: Any) -> None:
+    def set(self, key: str, value: Any) -> bool:
+        """写入单个配置键，返回是否成功。调用方（WebUI 配置保存）据此把键记入
+        applied 还是 rejected——失败仍 warning 留痕，但不假装写成功。"""
         try:
             self._raw[key] = value
-        except Exception:
-            pass
+        except Exception as e:  # noqa: BLE001 - AstrBotConfig 行为异常时降级为不写
+            from astrbot.api import logger
+
+            logger.warning(f"[music_hub] 配置项 {key} 写入失败: {type(e).__name__}: {e}")
+            return False
+        return True
 
     def save(self) -> bool:
         """保存配置（同步）。**事件循环上请用 :meth:`save_async`**，此方法供非异步上下文。"""
@@ -101,7 +116,9 @@ class Config:
         """事件循环安全的保存。
 
         优先走 AstrBotConfig.save_config_async（4.28+ 自带：快照 + revision 防并发
-        覆盖，磁盘写在 to_thread）；低版本没有该属性时退回 to_thread(save)。
+        覆盖，磁盘写在 to_thread）；低版本没有该属性时退回 to_thread(save)——save
+        在工作线程序列化 live dict，与并发的另一次回退保存互相交错，用实例级锁把
+        回退保存串行化（快照路径自带 revision 保护，不加锁）。
         """
         raw_async = getattr(self._raw, "save_config_async", None)
         if callable(raw_async):
@@ -109,9 +126,19 @@ class Config:
                 return bool(await raw_async())
             except Exception:  # noqa: BLE001
                 return False
-        import asyncio
-
-        return await asyncio.to_thread(self.save)
+        if self._save_lock is None:
+            # 事件循环单线程，惰性创建无竞态（3.10+ 的 Lock 不再绑定创建时的 loop）
+            self._save_lock = asyncio.Lock()
+        async with self._save_lock:
+            # 回退路径在工作线程序列化 live dict：事件循环并发的 set()/set_src_cookie
+            # 可能撞「dict changed size during iteration」（save 吞成 False，调用方
+            # 误报「配置保存失败」，扫码凭证丢持久化）。快照路径有 revision 保护，
+            # 这里退一步用单次重试收敛——竞态窗口只在序列化瞬间，重试几乎必成
+            for attempt in (1, 2):
+                if await asyncio.to_thread(self.save):
+                    return True
+                await asyncio.sleep(0.05 * attempt)
+            return False
 
     # ──────────── 全局 ────────────
     @property
@@ -203,10 +230,11 @@ class Config:
         """音源 API 地址，完全以配置为准（默认值只在 _conf_schema.json 里）。
 
         留空返回空串 = 该音源停用（这也是 ncm/kg 唯一的单音源开关）；
-        新装时 AstrBot 按 schema default 补齐，开箱即有值。QQ 不依赖外部服务，恒返回 "local"。
+        schema 默认值为空串，新装 ncm/kg 双双停用，需用户自行填 API 地址。
+        QQ 不依赖外部服务，恒返回展示用哨兵 "内置"（WebUI 音源状态卡直接渲染该值）。
         """
         if source == "qq":
-            return "local"
+            return "内置"
         return normalize_base(as_str(self.src_node(source).get("apiBase")))
 
     # 旧版 QQ 节点用 credential/uin，与另两平台的 cookie/uid 不一致；
@@ -280,7 +308,7 @@ class Config:
 
     def set_acl(
         self, mode: str | None = None, blacklist: list | None = None, whitelist: list | None = None
-    ) -> None:
+    ) -> bool:
         acl = dict(self.get("acl")) if isinstance(self.get("acl"), dict) else {}
         if mode is not None:
             acl["mode"] = mode
@@ -288,7 +316,9 @@ class Config:
             acl["blacklist"] = blacklist
         if whitelist is not None:
             acl["whitelist"] = whitelist
-        self.set("acl", acl)
+        # 透传 set() 结果：丢弃会让「底层写入失败」在 WebUI 响应里谎报 ok:true，
+        # 管理员误以为拉黑已生效（与 make_config_save 的 set 检查同一纪律）
+        return self.set("acl", acl)
 
     # ──────────── WebUI ────────────
     @property
@@ -302,15 +332,33 @@ class Config:
 
     @property
     def webui_host_allowlist(self) -> list[str]:
-        """允许以域名访问面板的 Host 白名单（子域名自动放行）。"""
+        """允许以域名访问面板的 Host 白名单（精确匹配，不做子域放行）。"""
         raw = self.webui_node().get("hostAllowlist")
         if not isinstance(raw, list):
             return []
         return [d.strip().lower().lstrip(".") for d in (str(x) for x in raw) if d.strip()]
 
     @property
+    def webui_secure_cookie(self) -> bool:
+        """会话 Cookie 是否加 Secure 标志：https 反代场景开启；http 直连必须关
+        （Secure cookie 不会被明文请求携带，开了就永远登不上）。"""
+        return as_bool(self.webui_node().get("secureCookie"), False)
+
+    @property
+    def webui_trusted_proxy(self) -> str:
+        """可信反代地址（IP/CIDR，逗号分隔）。空 = 不信任 X-Forwarded-For，来源 IP
+        一律取 TCP 对端（直连语义）。仅反代需要按真实客户端 IP 限速时配置。"""
+        return as_str(self.webui_node().get("trustedProxy"), "")
+
+    @property
     def webui_port(self) -> int:
         return as_int(self.webui_node().get("port"), 17818, lo=1, hi=65535)
+
+    @property
+    def webui_session_hours(self) -> int:
+        """WebUI 登录会话有效时长（小时）。与 _auth.DEFAULT_SESSION_HOURS、
+        _api_admin._NESTED_INT_RANGES 三方同口径。"""
+        return as_int(self.webui_node().get("sessionHours"), 12, lo=1, hi=168)
 
     @property
     def webui_password(self) -> str:
@@ -354,6 +402,11 @@ class Config:
     def rate_limit_ms(self) -> int:
         # 统一返回 int：此前缺键返回 250.0、存在返回 int，类型漂移
         return as_int(self.get("rateLimitMs"), 250, lo=0, hi=5000)
+
+    @property
+    def api_timeout_sec(self) -> int:
+        """音源 JSON 请求超时（秒）。经 http 模块的 provider 惰性读取，改配置即时生效。"""
+        return as_int(self.get("apiTimeoutSec"), 20, lo=5, hi=120)
 
     @property
     def cooldown_sec(self) -> int:

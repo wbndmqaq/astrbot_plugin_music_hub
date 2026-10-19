@@ -29,14 +29,23 @@ def _file_to_base64(path: str) -> str:
         return base64.b64encode(f.read()).decode("ascii")
 
 
+# 协议端假死（ws 半开）时 call_action 会无限期挂起，把整条投递链卡死：
+# 统一 60s 超时，超时按普通发送失败处理（语音/文件退组件通道，音乐卡降级返回 False）
+_CALL_ACTION_TIMEOUT = 60
+
+
 async def _aiocq_call_action(event, action: str, sid: str, segs: list) -> None:
     bot = getattr(event, "bot", None) or getattr(getattr(event, "platform", None), "bot", None)
     if bot is None:
         raise RuntimeError("无法获取 aiocqhttp bot 实例")
     if action == "send_group_msg":
-        await bot.call_action(action, group_id=sid, message=segs)
+        coro = bot.call_action(action, group_id=sid, message=segs)
     else:
-        await bot.call_action(action, user_id=sid, message=segs)
+        coro = bot.call_action(action, user_id=sid, message=segs)
+    try:
+        await asyncio.wait_for(coro, timeout=_CALL_ACTION_TIMEOUT)
+    except asyncio.TimeoutError as e:
+        raise RuntimeError(f"OneBot 响应超时（{_CALL_ACTION_TIMEOUT}s）") from e
 
 
 def aiocq_target(event) -> tuple[str, str]:
@@ -44,6 +53,10 @@ def aiocq_target(event) -> tuple[str, str]:
     sid = event.message_obj.group_id if is_group else event.get_sender_id()
     # 部分平台用 UUID 而非数字 id，int() 会抛 ValueError 让语音/文件投递整体退化成
     # 组件通道。OneBot 协议对 string id 兼容，原样传即可。
+    # sender_id 为 None 时 str() 会拼出 user_id="None"——协议端必报参数错误，
+    # 与其多发一轮注定失败的请求，不如在这里就抛错走组件通道降级
+    if not sid:
+        raise RuntimeError("无法确定 OneBot 消息目标（sender/group id 为空）")
     return ("send_group_msg" if is_group else "send_private_msg"), str(sid)
 
 
@@ -76,10 +89,20 @@ async def _send_music_segment(event, music_data: dict) -> bool:
     call_action = getattr(bot, "call_action", None)
     if call_action is None:
         return False
-    action, sid = aiocq_target(event)
-    target = {"group_id": sid} if action == "send_group_msg" else {"user_id": sid}
     try:
-        await call_action(action, message=[{"type": "music", "data": music_data}], **target)
+        action, sid = aiocq_target(event)
+        target = {"group_id": sid} if action == "send_group_msg" else {"user_id": sid}
+    except Exception as e:  # noqa: BLE001
+        # 目标缺失（sender/group id 全空）时让原生卡链路与 aiocq_send_record/file
+        # 同口径降级返回 False，而不是穿到路由兜底
+        logger.warning(f"{TAG} 音乐卡片发送失败（无可用消息目标）: {e}")
+        return False
+    try:
+        # 与 _aiocq_call_action 同一假死风险：原生卡挂起同样会卡死投递链
+        await asyncio.wait_for(
+            call_action(action, message=[{"type": "music", "data": music_data}], **target),
+            timeout=_CALL_ACTION_TIMEOUT,
+        )
         return True
     except Exception as e:  # noqa: BLE001
         logger.warning(f"{TAG} 音乐卡片发送失败: {e}")

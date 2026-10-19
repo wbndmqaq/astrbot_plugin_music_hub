@@ -12,7 +12,7 @@
   .hero::after{content:"";position:absolute;inset:0;z-index:-1;opacity:.05;mix-blend-mode:overlay;
     background:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='140' height='140'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.9' numOctaves='2'/%3E%3CfeColorMatrix type='saturate' values='0'/%3E%3C/filter%3E%3Crect width='140' height='140' filter='url(%23n)'/%3E%3C/svg%3E")}
   .hero-src{font-size:11px;font-weight:800;letter-spacing:3px;opacity:.9}
-  .hero-title{margin-top:8px;font-size:31px;font-weight:900;letter-spacing:.5px;line-height:1.2;
+  .hero-title{margin-top:8px;font-size:31px;font-weight:900;letter-spacing:.5px;line-height:1.2;overflow-wrap:anywhere;
     text-shadow:0 2px 18px rgba(0,0,0,.18)}
   .hero-sub{margin-top:8px;font-size:13px;font-weight:600;opacity:.9}
   .hero-stats{display:flex;gap:10px;margin-top:15px;flex-wrap:wrap}
@@ -26,7 +26,7 @@
   .row:last-child{border-bottom:none}
   .row-idx{width:28px;text-align:center;font-size:14.5px;font-weight:800;color:var(--mh-muted);
     font-variant-numeric:tabular-nums;flex:none}
-  .row-idx.top{color:var(--mh-nm);font-size:16.5px}
+  .row-idx.top{color:var(--mh-nm-deep);font-size:16.5px}
   .row-cover{width:44px;height:44px;border-radius:11px;object-fit:cover;flex:none;box-shadow:0 3px 10px rgba(0,0,0,.14)}
   .row-cover-ph{width:44px;height:44px;border-radius:11px;flex:none;display:grid;place-items:center;
     background:var(--mh-chip);color:var(--mh-nm);font-size:17px;font-weight:800}
@@ -48,14 +48,16 @@
     <div class="hero-title">{{ data.title }}</div>
     {% if data.subtitle %}<div class="hero-sub">{{ data.subtitle }}</div>{% endif %}
     <div class="hero-stats">
-      <div class="stat-chip"><b>{{ data.total }}</b> 项</div>
+      {# total 缺失时（ChainableUndefined 渲染成空串）会留下孤立的「 项」，回退用 items 实际条数（对齐 comment.html 的写法） #}
+      <div class="stat-chip">{% if data.total %}<b>{{ data.total }}</b> 项{% else %}共 {{ (data.get("items") or [])|length }} 项{% endif %}</div>
     </div>
   </div>
   <div class="body-card">
     <div class="rows">
       {% for it in data.get("items") or [] %}
       <div class="row">
-        <div class="row-idx{% if it.index <= 3 %} top{% endif %}">{{ it.index }}</div>
+        {# index 先判存在再比较：ChainableUndefined 参与比较会抛 UndefinedError 整卡崩溃（缺失时徽章不渲染） #}
+        <div class="row-idx{% if it.index and it.index <= 3 %} top{% endif %}">{{ it.index }}</div>
         {% if it.cover %}
         <img class="row-cover" src="{{ it.cover }}" referrerpolicy="no-referrer" onerror="var d=document.createElement('div');d.className='row-cover-ph';d.textContent='♪';this.replaceWith(d)" />
         {% else %}
@@ -74,8 +76,10 @@
     {% endif %}
     <div class="footer">
       <span>♪ Music Hub 聚合点歌</span>
-      {# 不能写 data["items"]：键缺失时 Jinja 回退到 getattr，拿到的是 dict.items 方法 #}
-      <span>{{ (data.get("items") or [])|length }} / {{ data.total }}</span>
+      {# 不能写 data["items"]：键缺失时 Jinja 回退到 getattr，拿到的是 dict.items 方法。
+         total 用 truthy 判断而非 `is not none`：环境是 ChainableUndefined，键缺失时
+         `data.total` 是 Undefined、同一性比较恒真，页脚仍会渲染成孤立的「3 / 」 #}
+      <span>{{ (data.get("items") or [])|length }} / {% if data.total %}{{ data.total }}{% else %}{{ (data.get("items") or [])|length }}{% endif %}</span>
     </div>
   </div>
 </div>

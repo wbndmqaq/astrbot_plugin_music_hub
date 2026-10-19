@@ -54,11 +54,29 @@ _DEFAULT = PlatformCaps()
 
 
 def caps_for_name(name: str) -> PlatformCaps:
-    """按平台名取能力预设（WebUI 远程投递等没有 event 对象的场景）。"""
+    """按平台名取能力预设（WebUI 远程投递等没有 event 对象的场景）。
+
+    匹配是顺序敏感的**子串**匹配（按 _PRESETS 迭代序，先命中先返回）：
+    - key 不要用过短的词或通用词（如 "qq"），否则自定义平台名会被误归类；
+    - 新增 key 必须是全匹配语义的平台标识（协议适配器的 platform_name 原文）。
+
+    子串匹配之外再做一次去分隔符匹配：自定义显示名/别名（"qqofficial" 拼不出
+    qq_official）落默认全能力预设会丢 passive_limited 等省配额策略——把双方
+    分隔符都剥掉后再比对一次。"""
     name = str(name or "").lower()
     for key, caps in _PRESETS.items():
         if key in name:
             return caps
+    flat = name
+    for ch in ("_", "-", " "):
+        flat = flat.replace(ch, "")
+    if flat:
+        # 不设 flat != name 守卫：名字本身不含分隔符时（"qqofficial"）flat == name
+        # 会让这段匹配被跳过，docstring 自举的这类别名恰好失效；flat 的比对口径
+        # 是「key 去下划线后是否为其子串」，与第一段循环并不重复
+        for key, caps in _PRESETS.items():
+            if key.replace("_", "") in flat:
+                return caps
     return _DEFAULT
 
 

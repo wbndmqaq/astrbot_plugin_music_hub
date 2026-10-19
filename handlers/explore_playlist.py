@@ -1,4 +1,4 @@
-"""explore 域模块：playlist类发现指令。"""
+"""explore 域模块：playlist 类发现指令。"""
 
 from __future__ import annotations
 
@@ -86,8 +86,14 @@ async def run_playlist(service, event):
         await service.reply(event, "用法：歌单 歌单名 或 歌单 歌单ID")
         return
     if kw.isdigit():
-        # 纯 ID 直取：无需搜索，因此复用「听N」展开用的 resolver（同一实现、同一取数上限）
-        pl, songs = await resolver_for("playlist_songs", src)(service.client_of(src), kw, kw)
+        # 纯 ID 直取：无需搜索，因此复用「听N」展开用的 resolver（同一实现、同一取数上限）。
+        # 与 _resolve_by_keyword 同口径先判 None：catalog 的 resolver 表变化时这里
+        # 不至于 TypeError('NoneType' object is not callable)
+        resolve_songs = resolver_for("playlist_songs", src)
+        if resolve_songs is None:
+            await service.reply(event, f"{SOURCE_NAMES.get(src, src)}暂不支持歌单曲目查询")
+            return
+        pl, songs = await resolve_songs(service.client_of(src), kw, kw)
         if not songs:
             await service.reply(event, "歌单暂无曲目或不存在")
             return
@@ -196,7 +202,12 @@ async def run_related_playlists(service, event):
                 tip="命中多个歌单，回复 听N 展开后用「相关歌单 歌单ID」",
             )
             return
-        pid = cands[0]["id"]
+        # 上游行缺 id 时裸下标 KeyError 会被路由兜底吃成「执行失败」：
+        # 同文件 run_rank 对同类问题有明确兜底，这里保持同一口径
+        pid = cands[0].get("id") or ""
+        if not pid:
+            await service.reply(event, f"「{kw}」的搜索结果缺少歌单 ID（上游格式变化），请换个关键词")
+            return
     pls = await service.call(src, "explore", service.client_of(src).related_playlists(pid, 10))
     if not pls:
         await service.reply(event, "这个歌单没有相关推荐（官方榜单没有该数据）")

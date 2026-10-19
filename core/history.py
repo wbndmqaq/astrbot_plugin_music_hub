@@ -11,6 +11,7 @@
 
 from __future__ import annotations
 
+import copy
 import time
 
 # 每会话播放历史上限 / 分页缓存条目有效期（秒）/ 会话总数上限
@@ -80,9 +81,10 @@ class HistoryStore:
         if time.time() - entry.get("ts", 0) > PAGER_TTL:
             self._pagers.pop(key, None)
             return None
-        # 返回浅拷贝：调用方会原地改（如 detail.py 的 data["page"] = page），
-        # 直接给内部引用会让一处修改静默影响另一处持有同一 dict 的代码路径
-        return dict(entry.get("data") or {})
+        # 深拷贝：调用方会原地改顶层（如 detail.py 的 data["page"] = page）也可能
+        # 改嵌套列表（歌词页数据重组），浅拷贝下嵌套 lines/comments 仍与缓存共享
+        # 引用，一处原地改会静默污染缓存里另一页的数据
+        return copy.deepcopy(entry.get("data") or {})
 
     def sweep_pagers(self) -> int:
         """清掉过期分页缓存。PAGER_TTL 原先只在读取时惰性生效，

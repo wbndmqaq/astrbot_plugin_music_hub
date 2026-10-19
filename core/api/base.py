@@ -79,6 +79,7 @@ class SourceClient(Protocol):
 
     async def vip_info(self) -> dict:
         """会员信息。"""
+        ...
 
 
 @runtime_checkable

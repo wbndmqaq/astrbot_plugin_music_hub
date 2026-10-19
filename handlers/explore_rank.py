@@ -1,4 +1,4 @@
-"""explore 域模块：rank类发现指令。"""
+"""explore 域模块：rank 类发现指令。"""
 
 from __future__ import annotations
 
@@ -50,14 +50,20 @@ async def run_rank(service, event):
             subtitle="回复 排行榜 榜单名 查看歌曲",
         )
         return
-    # 按名匹配：先正向包含，再反向包含
+    # 按名匹配：先正向包含，再反向包含。反向包含必须排除空名行——
+    # 空串 in 任何字符串恒为 True，会误命中脏数据行而不是回复「没有找到榜单」
     hit = next((r for r in lst if name in (r.get("name") or "")), None) or next(
-        (r for r in lst if (r.get("name") or "") in name), None
+        (r for r in lst if (r.get("name") or "") and (r.get("name") or "") in name), None
     )
     if hit is None:
         await service.reply(event, f"没有找到榜单「{name}」，回复「排行榜」查看全部")
         return
-    songs = await service.call(src, "rank", client.rank_songs(hit["id"], 30))
+    rank_id = hit.get("id")
+    if not rank_id:
+        # 上游脏数据缺 id：明确回复而不是 KeyError 炸到路由兜底显示「执行失败」
+        await service.reply(event, f"榜单「{hit.get('name') or name}」数据异常，暂不支持查看歌曲")
+        return
+    songs = await service.call(src, "rank", client.rank_songs(rank_id, 30))
     if not songs:
         await service.reply(event, "榜单暂无歌曲")
         return
@@ -83,7 +89,13 @@ async def run_artist(service, event):
     if not kw:
         await service.reply(event, "用法：歌手 歌手名")
         return
-    res = await resolver_for("artist", src)(service.client_of(src), kw)
+    # 与 explore_playlist 同口径先判 None：catalog 的 resolver 表变化时这里
+    # 不至于 TypeError('NoneType' object is not callable)
+    resolve = resolver_for("artist", src)
+    if resolve is None:
+        await service.reply(event, f"{SOURCE_NAMES.get(src, src)}暂不支持歌手歌曲获取")
+        return
+    res = await resolve(service.client_of(src), kw)
     if not res.songs:
         await service.reply(event, f"没有找到歌手「{kw}」" if res.not_found else f"没有找到「{kw}」的歌曲")
         return

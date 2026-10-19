@@ -27,10 +27,20 @@ class UmoRegistry:
         self._dirty = False
 
     async def load(self) -> None:
-        """启动时从 KV 恢复（加载失败的条目直接丢弃）。"""
+        """启动时从 KV 恢复（加载失败的条目直接丢弃；脏 ts 归一成 float，
+        否则 save()/rows() 的排序在字符串 ts 上 TypeError）。"""
         data = await self._kv_get(self._key, None)
         if isinstance(data, dict):
-            self._rows = {k: v for k, v in data.items() if isinstance(v, dict) and v.get("umo")}
+            rows: dict[str, dict] = {}
+            for k, v in data.items():
+                if not (isinstance(v, dict) and v.get("umo")):
+                    continue
+                try:
+                    ts = float(v.get("ts", 0))
+                except (TypeError, ValueError):
+                    ts = 0.0
+                rows[str(k)] = {"umo": str(v["umo"]), "ts": ts}
+            self._rows = rows
 
     def note(self, scope: str, umo: str) -> bool:
         """登记会话的 umo。返回 True 表示落盘内容会变化（首次登记或 umo 变更，
@@ -44,6 +54,12 @@ class UmoRegistry:
         row = self._rows.get(scope)
         changed = row is None or row.get("umo") != umo
         self._rows[scope] = {"umo": umo, "ts": int(time.time())}
+        # 内存与落盘同口径截断：save() 的 [:MAX_SCOPES] 只作用于落盘拷贝，
+        # 不就地淘汰的话 _rows 随触达过的会话数只增不减，重启前不回收
+        if len(self._rows) > MAX_SCOPES:
+            over = len(self._rows) - MAX_SCOPES
+            for k in sorted(self._rows, key=lambda k: self._rows[k].get("ts", 0))[:over]:
+                self._rows.pop(k, None)
         # 保存进行中登记了新会话：置脏标记，让 save() 的尾随循环补写一次，
         # 否则 await 期间的变更永远等不到下一次 save
         if self._saving:
@@ -58,18 +74,18 @@ class UmoRegistry:
         self._saving = True
         try:
             while True:
+                # 常规路径：写盘期间 note() 置脏的变更补写。
+                # 正确性完全由这里的「置脏 → 写盘 → 查脏」循环保证：`self._dirty
+                # = False`（无 await 点）之后到下方 `if self._dirty` 之间没有任何
+                # 挂起点，note() 不可能插入——不要再在此之间加 await
                 self._dirty = False
                 trimmed = dict(sorted(self._rows.items(), key=lambda kv: -kv[1].get("ts", 0))[:MAX_SCOPES])
                 await self._kv_put(self._key, trimmed)
-                if not self._dirty:
-                    return
+                if self._dirty:
+                    continue
+                return
         finally:
             self._saving = False
-            # 退出前又有新登记（发生在上面的 _dirty 判定之后、finally 置位之前）：
-            # 不补跑一次这些 umo 就永远不落盘，重启后点歌台/订阅推送会丢目标会话。
-            if self._dirty:
-                self._saving = False
-                await self.save()
 
     def umo_of(self, scope: str) -> str:
         return (self._rows.get(scope) or {}).get("umo", "")

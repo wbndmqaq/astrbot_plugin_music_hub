@@ -29,8 +29,8 @@
   .cmt-main{flex:1;min-width:0}
   .cmt-head{display:flex;align-items:center;gap:8px;flex-wrap:wrap}
   .nick{font-size:13px;font-weight:800}
-  .hot-badge{font-size:9.5px;font-weight:800;padding:2px 8px;border-radius:999px;
-    background:linear-gradient(135deg,#f7b733,#e8892c);color:#fff;letter-spacing:1px}
+  .hot-badge{font-size:10.5px;font-weight:800;padding:2px 8px;border-radius:999px;
+    background:linear-gradient(135deg,#f7b733,#e8892c);color:#5c3a00;letter-spacing:1px}
   .cmt-time{margin-left:auto;font-size:10.5px;color:var(--mh-muted)}
   .cmt-body{font-size:14px;line-height:1.85;margin-top:6px;color:var(--mh-text);word-break:break-word;
     display:-webkit-box;-webkit-line-clamp:5;-webkit-box-orient:vertical;overflow:hidden}
@@ -43,14 +43,15 @@
 <div class="page">
   <div class="hero">
     <div class="hero-row">
-      {% if data.cover %}<img class="cover" src="{{ data.cover }}" referrerpolicy="no-referrer" />
+      {% if data.cover %}<img class="cover" src="{{ data.cover }}" referrerpolicy="no-referrer" onerror="var d=document.createElement('div');d.className='cover-ph';d.textContent='♪';this.replaceWith(d)" />
       {% else %}<div class="cover-ph">♪</div>{% endif %}
       <div class="meta">
         <div class="src-tag">{{ data.sourceName }} · 热评</div>
         <div class="title">{{ data.songName }}</div>
         <div class="artist">{{ data.singerName }}</div>
       </div>
-      <div class="pill">{{ data.total }} 条</div>
+      {# total 缺失时（ChainableUndefined 渲染成空串）会留下孤立的「 条」 #}
+      <div class="pill">{% if data.total %}{{ data.total }} 条{% else %}热评{% endif %}</div>
     </div>
   </div>
   <div class="comments">

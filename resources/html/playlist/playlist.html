@@ -10,7 +10,7 @@
     background:radial-gradient(58% 46% at 86% 8%,rgba(255,255,255,.28) 0%,transparent 68%),
                radial-gradient(50% 44% at 4% 98%,rgba(0,0,0,.30) 0%,transparent 72%)}
   .hero-src{font-size:11px;font-weight:800;letter-spacing:3px;opacity:.9}
-  .hero-title{margin-top:8px;font-size:31px;font-weight:900;line-height:1.2;text-shadow:0 2px 18px rgba(0,0,0,.18)}
+  .hero-title{margin-top:8px;font-size:31px;font-weight:900;line-height:1.2;overflow-wrap:anywhere;text-shadow:0 2px 18px rgba(0,0,0,.18)}
   .hero-sub{margin-top:8px;font-size:13px;font-weight:600;opacity:.9}
   .grid{background:linear-gradient(180deg,var(--mh-card-a),var(--mh-card-b));
     border-radius:0 0 26px 26px;padding:14px;margin-top:-8px;position:relative;
@@ -19,6 +19,9 @@
     display:flex;flex-direction:column;transition:transform .3s;box-shadow:0 4px 14px rgba(0,0,0,.05)}
   .pl-cover{position:relative;width:100%;aspect-ratio:1;border-radius:13px;overflow:hidden;background:var(--mh-chip)}
   .pl-cover img{width:100%;height:100%;object-fit:cover}
+  {# 封面裂图兜底与其他模板同口径：替换为 ♪ 占位块，而不是裸 remove 露出纯底色 #}
+  .pl-cover-ph{width:100%;height:100%;display:grid;place-items:center;
+    color:var(--mh-nm);font-size:26px;font-weight:800}
   .pl-count{position:absolute;right:7px;top:7px;display:inline-flex;align-items:center;gap:4px;
     font-size:10px;font-weight:800;color:#fff;padding:3px 9px;border-radius:999px;
     background:rgba(0,0,0,.5);backdrop-filter:blur(4px)}
@@ -41,7 +44,7 @@
     {% for p in data.get("items") or [] %}
     <div class="pl">
       <div class="pl-cover">
-        {% if p.cover %}<img src="{{ p.cover }}" referrerpolicy="no-referrer" />{% endif %}
+        {% if p.cover %}<img src="{{ p.cover }}" referrerpolicy="no-referrer" onerror="var d=document.createElement('div');d.className='pl-cover-ph';d.textContent='♪';this.replaceWith(d)" />{% endif %}
         <span class="pl-count">▶ {{ p.playCountText }}</span>
       </div>
       <div class="pl-name">{{ p.name }}</div>

@@ -24,7 +24,9 @@
   /* accent 底上的文字：白字压 --pink 仅 2.36:1，压 --blue-deep 仅 2.88:1 */
   --on-accent:#2b1024;
   --r-lg:24px;--r-md:18px;
-  --side-w:236px;
+  /* 268：品牌区（三 logo 96px + 间距 10 + 副标题 ~93px）在 12px 侧栏内边距下刚好放下，
+     再窄会把「Music Hub / 聚合点歌 · 管理面板」挤出侧栏卡片（实测 236 时溢出 ~47px） */
+  --side-w:268px;
   --ease:cubic-bezier(.22,1,.36,1);
   --bounce:cubic-bezier(.34,1.56,.64,1);
   --clay:0 6px 0 rgba(240,79,152,.13),0 14px 34px rgba(240,79,152,.12),inset 0 2px 0 rgba(255,255,255,.9);
@@ -54,7 +56,10 @@ body{
   font-family:"MiSans","HarmonyOS Sans SC","PingFang SC","Microsoft YaHei",sans-serif;
   color:var(--txt);min-height:100vh;
   /* clip 而非 hidden：hidden 会把 overflow 变成滚动容器（position:sticky 等失效），
-     375px 下 .result-row 溢出仍需被裁掉，故用 clip */
+     375px 下 .result-row 溢出仍需被裁掉，故用 clip。
+     前置 hidden 行作旧 Safari（≤15 不支持 clip）的回退：支持 clip 的浏览器
+     取后一条声明，横向溢出行为不变 */
+  overflow-x:hidden;
   overflow-x:clip;
   padding-left:var(--side-w);
   background:linear-gradient(160deg,var(--bg) 0%,var(--bg2) 55%,var(--bg) 100%);
@@ -90,8 +95,10 @@ html[data-theme="dark"] .petal{background:linear-gradient(135deg,#4a2b57,#834a86
              radial-gradient(44% 38% at 50% 110%,rgba(179,157,255,.24) 0%,transparent 70%)}
 html[data-theme="dark"] .bg-wash{opacity:.4}
 
-/* ─────────── 滚动进度条（糖果双色） ─────────── */
-.scroll-progress{position:fixed;top:0;left:0;width:100%;height:4px;z-index:400;
+/* ─────────── 滚动进度条（糖果双色） ───────────
+   z-index 压到 90 段：原先 400 高于 modal-mask(300)/login-mask(200)，
+   弹窗打开时进度条仍悬浮其上 */
+.scroll-progress{position:fixed;top:0;left:0;width:100%;height:4px;z-index:90;
   transform-origin:0 50%;transform:scaleX(0);pointer-events:none;
   background:linear-gradient(90deg,var(--pink),var(--blue),var(--violet),var(--pink));
   background-size:200% 100%;animation:candyFlow 4s linear infinite;
@@ -101,9 +108,9 @@ html[data-theme="dark"] .bg-wash{opacity:.4}
 /* ─────────── 软糖滚动条 ─────────── */
 ::-webkit-scrollbar{width:10px;height:10px}
 ::-webkit-scrollbar-track{background:transparent}
-::-webkit-scrollbar-thumb{border-radius:999px;background:linear-gradient(180deg,var(--pink),var(--violet));
+::-webkit-scrollbar-thumb{border-radius:999px;background:linear-gradient(180deg,var(--pink-ink),var(--violet-ink));
   border:2.5px solid var(--bg);box-shadow:inset 0 1px 0 rgba(255,255,255,.4)}
-*{scrollbar-width:thin;scrollbar-color:var(--pink) transparent}
+*{scrollbar-width:thin;scrollbar-color:var(--pink-ink) transparent}
 
 /* ─────────── 侧边栏（云朵气泡） ─────────── */
 .side{position:fixed;left:14px;top:14px;bottom:14px;width:calc(var(--side-w) - 28px);z-index:50;
@@ -113,19 +120,21 @@ html[data-theme="dark"] .bg-wash{opacity:.4}
   border:2.5px solid var(--line);box-shadow:var(--clay);
   backdrop-filter:blur(16px)}
 html[data-theme="dark"] .side{background:linear-gradient(180deg,rgba(38,30,66,.94),rgba(30,24,54,.9))}
-.brand{display:flex;align-items:center;gap:11px;padding:2px 8px 14px}
+/* min-width:0 兜底：极端字体/字号下文本列可收缩并省略，不再把副标题挤出卡片 */
+.brand{display:flex;align-items:center;gap:10px;padding:2px 6px 14px;min-width:0}
 /* 侧边栏品牌标识：三平台官方 logo 横向排列 */
-.brand-logo{width:auto;height:38px;border-radius:14px;display:flex;align-items:center;flex:none;
-  gap:4px;padding:5px 8px;background:var(--card2);border:2.5px solid var(--line);
+.brand-logo{width:auto;height:34px;border-radius:13px;display:flex;align-items:center;flex:none;
+  gap:3px;padding:4px 6px;background:var(--card2);border:2.5px solid var(--line);
   box-shadow:var(--clay-sm);animation:logoBob 3.2s ease-in-out infinite}
 /* 统一底衬：酷狗官方 logo 是白底黑 K，无底衬时在浅色卡片上不可见 */
-.brand-logo img{width:24px;height:24px;object-fit:contain;display:block;flex:none;
+.brand-logo img{width:20px;height:20px;object-fit:contain;display:block;flex:none;
   background:#fff;border-radius:50%;padding:1px}
 @keyframes logoBob{0%,100%{transform:rotate(-5deg)}50%{transform:rotate(5deg) translateY(-2px)}}
-.brand-txt{font-size:20px;font-weight:900;line-height:1.05;white-space:nowrap}
+.brand-txt{font-size:19px;font-weight:900;line-height:1.05;white-space:nowrap;min-width:0;overflow:hidden}
 .brand-txt b{background:linear-gradient(90deg,var(--pink-deep),var(--violet));
   -webkit-background-clip:text;background-clip:text;-webkit-text-fill-color:transparent}
-.brand-txt small{display:block;font-size:9.5px;font-weight:700;color:var(--sub);letter-spacing:1px;margin-top:3px;white-space:nowrap}
+.brand-txt small{display:block;font-size:10px;font-weight:700;color:var(--sub);letter-spacing:.5px;margin-top:3px;
+  white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 
 .side-list{position:relative;flex:1;display:flex;flex-direction:column;gap:6px;overflow-y:auto;scrollbar-width:none}
 .side-list::-webkit-scrollbar{display:none}
@@ -161,8 +170,9 @@ html[data-theme-mode="light"] .theme-toggle .ico-sun{opacity:1;transform:none}
 .chip{display:inline-flex;align-items:center;gap:7px;padding:6px 15px;border-radius:999px;
   background:var(--card);border:2px solid var(--line);color:var(--sub);font-size:12px;font-weight:800;
   box-shadow:var(--clay-sm)}
-/* 状态点承载「运行中/已关闭」语义，必须 ≥3:1，故用 ink 而非 pastel */
-.chip .dot{width:8px;height:8px;border-radius:50%;background:var(--faint);box-shadow:0 0 0 3px rgba(62,207,154,.2)}
+/* 状态点承载「运行中/已关闭」语义，必须 ≥3:1，故用 ink 而非 pastel。
+   中性态光晕用灰而非绿：默认/关闭状态配绿色光晕是语义冲突 */
+.chip .dot{width:8px;height:8px;border-radius:50%;background:var(--faint);box-shadow:0 0 0 3px rgba(128,128,128,.18)}
 .chip.ok .dot{background:var(--ok-ink);box-shadow:0 0 0 3px rgba(62,207,154,.2)}
 .chip.warn .dot{background:var(--warn-ink);box-shadow:0 0 0 3px rgba(255,184,77,.25)}
 
@@ -240,12 +250,57 @@ html[data-theme-mode="light"] .theme-toggle .ico-sun{opacity:1;transform:none}
 .input:focus-visible{box-shadow:0 0 0 4px rgba(168,18,58,.38)}
 html[data-theme="dark"] .input:focus-visible{box-shadow:0 0 0 4px rgba(255,158,198,.42)}
 .input::placeholder{color:var(--faint)}
+/* tooltip 宿主带 tabindex=0（键盘可达）：给键盘用户可见的焦点环 */
+[data-tip][tabindex="0"]:focus-visible{outline:2px solid var(--focus);outline-offset:2px;border-radius:8px}
 select.input{appearance:none;
   background-image:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='10' height='6' viewBox='0 0 10 6'%3E%3Cpath d='M1 1l4 4 4-4' stroke='%23f04f98' stroke-width='1.8' fill='none' stroke-linecap='round'/%3E%3C/svg%3E");
   background-repeat:no-repeat;background-position:right 15px center;padding-right:36px}
+
+/* ─────────── 自定义下拉框（替代原生 select 弹层） ───────────
+   原生展开列表由浏览器绘制、无法套主题与动画；增强后 select 隐藏，
+   仅作 value 载体（enhanceSelects 见 app.js）。 */
+.csel{position:relative;flex:1;min-width:160px}
+/* 窄宽度与原生 select 载体（.sel-narrow，见下方表单区）共用一条规则 */
+.csel-btn{display:flex;align-items:center;gap:10px;text-align:left;padding-right:38px;cursor:pointer}
+.csel-label{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.csel-arrow{flex:none;color:var(--pink-ink);transition:transform .28s var(--bounce)}
+.csel.open .csel-arrow{transform:rotate(180deg)}
+.csel.open .csel-btn{border-color:var(--focus)}
+.csel-pop{position:fixed;z-index:90;
+  background:var(--card);border:2.5px solid var(--line-strong);border-radius:16px;
+  box-shadow:var(--clay),0 18px 44px rgba(74,44,63,.18);
+  padding:6px;overflow-y:auto;
+  animation:cselInDown .24s var(--bounce)}
+/* left/top/width/maxHeight 由 cselPosition() 按按钮位置与视口剩余空间内联设定；
+   .up 只切换进出场动画方向 */
+.csel-pop.up{animation-name:cselInUp}
+.csel-pop.closing{animation:cselOutDown .16s var(--ease) forwards}
+.csel-pop.up.closing{animation-name:cselOutUp}
+@keyframes cselInDown{from{opacity:0;transform:translateY(-9px) scale(.97)}to{opacity:1;transform:none}}
+@keyframes cselInUp{from{opacity:0;transform:translateY(9px) scale(.97)}to{opacity:1;transform:none}}
+@keyframes cselOutDown{to{opacity:0;transform:translateY(-7px) scale(.98)}}
+@keyframes cselOutUp{to{opacity:0;transform:translateY(7px) scale(.98)}}
+.csel-opt{display:flex;align-items:center;gap:8px;padding:9px 12px;border-radius:11px;cursor:pointer;
+  font-size:13px;font-weight:700;color:var(--sub);min-height:38px;transition:background-color .15s,color .15s}
+.csel-opt.active{background:var(--muted);color:var(--txt)}
+.csel-opt.sel{color:var(--pink-ink);font-weight:900}
+.csel-opt.sel::after{content:"✓";margin-left:auto;font-weight:900}
+/* 被替代的原生 select：display:none 顺带移出 Tab 序与读屏树 */
+[data-csel-src]{display:none!important}
+
+/* ─────────── 自定义 tooltip（替代原生 title 气泡） ─────────── */
+.tip{position:fixed;z-index:600;pointer-events:none;max-width:min(80vw,300px);
+  padding:6px 11px;border-radius:11px;background:var(--pink-ink);color:#fff;
+  font-size:11.5px;font-weight:800;line-height:1.5;box-shadow:var(--clay-sm);
+  animation:tipIn .18s var(--ease)}
+/* 暗色主题 --pink-ink 重定义为浅粉 #ff9ec6，白字压上去仅 ~1.9:1（要求 4.5:1）：
+   tooltip 承载流水详情/错误全文等关键信息，暗色下改用深底 */
+html[data-theme="dark"] .tip{background:#5c1436;color:#fff}
+@keyframes tipIn{from{opacity:0;transform:translateY(5px) scale(.96)}to{opacity:1;transform:none}}
 .form-row{display:flex;gap:10px;align-items:center;margin-top:12px;flex-wrap:wrap}
 .form-row .input{flex:1;min-width:160px}
-.sel-narrow{max-width:280px}
+/* 窄 select：原生载体与增强后的 .csel 根共用（选择器目标不同，宽度同源） */
+.csel.sel-narrow,.sel-narrow{max-width:280px}
 
 /* ─────────── 提示条 ─────────── */
 .hint-bar{padding:12px 16px;border-radius:16px;margin-bottom:14px;
@@ -261,7 +316,7 @@ select.input{appearance:none;
 .svc-logo{width:22px;height:22px;object-fit:contain;display:block;flex:none;
   background:#fff;border-radius:50%;padding:1px}
 .svc-name{font-weight:900;font-size:14px}
-.svc-tag{margin-left:auto;font-size:10.5px;padding:4px 11px;border-radius:999px;font-weight:900}
+.svc-tag{margin-left:auto;font-size:11px;padding:4px 11px;border-radius:999px;font-weight:900}
 /* pastel ok 1.69:1 → ink 5.33:1(on card) / 4.76:1(on muted) */
 .svc-tag.ok{background:rgba(62,207,154,.16);color:var(--ok-ink)}
 .svc-tag.bad{background:rgba(255,107,129,.14);color:var(--danger-ink)}
@@ -372,7 +427,7 @@ html[data-theme="dark"] .modal-mask{background:rgba(10,6,24,.7)}
 /* width 动画每帧触发布局；改 scaleX（合成属性） */
 .bar-fill{display:block;height:100%;border-radius:999px;width:100%;
   transform:scaleX(var(--w,0));transform-origin:left center;
-  transition:transform .7s var(--ease);background:linear-gradient(90deg,var(--bc,var(--blue)),var(--bc,var(--blue)))}
+  transition:transform .7s var(--ease);background:var(--bc,var(--blue))}
 .bar-num{text-align:right;color:var(--sub);font-variant-numeric:tabular-nums;font-weight:900}
 
 /* ─────────── 表格 ─────────── */
@@ -403,6 +458,13 @@ html[data-theme="dark"] .modal-mask{background:rgba(10,6,24,.7)}
 .src-dot.ncm{--sc:var(--ncm);--sci:var(--ncm-ink)}
 .src-dot.kg{--sc:var(--kg);--sci:var(--kg-ink)}
 .src-dot.qq{--sc:var(--qq);--sci:var(--qq-ink)}
+/* 未知音源兜底（防御路径：后端 SOURCES 恒为三平台）——与模板侧 list.html 的
+   .src-other 同口径的中性灰，缺了会让圆点透明、文字失去品牌色对比。
+   暗色主题单独提亮：#4a5462 压暗色卡（#221a3e）对比度约 2.1:1，低于 4.5:1 */
+.src-dot.src-other{--sc:#8f9aab;--sci:#4a5462}
+html[data-theme="dark"] .src-dot.src-other{--sc:#a7b0bf;--sci:#b7c0cf}
+/* 等宽字体（二维码降级为纯链接时的 URL 展示）：长 URL 复制体验 */
+.mono{font-family:"Cascadia Mono",Consolas,"JetBrains Mono",monospace;font-size:12px;word-break:break-all}
 .vchip{display:inline-flex;align-items:center;gap:4px;padding:3px 8px 3px 4px;border-radius:10px;
   background:var(--card);border:2px solid var(--line);
   transition:transform .2s var(--bounce),border-color .2s}
@@ -411,7 +473,7 @@ html[data-theme="dark"] .modal-mask{background:rgba(10,6,24,.7)}
 .vchip.qq{border-color:var(--qq-ink)}
 .vchip img{width:18px;height:18px;object-fit:contain;display:block;flex:none;
   background:#fff;border-radius:50%;padding:1px}
-.vchip small{font-size:9.5px;font-weight:900;color:var(--sub);letter-spacing:.3px}
+.vchip small{font-size:11px;font-weight:900;color:var(--sub);letter-spacing:.3px}
 
 /* ─────────── 多音源搜索（WebUI） ─────────── */
 .search-bar{display:flex;gap:10px;margin-bottom:16px}
@@ -452,7 +514,9 @@ html[data-theme="dark"] .modal-mask{background:rgba(10,6,24,.7)}
 .seg{display:inline-flex;background:var(--muted);border-radius:999px;padding:5px;gap:3px;margin-bottom:14px;
   border:2px solid var(--line-soft)}
 .seg button{border:none;background:none;color:var(--sub);padding:8px 20px;border-radius:999px;font-size:13px;
-  min-height:38px;font-weight:900;transition:background-color .3s var(--bounce),color .3s,box-shadow .3s}
+  min-height:38px;font-weight:900;position:relative;transition:background-color .3s var(--bounce),color .3s,box-shadow .3s}
+/* 38px 视觉 + ::before 把触控热区扩到 44px（对齐 .stab::before 的做法） */
+.seg button::before{content:"";position:absolute;inset:-3px;border-radius:inherit}
 .seg button.on{background:linear-gradient(135deg,var(--pink),var(--pink-deep));color:var(--on-accent);
   box-shadow:0 3px 0 rgba(240,79,152,.3)}
 .acl-cols{display:grid;grid-template-columns:1fr 1fr;gap:16px}
@@ -466,17 +530,33 @@ html[data-theme="dark"] .modal-mask{background:rgba(10,6,24,.7)}
   transition:transform .2s,color .2s,background-color .2s}
 .le-item button::before{content:"";position:absolute;inset:-6px}
 .empty-state{text-align:center;padding:26px 10px;color:var(--faint);font-size:13px;font-weight:700;animation:popIn .4s var(--bounce)}
+/* 部分音源取数失败的提示横幅：结果可用但可能不全，视觉上弱于错误、强于正文 */
+.src-notice{margin:0 0 10px;padding:9px 13px;border:1.5px solid var(--line);border-radius:10px;
+  background:var(--muted);color:var(--sub);font-size:12.5px;line-height:1.6;animation:popIn .35s var(--bounce)}
 
-/* ─────────── 配置 ─────────── */
+/* ─────────── 配置 ───────────
+   折叠组：手写 <button.cfg-head> + grid-template-rows 过渡。
+   原生 <details> 的展开/收起是瞬时切换、无法做高度动画。 */
 .cfg-group{border:2.5px solid var(--line);border-radius:var(--r-lg);margin-bottom:14px;
   background:var(--card);overflow:hidden;box-shadow:var(--clay-sm)}
-.cfg-group summary{display:flex;align-items:center;gap:10px;padding:15px 18px;cursor:pointer;list-style:none;
+.cfg-head{display:flex;align-items:center;gap:10px;padding:15px 18px;cursor:pointer;
+  border:none;background:none;width:100%;color:var(--txt);font-family:inherit;text-align:left;
   font-weight:900;font-size:14px;user-select:none;transition:background .2s;min-height:52px}
-.cfg-group summary::-webkit-details-marker{display:none}
-.cfg-group summary .arrow{transition:transform .3s var(--bounce);color:var(--pink-ink)}
-.cfg-group[open] summary .arrow{transform:rotate(90deg)}
+.cfg-head .arrow{transition:transform .3s var(--bounce);color:var(--pink-ink)}
+.cfg-group.open .cfg-head .arrow{transform:rotate(90deg)}
+/* 0fr→1fr 网格行过渡：内容高度自适应，无需 JS 测量 scrollHeight。
+   0fr 只收高度不改可聚焦性：收起态内容仍在 Tab 序与读屏树里，键盘会走进
+   看不见的输入框（焦点环还被 overflow:hidden 裁掉）→ 必须 visibility:hidden。
+   收起时 visibility 延迟 .32s，等高度动画播完再隐藏；展开态把 delay 归零，
+   否则开场 320ms 内容不可见 */
+.cfg-body{display:grid;grid-template-rows:0fr;visibility:hidden;
+  transition:grid-template-rows .32s var(--ease),visibility 0s .32s}
+.cfg-group.open .cfg-body{grid-template-rows:1fr;visibility:visible;transition-delay:0s}
+.cfg-body-in{min-height:0;overflow:hidden}
 .cfg-count{margin-left:auto;font-size:11px;color:var(--sub);background:var(--muted);padding:4px 12px;border-radius:999px;font-weight:900}
-.cfg-items{padding:6px 18px 18px;display:grid;grid-template-columns:repeat(auto-fit,minmax(300px,1fr));gap:14px}
+/* 轨道下限用 min(300px,100%)：裸 300px 在 ≤368px 视口（360 减去 wrap/group
+   内边距后可用宽约 291px）会溢出，被 .cfg-group 的 overflow:hidden 裁掉右缘 */
+.cfg-items{padding:6px 18px 18px;display:grid;grid-template-columns:repeat(auto-fit,minmax(min(300px,100%),1fr));gap:14px}
 .cfg-item{display:flex;flex-direction:column;gap:7px}
 .cfg-item label,.cfg-label{font-size:12.5px;color:var(--sub);font-weight:900}
 .cfg-item .desc{font-size:11px;color:var(--faint);line-height:1.6;font-weight:600}
@@ -520,13 +600,23 @@ html[data-theme="dark"] .modal-mask{background:rgba(10,6,24,.7)}
 @keyframes shimmer{to{background-position:-200% 0}}
 
 /* ─────────── 响应式 ─────────── */
-@media (max-width:920px){.acl-cols{grid-template-columns:1fr}}
+/* 769–920px 平板区间：result-row 的固定宽子项（封面/版本/操作/时长）合计
+   ≈510px+ 已超可用宽度，.result-main 被 min-width:0 压没后仍溢出 10–20px
+   被 overflow-x:clip 裁掉——把 ≤768 的换行布局提前到 920 生效 */
+@media (max-width:920px){
+  .acl-cols{grid-template-columns:1fr}
+  .result-row{flex-wrap:wrap;row-gap:10px}
+  .result-vers{order:3;max-width:100%;justify-content:flex-start}
+  .row-actions{order:4;margin-left:auto}
+  .result-dur{order:5;margin-left:auto}
+}
 @media (max-width:768px){
   body{padding-left:0;padding-bottom:calc(70px + env(safe-area-inset-bottom))}
   .side{position:static;width:auto;flex-direction:column;gap:8px;padding:14px;border-radius:0 0 26px 26px;
     margin:0 0 4px}
   .brand{padding-bottom:6px}
-  .side-list{flex-direction:row;overflow-x:auto;gap:8px;padding-bottom:4px}
+  /* 全部 9 项已由底栏(5) + 更多抽屉(4)承载：顶部横滚列表与之重复，隐藏收敛为两层 */
+  .side-list{display:none}
   .side-item{padding:8px 13px;white-space:nowrap;font-size:12.5px;min-height:44px}
   /* 主题切换与退出登录在手机上改由底栏「更多」抽屉提供（见 index.html .more-sheet），
      这里必须真正隐藏，避免同一控件出现两次 */
@@ -535,16 +625,14 @@ html[data-theme="dark"] .modal-mask{background:rgba(10,6,24,.7)}
   .bottom-nav{display:grid}
   .hero-banner h1{font-size:17px}
   /* 375px 下 .result-row 所需宽度 ≈410px > 可用 347px：
-     不换行则「试听/投递」被 overflow 裁出屏幕外 */
-  .result-row{flex-wrap:wrap;row-gap:10px}
+     不换行则「试听/投递」被 overflow 裁出屏幕外（换行规则见上方 ≤920 块） */
   .result-cover{width:44px;height:44px;border-radius:13px}
   .result-cover-ph{width:44px;height:44px;border-radius:13px}
   .result-main{flex:1 1 calc(100% - 58px)}
-  .result-vers{order:3;max-width:100%;justify-content:flex-start}
-  .row-actions{order:4;margin-left:auto}
-  .result-dur{order:5;margin-left:auto}
   .row-actions .btn{padding:8px 14px}
   .log-console{font-size:11.5px}
+  /* 底栏高约 70px + 安全区：toast 原位会盖住底栏图标 */
+  .toast-box{right:12px;bottom:calc(80px + env(safe-area-inset-bottom))}
 }
 .bottom-nav{position:fixed;left:0;right:0;bottom:0;z-index:60;grid-auto-flow:column;
   grid-auto-columns:minmax(0,1fr);
@@ -553,12 +641,12 @@ html[data-theme="dark"] .modal-mask{background:rgba(10,6,24,.7)}
   box-shadow:0 -8px 30px rgba(240,79,152,.12)}
 .bn-item{display:flex;flex-direction:column;align-items:center;justify-content:center;gap:3px;
   padding:6px 0;min-height:44px;border:none;background:none;
-  color:var(--sub);font-size:10px;font-weight:900;transition:color .25s,transform .25s var(--bounce)}
+  color:var(--sub);font-size:11px;font-weight:900;transition:color .25s,transform .25s var(--bounce)}
 .bn-item svg{width:20px;height:20px}
 .bn-item.on{color:var(--pink-ink);transform:translateY(-2px)}
 .bn-item .bn-more{font-size:17px;font-weight:900;line-height:1;height:20px}
 
-/* 底栏「更多」抽屉：手机端承载 4 个面板 + 主题切换 + 退出登录。
+/* 底栏「更多」抽屉：手机端承载 5 个面板 + 主题切换 + 退出登录。
    z-index 高于底栏(60)与 toast 之下，遮住底栏但不吃指针事件外的点击 */
 .more-sheet{position:fixed;inset:auto 0 0 0;z-index:70;background:var(--card);
   border-top:2.5px solid var(--line);border-radius:24px 24px 0 0;box-shadow:var(--clay);
@@ -617,7 +705,8 @@ html[data-theme="dark"] .login-mask{background:linear-gradient(150deg,rgba(38,22
   transition:transform .18s,background-color .18s,color .18s,box-shadow .18s}
 /* 视觉尺寸不变，热区扩到 44px（同 .btn-sm::before 的做法） */
 .stab::before{content:"";position:absolute;inset:-3px;border-radius:inherit}
-html[data-theme="dark"] .stab{background:rgba(255,255,255,.06)}
+/* :not(.on) 限定：否则 (0,2,1) 会压过 .stab.on (0,2,0)，暗色下激活标签丢高亮 */
+html[data-theme="dark"] .stab:not(.on){background:rgba(255,255,255,.06)}
 .stab.on{background:linear-gradient(135deg,var(--pink),var(--violet));color:var(--on-accent);
   box-shadow:0 4px 14px rgba(214,116,180,.35)}
 .remote-bar{display:flex;align-items:center;gap:10px;margin-bottom:12px;padding:10px 14px;border-radius:var(--r-md);
@@ -630,6 +719,8 @@ html[data-theme="dark"] .remote-bar{background:rgba(255,255,255,.05)}
 .err-list{display:flex;flex-direction:column;gap:9px}
 .err-row{display:flex;align-items:center;gap:12px;padding:8px 4px}
 .err-detail{flex:1;min-width:0;font-size:13px;color:var(--txt);overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-weight:600}
+/* 流水表详情列：单行截断样式进样式表（原内联 style 难以随主题/断点调整） */
+td.cell-detail{max-width:260px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .err-bar-wrap{width:120px;height:10px;border-radius:999px;background:var(--muted);overflow:hidden;flex:none;
   box-shadow:inset 0 0 0 1.5px var(--line)}
 /* width 动画每帧触发布局；改 scaleX */
@@ -675,7 +766,9 @@ html[data-theme="dark"] .log-console{background:#0d0a18}
   .stab:hover{transform:translateY(-2px)}
   .modal-x:hover{transform:rotate(90deg);color:var(--danger-ink)}
   .le-item button:hover{color:#fff;background:var(--danger-ink);transform:rotate(90deg)}
-  .cfg-group summary:hover{background:var(--card2)}
+  /* 暗色 --danger-ink 是浅红 #ff9aa6：白字 hover 仅 ~2.0:1，改用深底浅字中的深字 */
+  html[data-theme="dark"] .le-item button:hover{color:var(--on-accent)}
+  .cfg-group .cfg-head:hover{background:var(--card2)}
   .tbl tbody tr:hover td{background:rgba(255,126,182,.06)}
 }
 @media (prefers-reduced-motion:reduce){

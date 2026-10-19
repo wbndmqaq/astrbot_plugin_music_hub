@@ -4,24 +4,27 @@ from __future__ import annotations
 
 import re
 
+from ..core import SOURCE_NCM, SOURCE_QQ
 from ..core.cards import build_comment_card_data, build_lyric_card_data
 from ..core.errors import ApiError
+from ..core.sources import token_to_source
 from .actions import LYRIC_PAGE_SIZE
 from .base import COMMENT_NEXT_HINT, LYRIC_PAGE_HINT, Route
 
 # (pattern, route-name, action, 说明)
 _SRC = r"(?:(ncm|kg|qqm|qq)\s*)?"
-_RE_LYRIC = rf"^\s*#?{_SRC}歌词\s*(.*?)\s*$"
-_RE_LYRIC_WORD = rf"^\s*#?{_SRC}逐字歌词\s*(.*?)\s*$"
-_RE_COMMENT = rf"^\s*#?{_SRC}评论\s*(.*?)\s*$"
-_RE_SIMILAR = rf"^\s*#?{_SRC}相似\s*(.*?)\s*$"
-_RE_SIMI_PLAYLIST = rf"^\s*#?{_SRC}相似歌单\s*(.*?)\s*$"
-_RE_MV = rf"^\s*#?{_SRC}(?:MV|mv)\s*(.*?)\s*$"
-_RE_CLIMAX = rf"^\s*#?{_SRC}高潮\s*(.*?)\s*$"
-_RE_VERSIONS = rf"^\s*#?{_SRC}(?:版本|其他版本)\s*(.*?)\s*$"
-_RE_AI = rf"^\s*#?{_SRC}AI推荐\s*(.*?)\s*$"
-_RE_LYRIC_PAGE = r"^\s*#?\s*(?:ncm|kg|qqm|qq)?\s*歌词(下页|上页|上一页)\s*$"
-_RE_COMMENT_NEXT = r"^\s*#?\s*(?:ncm|kg|qqm|qq)?\s*评论下页\s*$"
+_RE_LYRIC = rf"^\s*[#＃]?{_SRC}歌词\s*(.*?)\s*$"
+_RE_LYRIC_WORD = rf"^\s*[#＃]?{_SRC}逐字歌词\s*(.*?)\s*$"
+_RE_COMMENT = rf"^\s*[#＃]?{_SRC}评论\s*(.*?)\s*$"
+_RE_SIMILAR = rf"^\s*[#＃]?{_SRC}相似\s*(.*?)\s*$"
+_RE_SIMI_PLAYLIST = rf"^\s*[#＃]?{_SRC}相似歌单\s*(.*?)\s*$"
+_RE_MV = rf"^\s*[#＃]?{_SRC}(?:MV|mv)\s*(.*?)\s*$"
+_RE_CLIMAX = rf"^\s*[#＃]?{_SRC}高潮\s*(.*?)\s*$"
+_RE_VERSIONS = rf"^\s*[#＃]?{_SRC}(?:版本|其他版本)\s*(.*?)\s*$"
+_RE_AI = rf"^\s*[#＃]?{_SRC}AI\s*推荐\s*(.*?)\s*$"
+_RE_LYRIC_PAGE = r"^\s*[#＃]?\s*(?:ncm|kg|qqm|qq)?\s*歌词\s*(下页|上页|上一页)\s*$"
+_RE_COMMENT_NEXT = r"^\s*[#＃]?\s*(?:ncm|kg|qqm|qq)?\s*评论\s*下页\s*$"
+_RE_COMMENT_PREV = r"^\s*[#＃]?\s*(?:ncm|kg|qqm|qq)?\s*评论\s*(?:上页|上一页)\s*$"
 
 
 async def run_lyric_page(service, event):
@@ -72,45 +75,82 @@ async def run_comment_next(service, event):
     if data.get("page", 1) >= data.get("total", 1):
         await service.reply(event, "没有更多评论啦")
         return
-    data["page"] = 2
-    service.set_pager(scope, "comment", data)
     song = data.get("song", {})
     comments = data.get("comments", {})
     fresh = comments.get("new") or []
-    if not fresh and song.get("source") == "qq":
-        # QQ 的最新评论是翻页时现拉的
+    if not fresh and song.get("source") == SOURCE_QQ:
+        # QQ 的最新评论是翻页时现拉的。先取数成功再写 pager：失败就 return 时
+        # page 仍是 1，重试「评论下页」不会被判成「没有更多评论」而永久卡死
         sid = song.get("sid2") or song.get("sid", "")
         try:
-            fresh = await service.call("qq", "comment", service.qq.new_comments(sid, 12))
+            fresh = await service.call(
+                SOURCE_QQ, "comment", service.client_of(SOURCE_QQ).new_comments(sid, 12)
+            )
         except ApiError as e:
             await service.reply(event, e.with_source())
             return
     if not fresh:
-        await service.reply(event, "没有更多评论啦（最新评论仅网易云 / QQ 提供）")
+        # 空结果两种成因分开说：支持最新评论的平台（网易云 / QQ）是「真的没有了」，
+        # 酷狗这类没有该接口的平台是能力边界——混成一句会误导排查
+        if song.get("source") in (SOURCE_NCM, SOURCE_QQ):
+            await service.reply(event, "没有更多评论啦")
+        else:
+            await service.reply(event, "最新评论仅网易云 / QQ 提供")
         return
+    data["page"] = 2
+    service.set_pager(scope, "comment", data)
     from ..core.formatters import format_comment_text
 
     view = {"hot": fresh, "total": comments.get("total", 0)}
     card = build_comment_card_data(song, view)
-    card["tip"] = "最新评论 · 回复「评论」回看热门"
+    card["tip"] = "最新评论 · 回复「评论上页」回热门 / 「评论下页」继续"
     await service.reply_card_or_text(
         event, card, "comment", song.get("source", ""), lambda d: format_comment_text(song, view)
     )
 
 
-def _make_select_runner(action: str):
-    """二段式命令 runner：带关键词 → 搜索+记录 action；不带 → 复用当前列表。"""
+async def run_comment_prev(service, event):
+    """评论上页：从最新评论退回热门首页（pager 的热门数据一直留在缓存 comments.hot）。"""
+    scope = service.scope(event)
+    data = service.get_pager(scope, "comment")
+    if not data:
+        await service.reply(event, COMMENT_NEXT_HINT)
+        return
+    if data.get("page", 1) <= 1:
+        await service.reply(event, "已经是第一页啦")
+        return
+    song = data.get("song", {})
+    comments = data.get("comments", {})
+    data["page"] = 1
+    service.set_pager(scope, "comment", data)
+    from ..core.formatters import format_comment_text
+
+    card = build_comment_card_data(song, comments)
+    card["tip"] = "热门评论 · 回复「评论下页」看最新"
+    await service.reply_card_or_text(
+        event, card, "comment", song.get("source", ""), lambda d: format_comment_text(song, comments)
+    )
+
+
+def _make_select_runner(action: str, pattern: str):
+    """二段式命令 runner：带关键词 → 搜索+记录 action；不带 → 复用当前列表。
+
+    pattern 由 routes() 直接绑定进闭包（原先经 _PATTERN_OF 查表，存在隐式
+    调用时序依赖，独立构造 runner 会 KeyError）。
+    """
 
     async def run(service, event):
         # 总开关由路由 gated 静默让路，体内不再重复 check_playable
-        m = re.search(_PATTERN_OF[action], event.message_str, re.IGNORECASE)
+        m = re.search(pattern, event.message_str, re.IGNORECASE)
         keyword = (m.group(2) if m else "").strip()
-        await service.start_select(event, keyword, action, _ACTION_LABELS[action])
+        # 音源前缀（#kg 歌词 晴天）要传给搜索：原先丢弃前缀走三源聚合，
+        # 与点歌路由尊重前缀的行为不一致，后续单音源动作也会音源对不上
+        prefix = token_to_source(m.group(1) if m else "") if m else "auto"
+        await service.start_select(event, keyword, action, _ACTION_LABELS[action], source=prefix)
 
     return run
 
 
-_PATTERN_OF = {}
 _ACTION_LABELS = {
     "lyric": "歌词",
     "lyric_word": "逐字歌词",
@@ -133,8 +173,16 @@ def routes() -> list[Route]:
         Route(
             re.compile(_RE_COMMENT_NEXT, re.IGNORECASE),
             "mh_comment_next",
-            "评论翻页",
+            "评论翻页（最新）",
             run_comment_next,
+            priority=7,
+        ),
+        # 评论上页与下页同优先级：热门口径的数据一直在 pager 缓存里，可直接回退
+        Route(
+            re.compile(_RE_COMMENT_PREV, re.IGNORECASE),
+            "mh_comment_prev",
+            "评论翻页（回热门）",
+            run_comment_prev,
             priority=7,
         ),
     ]
@@ -152,17 +200,19 @@ def routes() -> list[Route]:
         (_RE_AI, "mh_ai", "ai_recommend", "AI 相似推荐（酷狗）", 6),
     ]
     for pattern, name, action, doc, prio in specs:
-        _PATTERN_OF[action] = pattern
         out.append(
             Route(
                 re.compile(pattern, re.IGNORECASE),
                 name,
                 doc,
-                _make_select_runner(action),
+                _make_select_runner(action, pattern),
                 priority=prio,
             )
         )
-    # 总开关关闭 → 包装器静默让路（体内不再自行 check_playable 回复）
+    # 直刷上游的读指令（歌词/评论/MV 搜索）挂轻频控（与点歌冷却分开计）。
+    # 翻页路由例外：读的是分页缓存（仅 QQ 评论下页现拉上游，体内自带限频），
+    # 挂 2s 节流会让连续翻页被「操作太频繁」打断
     for r in out:
         r.gated = True
+        r.throttle = 0 if r.name in ("mh_lyric_page", "mh_comment_next", "mh_comment_prev") else 2.0
     return out

@@ -11,8 +11,10 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import math
 import os
 import time
+import weakref
 from pathlib import Path
 
 from astrbot.api import logger
@@ -21,7 +23,7 @@ from astrbot.api.message_components import Image, Plain
 from . import PLUGIN_NAME, SOURCE_KG, SOURCE_NAMES, SOURCE_NCM, SOURCES
 from . import color as mh_color
 from .acl import Acl
-from .api import close_session, missing_methods
+from .api import close_session, missing_methods, reset_http, set_api_timeout_provider
 from .api import create as create_clients
 from .cards import (
     build_detail_card_data,
@@ -31,7 +33,7 @@ from .cards import (
 )
 from .config import Config, as_int
 from .delivery import deliver_song, schedule_cleanup
-from .errors import ApiError, NotEnabledError, TooManyTasks
+from .errors import AclDeniedError, ApiError, NotEnabledError, TooManyTasks
 from .formatters import format_detail_text, format_list_text
 from .help_data import HELP_SECTIONS, VERSION
 from .history import HistoryStore
@@ -47,6 +49,7 @@ from .render import (
     Renderer,
     apply_theme,
     inject_theme_css,
+    inline_cover_images,
     load_template,
     template_path,
     theme_bg,
@@ -63,6 +66,9 @@ TAG = "[music_hub]"
 PLAY_ALL_LIMIT = 30
 # 列表展示上限
 LIST_SHOW_LIMIT = 30
+# 下载成功但全部发送通道失败（禁言/协议端异常）的统一文案：deliver_song quiet=True
+# 不补文案，play_group / 连播等调用方用同一句汇总
+SEND_FAIL_MSG = "歌曲已下载但发送失败：语音与文件通道均不可用（可能被禁言或协议端异常）"
 
 
 class MusicService:
@@ -104,27 +110,53 @@ class MusicService:
         self.renderer = Renderer()
         self._bg_tasks: set[asyncio.Task] = set()
         self._cooldowns: dict[str, float] = {}
+        # 冷却章归属：scope → 盖章事件的 id(event)。兜底退章（handlers/base.py）
+        # 与各 handler 内部的退章都走 release_cooldown，只能退自己盖的章——
+        # 否则 B 用户触发任意路由报错会把 A 用户刚盖的群级冷却章清掉（冷却旁路）
+        self._cooldown_owner: dict[str, weakref.ref] = {}
+        # 「听所有」进行中的 scope：连播长达数十秒且逐首 sleep，冷却过期后
+        # 第二条「听所有」会并发跑第二轮造成刷屏，这里挡住重复入口
+        self._playall_scopes: set[str] = set()
+        # 只读指令轻频控：scope → 上次调用时刻（explore/账号/二段式类路由共用）
+        self._browse_ts: dict[str, float] = {}
         # 会话注册表（scope → umo）与播放历史 / 翻页缓存
         self.registry = UmoRegistry(self.get_kv, self.put_kv)
         self.history = HistoryStore()
         # 搜索编排（单源 / 聚合 / 分类型）：注入协作者而非反向持有 service
-        self.search = SongSearch(config, clients, self.stats, self.enabled_sources)
+        self.search = SongSearch(config, clients, self.stats, self.enabled_sources, self.missing_sources)
 
     # ──────────── 生命周期 ────────────
     async def initialize(self) -> None:
+        # 停用→启用同进程只重跑 initialize、不重载 http 模块：先解除上一轮
+        # terminate 留下的「已关闭」闩，否则本轮所有音源请求永远被拒
+        reset_http()
         # kg 工厂失败时 self.kg 为 None（registry 会跳过并告警）：这里若裸调会把
         # 初始化失败放大成整个插件激活失败，违背单音源故障不拖垮其余音源的设计
         if self.kg is not None:
             await asyncio.to_thread(self.kg.load_device)
+        # 惰性间隔来源：主面板改 rateLimitMs 不经过插件 WebUI 保存钩子，
+        # acquire 现读才能让「改配置即生效」对全部写入口成立
+        limiter.set_interval_provider(lambda: self.config.rate_limit_ms)
         limiter.update_interval(self.config.rate_limit_ms)
+        # 音源请求超时同理：provider 现读，WebUI/主面板改 apiTimeoutSec 都即时生效
+        set_api_timeout_provider(lambda: self.config.api_timeout_sec)
         await self.stats.start()
-        await self.scheduler.start()
+        # 订阅表/登记表必须先于调度器装载：scheduler.start() 起的循环在跨天首次
+        # 运行（早上开机/首装）会立即触发 _run_daily → subs.push_all()，若此时
+        # 订阅表还是空 dict，当天推送会被静默「成功」掉并落盘已跑标记
         await self.subs.load()
         await self.registry.load()
-        self.spawn(self._startup())
+        await self.scheduler.start()
+        try:
+            self.spawn(self._startup())
+        except TooManyTasks:
+            # 任务槽恰好占满时不能让整个 initialize 失败（会放大成插件激活失败）；
+            # 启动提示缺失只影响一条日志，下次重载即恢复
+            logger.warning(f"{TAG} 启动提示任务被拒：后台任务并发上限已满")
 
     async def _startup(self) -> None:
         await startup_sweep()
+        await self.sessions.sweep_owner_tmp()
         enabled = self.config.enabled_sources()
         logger.info(f"{TAG} 初始化完成，可用音源：{' / '.join(SOURCE_NAMES[s] for s in enabled) or '无'}")
 
@@ -133,22 +165,68 @@ class MusicService:
         定时器）泄漏——插件重载时这些泄漏是累积性的，Windows 上表现为端口占用与 temp 膨胀。
         """
 
+        # terminate 自身也可能被取消（关机/卸载窗口框架会整批 cancel pending 协程）：
+        # 取消若从中途穿出，后面的统计落盘/浏览器关闭等步骤全部跳过——正是本方法
+        # 要防的累积性泄漏。每个清理步骤独立成 task 并 shield：外层取消先记下，
+        # 等步骤收尾后继续走完剩余清理，末尾按协议补上抛
+        interrupted = False
+
         async def _safe(label: str, coro) -> None:
+            nonlocal interrupted
+            task = asyncio.ensure_future(coro)
             try:
-                await coro
+                await asyncio.shield(task)
+            except asyncio.CancelledError:
+                interrupted = True
+                try:
+                    await task
+                except asyncio.CancelledError:
+                    pass
+                except Exception as e:  # noqa: BLE001
+                    logger.warning(f"{TAG} 清理{label}失败：{e}")
             except Exception as e:  # noqa: BLE001
                 logger.warning(f"{TAG} 清理{label}失败：{e}")
 
         await _safe("点歌台", self.queue.stop_all())
-        for t in list(self._bg_tasks):
+        # 调度器最先停：日推/订阅推送循环若还活着，后续数秒的清理窗口里仍可能
+        # 触发 _run_daily → subs.push_all，向正在卸载的插件投递消息
+        await _safe("调度器", self.scheduler.stop())
+        # 登录会话 gc 在取消后台任务**之前**：扫码刚成功、_finish 还在写配置时，
+        # 先 cancel 会吞掉用户刚扫到的凭证。gc 会等待 done 态任务自然收尾
+        await _safe("登录会话", self.login.gc())
+        # 点歌台登记表在此显式落盘：note_umo 走 spawn 异步保存，上面的取消循环
+        # 会把在途 save 一并取消——重载前最后一次发言才首次登记的会话若不补写，
+        # 其 umo 永不落盘，下次发言前点歌台/订阅/远程投递都发不进去（save 幂等）
+        await _safe("会话登记表", self.registry.save())
+        # cancel 与 gather 之间存在窗口：期间 handler 再 spawn 的新任务不被取消。
+        # 有界循环补刀直到集合清空（3 轮上限防 spawn 风暴拖住 terminate，正常
+        # 场景一轮即清空）；每轮 gather return_exceptions，取消异常不打断清理链
+        for _ in range(3):
+            tasks = list(self._bg_tasks)
+            if not tasks:
+                break
+            for t in tasks:
+                t.cancel()
+            inner = asyncio.gather(*tasks, return_exceptions=True)
+            try:
+                await asyncio.shield(inner)
+            except asyncio.CancelledError:
+                # gather 子任务各自在吸收自己的 cancel，等它们收尾再继续；
+                # 外层取消由 interrupted 记账，末尾统一上抛
+                interrupted = True
+                try:
+                    await inner
+                except asyncio.CancelledError:
+                    pass
+        # 补刀后仍存活的任务（cancel 被内部 shield/吞掉等极端形态）只丢引用会让
+        # 它们带着指向已卸载 plugin 实例的回调跑到底：clear 前对剩余任务再补一次
+        # cancel（不 gather——terminate 不该被个别不肯退的任务拖住）
+        for t in self._bg_tasks:
             t.cancel()
-        if self._bg_tasks:
-            await asyncio.gather(*self._bg_tasks, return_exceptions=True)
         self._bg_tasks.clear()
         await _safe("临时文件", cancel_cleanup_timers())
-        await _safe("调度器", self.scheduler.stop())
-        await _safe("登录会话", self.login.gc())
-        await _safe("播放历史", self.sessions.close())
+        # sessions 是点歌会话列表存储（SessionStore），播放历史在 self.history：标签如实
+        await _safe("会话存储", self.sessions.close())
         await _safe("统计", self.stats.close())
         # QQ 库未安装时 self.qq 为 None：_safe 的 coro 参数先求值，裸调 .close()
         # 会在兜底之外炸出 AttributeError，导致后面的 HTTP 会话与 Chromium 泄漏
@@ -157,7 +235,17 @@ class MusicService:
         await _safe("封面取色", mh_color.close())
         await _safe("HTTP 会话", close_session())
         await _safe("渲染器", self.renderer.close())
+        # ffmpeg 执行器是模块级非 daemon 线程：不关闭的话每次重载残留 2 个空闲线程
+        try:
+            from .media import shutdown_ffmpeg_pool
+
+            shutdown_ffmpeg_pool()
+        except Exception as e:  # noqa: BLE001
+            logger.warning(f"{TAG} 清理 ffmpeg 线程池失败：{e}")
         logger.info(f"{TAG} 已退出")
+        # 清理链已走完，响应收到的取消（不对齐取消协议会让调用方误认为清理失败）
+        if interrupted:
+            raise asyncio.CancelledError
 
     # 后台任务并发上限：超过则拒绝新任务，防止高频调用把内存耗尽
     MAX_BG_TASKS = 64
@@ -210,7 +298,10 @@ class MusicService:
     async def get_kv(self, key: str, default=None):
         try:
             return await self.plugin.get_kv_data(key, default)
-        except Exception:  # noqa: BLE001
+        except Exception as e:  # noqa: BLE001
+            # 读失败返回 default 但必须有痕：订阅表 / 注册表读失败会让 _subs / _rows
+            # 变空，表现为「订阅推送悄悄停一天」，无日志就无法排查
+            self.log_warn(f"KV 读取失败（{key}）：{e}")
             return default
 
     async def put_kv(self, key: str, value) -> None:
@@ -230,7 +321,12 @@ class MusicService:
         if not umo:
             return
         if self.registry.note(self.scope(event), umo):
-            self.spawn(self.registry.save())
+            try:
+                self.spawn(self.registry.save())
+            except TooManyTasks:
+                # 每条消息都可能走到这里；恰逢后台任务满员时丢一次落盘即可
+                # （下一条消息会再次触发 save），不能炸到消息 handler
+                pass
 
     def umo_of(self, scope: str) -> str:
         return self.registry.umo_of(scope)
@@ -269,7 +365,9 @@ class MusicService:
             await self.send_to_umo(umo, f"播放失败：{e.with_source()}")
             result = {"ok": False, "reason": "no_url", "error": e.user_msg()}
         except Exception as e:  # noqa: BLE001
-            await self.send_to_umo(umo, f"播放失败：{e}")
+            # 非 ApiError 的原文可能带内部路径/URL/框架细节，不透给用户（对齐 LLM 工具入口的口径）
+            logger.warning(f"{TAG} 远程点歌异常: {e}")
+            await self.send_to_umo(umo, "播放失败，详情见运行日志")
             result = {"ok": False, "reason": "error", "error": str(e)}
         self.stats.record(
             song.get("source", ""), "play", ok=bool(result.get("ok")), detail=song.get("name", "")[:40]
@@ -341,7 +439,10 @@ class MusicService:
         try:
             result = await coro
         except Exception as e:  # noqa: BLE001
-            self.stats.record(source, action, ok=False, detail=str(e)[:60])
+            try:
+                self.stats.record(source, action, ok=False, detail=str(e)[:60])
+            except Exception:  # noqa: BLE001 - 统计崩溃不能顶替原始异常上抛
+                pass
             raise
         self.stats.record(source, action, ok=True, detail=detail)
         return result
@@ -375,8 +476,11 @@ class MusicService:
             sender = str(event.get_sender_id() or "")
             group = str(event.get_group_id() or "")
             platform = str(event.get_platform_name() or "")
-        except Exception:  # noqa: BLE001
-            return
+        except Exception as e:  # noqa: BLE001
+            # 黑名单判定对畸形事件 fail-closed：静默放行等于「发一个缺字段的
+            # 畸形事件即可绕过黑白名单」，至少留痕（LogBuffer 只落文本，安全）
+            self.log_warn(f"ACL 校验取事件字段失败，按拒绝处理: {type(e).__name__}")
+            raise AclDeniedError("无法确认事件来源，已拒绝") from e
         self.acl.check(sender, group, platform)
 
     def check_playable(self) -> str | None:
@@ -404,20 +508,66 @@ class MusicService:
         now = time.monotonic()
         last = self._cooldowns.get(scope, 0.0)
         if now - last < sec:
-            remain = int(sec - (now - last))
+            # 向上取整：int() 截断会提示「0 秒后再试」却仍被拒
+            remain = max(1, math.ceil(sec - (now - last)))
             return f"点歌冷却中，{remain} 秒后再试"
         self._cooldowns[scope] = now
+        # 存弱引用而非 id(event)：id 在对象回收后会被新事件复用，误判归属会让
+        # 他人报错退掉本事件的章；也不存强引用——event 持完整消息链，正常播放
+        # 的章不退、要等容量淘汰，高活跃群会常驻滞留最多 256 个大对象
+        self._cooldown_owner[scope] = weakref.ref(event)
         if len(self._cooldowns) > 256:
             # 按时间戳淘汰最旧的：dict 插入序 ≠ 最近使用（盖章只更新值不移动键），
             # 按插入序清会把最早盖章、往往也最活跃的群先清掉
             over = len(self._cooldowns) - 128
             for k in sorted(self._cooldowns, key=self._cooldowns.get)[:over]:
                 self._cooldowns.pop(k, None)
+                self._cooldown_owner.pop(k, None)
         return None
 
     def release_cooldown(self, event) -> None:
-        """本次触发没有产出任何播放（零结果 / 取流失败）时退还冷却，避免打错字也占冷却。"""
-        self._cooldowns.pop(self.scope(event), None)
+        """本次触发没有产出任何播放（零结果 / 取流失败 / 投递失败）时退还冷却，避免打错字也占冷却。
+
+        只退当前事件自己盖的章：路由兜底会对**所有**路由的异常调这里，若不判归属，
+        同群 B 触发的报错会把 A 刚盖的冷却章清掉，冷却被旁路。"""
+        scope = self.scope(event)
+        owner = self._cooldown_owner.get(scope)
+        # 弱引用已消亡（event 被回收）：章随时间自然过期，不归当前事件管
+        if owner is None or owner() is not event:
+            return
+        self._cooldowns.pop(scope, None)
+        self._cooldown_owner.pop(scope, None)
+
+    def restamp_cooldown(self, event) -> None:
+        """换源重试成功后重新盖章：上一版本的失败路径已退章，成功交付仍应占冷却。"""
+        if self.config.cooldown_sec <= 0:
+            return
+        scope = self.scope(event)
+        self._cooldowns[scope] = time.monotonic()
+        self._cooldown_owner[scope] = weakref.ref(event)
+
+    # 只读指令轻频控：点歌冷却管「发歌」出口，而歌词/评论/榜单/翻页等浏览类指令
+    # 直刷上游 API、无任何节流，是风控（403/152）高发区。这里按会话限一个宽松的
+    # 最小间隔（不盖章、不进冷却字典，与点歌冷却互不影响）。
+    BROWSE_MIN_INTERVAL = 2.0
+    _BROWSE_MAX_SCOPES = 512
+
+    def check_browse(self, event, min_interval: float = 0.0) -> str | None:
+        """浏览类指令节流：返回拒绝提示或 None（并记录本次时刻）。"""
+        sec = min_interval if min_interval > 0 else self.BROWSE_MIN_INTERVAL
+        scope = self.scope(event)
+        now = time.monotonic()
+        last = self._browse_ts.get(scope, 0.0)
+        if now - last < sec:
+            remain = max(1, math.ceil(sec - (now - last)))
+            return f"操作太频繁，{remain} 秒后再试"
+        if len(self._browse_ts) > self._BROWSE_MAX_SCOPES:
+            # 只保留最近活跃的一半（按时间戳）
+            over = len(self._browse_ts) - self._BROWSE_MAX_SCOPES // 2
+            for k in sorted(self._browse_ts, key=self._browse_ts.get)[:over]:
+                self._browse_ts.pop(k, None)
+        self._browse_ts[scope] = now
+        return None
 
     # ──────────── 搜索 ────────────
     def enabled_sources(self) -> list[str]:
@@ -427,6 +577,18 @@ class MusicService:
         出现在这里就等于把「点歌失败」推迟到用户点击时才暴露。
         """
         return [s for s in self.config.enabled_sources() if self._is_ready(s)]
+
+    def missing_sources(self) -> list[str]:
+        """配置里开着但客户端自检不通过的音源（依赖缺失 / 初始化失败）。
+
+        聚合搜索把它们静默排除在结果之外，总览与搜索提示需要这份名单来
+        向用户解释「为什么结果里没有这个源」。
+        """
+        return [s for s in self.config.enabled_sources() if not self._is_ready(s)]
+
+    def is_ready(self, source: str) -> bool:
+        """音源客户端自检是否通过（配置开着 ≠ 可用）。"""
+        return self._is_ready(source)
 
     def _is_ready(self, source: str) -> bool:
         client = self._clients.get(source)
@@ -471,6 +633,7 @@ class MusicService:
         version = pick_version(group, source)
         if version is None:
             want = SOURCE_NAMES.get(source, source) if source else "任意"
+            self.release_cooldown(event)
             await self.reply(
                 event, f"「{group.get('name', '')}」在 {want} 没有可用版本（可用：{version_names(group)}）"
             )
@@ -480,8 +643,14 @@ class MusicService:
             version,
             source_label="多音源" + (f" · {SOURCE_NAMES.get(version['source'], '')}" if source else ""),
             suppress_error_card=True,
+            quiet=True,
         )
         if result.get("ok"):
+            return result
+        if result.get("reason") == "send_fail":
+            # 下载成功但所有发送通道失败（禁言/协议端异常）：换源无济于事，
+            # 当面说明而不是静默——deliver_song 是 quiet=True，不会补文案
+            await self.reply(event, SEND_FAIL_MSG)
             return result
         if result.get("reason") not in ("no_url", "download_fail"):
             return result
@@ -496,8 +665,15 @@ class MusicService:
                 v,
                 source_label=f"自动换源 · {SOURCE_NAMES.get(v.get('source'), '')}",
                 suppress_error_card=True,
+                quiet=True,
+                skip_native_card=True,
             )
             if result.get("ok"):
+                # 上一版本的失败已退章：成功交付重新占冷却
+                self.restamp_cooldown(event)
+                return result
+            if result.get("reason") == "send_fail":
+                await self.reply(event, SEND_FAIL_MSG)
                 return result
             last_err = result.get("error", "") or last_err
         await self.reply(
@@ -509,9 +685,14 @@ class MusicService:
 
     async def switch_source(self, event, source: str) -> None:
         """换源重放：把最近播放的歌在指定音源重新搜索并播放。"""
+        # 与 search_full 单源路径同一前置闸门：未配置 apiBase 的源在这里给
+        # 可操作的文案，而不是让原始上游错误透给用户
+        if not self.config.src_enabled(source):
+            raise NotEnabledError(f"{SOURCE_NAMES.get(source, source)}音源未配置 API 地址", source=source)
         scope = self.scope(event)
         entry = await self.sessions.get(scope)
-        last = (entry or {}).get("data", {}).get("lastPlayed") if entry else None
+        # data 键存在但为 null 时对 None 调 .get 会炸：统一 `or {}` 兜底
+        last = (entry.get("data") or {}).get("lastPlayed") if entry else None
         if not last:
             self.release_cooldown(event)
             await self.reply(event, "还没有播放过歌曲，先「点歌」一次吧")
@@ -527,6 +708,9 @@ class MusicService:
 
     async def switch_source_for(self, event, song: dict, source: str) -> None:
         """把指定歌曲在另一音源重找并播放（听N 音源 用）。"""
+        # 同 switch_source：换源入口统一过「音源未配置」闸门
+        if not self.config.src_enabled(source):
+            raise NotEnabledError(f"{SOURCE_NAMES.get(source, source)}音源未配置 API 地址", source=source)
         if song.get("source") == source:
             await self.play_song(event, song)
             return
@@ -571,21 +755,39 @@ class MusicService:
     )
 
     async def _remember_last_played(self, event, song: dict) -> None:
-        """记住本次播放，供「换源」/「红心」使用。"""
+        """记住本次播放，供「换源」/「红心」使用。
+
+        锁内 mutate 定向改 lastPlayed 键，不做 get→set 整包回写：整包回写与并发
+        「点歌 新词」的 sessions.set 交错时，旧列表会把刚写入的新列表顶掉
+        （与 take_action_target 注释里修掉的是同一类缓存与 KV 双写竞态）。"""
         scope = self.scope(event)
-        entry = await self.sessions.get(scope)
-        if entry:
-            data = dict(entry.get("data", {}))
-            data["lastPlayed"] = {k: song.get(k) for k in self._LAST_PLAYED_KEYS}
-            await self.sessions.set(scope, entry.get("kind", "songs"), data)
+        last = {k: song.get(k) for k in self._LAST_PLAYED_KEYS}
+
+        def _remember(entry: dict) -> None:
+            entry.setdefault("data", {})["lastPlayed"] = last
+
+        # create=True：直接「播放 关键词」/链接解析的直播路径从不建会话，
+        # 不补建的话 lastPlayed 静默丢失，随后「换源」误报「还没有播放过歌曲」
+        await self.sessions.mutate(scope, _remember, create=True)
 
     async def play_song(
-        self, event, song: dict, *, source_label: str = "", suppress_error_card: bool = False
+        self,
+        event,
+        song: dict,
+        *,
+        source_label: str = "",
+        suppress_error_card: bool = False,
+        quiet: bool = False,
+        skip_native_card: bool = False,
     ) -> dict:
         """完整播放流程：取流 → 详情卡 → 投递。
 
         suppress_error_card：取流失败时不发错误详情卡（自动换源/队列等调用方
         会自行汇总报错），失败原因随返回值带回。
+        quiet：投递失败时不发补发文案（对齐 deliver_song 的同名语义），
+        与 suppress_error_card 搭配用于自动换源的中间失败。
+        skip_native_card：跳过原生音乐卡。自动换源的重试轮传 True——原生卡在
+        下载前就发出（有 sid 即发），每个失败版本各发一张会刷屏。
         """
         source = song.get("source", "")
         try:
@@ -614,9 +816,25 @@ class MusicService:
             except Exception as e:  # noqa: BLE001
                 self.log_warn(f"详情卡渲染失败: {e}")
 
-        result = await deliver_song(self, event, song, play, options={"skipTextInfo": card_sent})
+        try:
+            result = await deliver_song(
+                self,
+                event,
+                song,
+                play,
+                options={"skipTextInfo": card_sent, "skipNativeCard": skip_native_card},
+                quiet=quiet,
+            )
+        except (Exception, asyncio.CancelledError):
+            # 投递链路抛异常时 url 已在 resolve 记账、play 会漏：补记一条失败
+            # 再上抛，与正常路径的 record 调用保持口径对称
+            self.stats.record(source, "play", ok=False, detail=song.get("name", "")[:40])
+            raise
         if result.get("ok"):
             self.history.record(self.scope(event), song)
+        else:
+            # 投递失败（下载/发送）同样没播出任何内容：退还冷却章，对齐取流失败路径
+            self.release_cooldown(event)
         self.stats.record(source, "play", ok=bool(result.get("ok")), detail=song.get("name", "")[:40])
         return result
 
@@ -626,26 +844,64 @@ class MusicService:
         聚合点歌存进会话的是分组 dict（带 versions 键、无顶层 source/sid），
         直接喂给 play_song 会在 client_of("") 上炸 KeyError：遍历前先归一化到
         可播放的版本条目。"""
+        scope = self.scope(event)
+        # 并发守卫：连播逐首 sleep(1)，一轮可长达数分钟，冷却过期后第二条
+        # 「听所有」若并发跑第二轮会双倍刷屏
+        if scope in self._playall_scopes:
+            # 拒绝路径也要退章：调用方（run_listen_all）在盖章后进本函数，章滞留
+            # 会占满整个冷却窗、误伤同群其他人的「听N」（release_cooldown 只退
+            # 当前事件自己的章，跨事件无影响）
+            self.release_cooldown(event)
+            await self.reply(event, "连播正在进行中，等这一轮结束再用「听所有」吧")
+            return {"ok": 0, "fail": 0}
+        self._playall_scopes.add(scope)
+        try:
+            return await self._play_all_locked(event, scope, songs)
+        finally:
+            self._playall_scopes.discard(scope)
+
+    async def _play_all_locked(self, event, scope: str, songs: list[dict]) -> dict:
         fixed = []
         for song in songs:
             if song.get("versions"):
                 song = song.get("primary") or song["versions"][0]
             fixed.append(song)
+        fixed = fixed[:PLAY_ALL_LIMIT]
+        if not fixed:
+            # 防御路径：调用方已过滤空列表，但真走到这里仍回「连播 0 首」是误导文案
+            await self.reply(event, "没有可播放的歌曲")
+            return {"ok": 0, "fail": 0}
         ok, fail = 0, 0
-        total = min(len(fixed), PLAY_ALL_LIMIT)
+        total = len(fixed)
         await self.reply(event, f"开始连播 {total} 首（最多 {PLAY_ALL_LIMIT} 首）")
-        for i, song in enumerate(fixed[:PLAY_ALL_LIMIT]):
+        # 连续失败熔断：三源全挂时逐首弹失败卡 + 30 次 Playwright 渲染刷屏打爆统计
+        # （与点歌台 queue 的 _backoff 同源问题，此路径取「连败即停」而非退避——
+        # 连播语义下用户等不起逐首 120s 超时）
+        _FAIL_STREAK_STOP = 5
+        fail_streak = 0
+        for i, song in enumerate(fixed):
             try:
-                result = await self.play_song(event, song, source_label="连播")
+                result = await self.play_song(event, song, source_label="连播", suppress_error_card=True)
                 if result.get("ok"):
                     ok += 1
+                    fail_streak = 0
                 else:
                     fail += 1
+                    fail_streak += 1
             except Exception as e:  # noqa: BLE001
                 self.log_warn(f"连播第 {i + 1} 首失败: {e}")
                 fail += 1
+                fail_streak += 1
+            if fail_streak >= _FAIL_STREAK_STOP:
+                await self.reply(
+                    event,
+                    f"连续 {_FAIL_STREAK_STOP} 首播放失败，已停止连播（已播 {ok} 首）——请检查音源状态后重试",
+                )
+                return {"ok": ok, "fail": fail + (total - i - 1)}
             if i < total - 1:
                 await asyncio.sleep(1)
+        if fail and not ok:
+            await self.reply(event, f"连播 {total} 首全部失败——请检查音源状态（详见运行日志）")
         return {"ok": ok, "fail": fail}
 
     # ──────────── 会话 ────────────
@@ -667,11 +923,16 @@ class MusicService:
         data = build_list_card_data(keyword, shown, source, tip=tip, total=len(songs))
         await self.reply_card_or_text(event, data, "list", source, format_list_text)
 
-    async def start_select(self, event, keyword: str, action: str, action_label: str) -> None:
-        """二段式：带关键词搜索并记录 action；不带关键词复用当前列表。"""
+    async def start_select(
+        self, event, keyword: str, action: str, action_label: str, source: str = "auto"
+    ) -> None:
+        """二段式：带关键词搜索并记录 action；不带关键词复用当前列表。
+
+        source：路由正则里的音源前缀（#kg 歌词 xx），auto 表示无前缀走聚合。
+        """
         scope = self.scope(event)
         if keyword:
-            songs, src = await self.search_songs(keyword)
+            songs, src = await self.search_songs(keyword, source)
             if not songs:
                 await self.reply(event, f"没有搜到「{keyword}」相关的歌曲")
                 return
@@ -687,28 +948,53 @@ class MusicService:
                     event, f"当前没有歌曲列表，请先「点歌 关键词」或带关键词使用，如「{action_label} 晴天」"
                 )
                 return
+            # 候选列表（专辑/歌单/榜单/MV/歌手，条目带 kind）不支持内容动作：
+            # 「听N」的展开分支优先消费，挂上去的动作被静默吞掉、用户被承诺的
+            # 「回复 听N 查看 xx」永不兑现。当面说明而不是写一个必然失效的动作
+            if any(
+                s.get("kind") in ("album", "playlist", "rank", "mv", "artist", "topCategory")
+                for s in songs[:3]
+            ):
+                await self.reply(
+                    event,
+                    f"当前列表是候选列表（专辑/歌单/榜单等），不支持{action_label}，请回复 听N 逐个播放",
+                )
+                return
             await self.sessions.update_action(scope, action)
             src = songs[0].get("source", "auto") if songs else "auto"
             await self.reply(event, f"回复 听N 查看{action_label}（列表共 {len(songs)} 首）")
 
-    async def take_action_target(self, event, n: int) -> tuple[dict | None, str]:
-        """听N 的会话消费：返回 (song, pending_action) 并清除 action。"""
+    async def take_action_target(self, event, n: int) -> tuple[dict | None, str, str]:
+        """听N 的会话消费：返回 (song, pending_action, list_keyword) 并清除 action。
+
+        读 songs 与清 action 必须在同一次 mutate（单锁原子）内完成：拆成 get +
+        clear_action 两次加锁时，两个并发「听N」都能取到同一个 pending_action
+        并重复执行动作（如重复发歌词）。
+        list_keyword 是消费瞬间的列表关键词：调用方写回动作前比对它，避免旧动作
+        写回被并发搜索整包替换的新列表。
+        """
         scope = self.scope(event)
-        entry = await self.sessions.get(scope, refresh=True)
-        if not entry:
-            return None, ""
-        songs = entry.get("data", {}).get("songs") or []
-        if not songs or not (1 <= n <= len(songs)):
-            return None, entry.get("action", "")
-        song = songs[n - 1]
-        action = entry.get("action", "")
-        if action:
-            await self.sessions.clear_action(scope)
-        # 无 action 时不做整包回写：get(refresh=True) 已续过内存 TTL，KV 不回写是
-        # session.py 声明过的可接受近似（跨重载剩余 TTL 偏短）。原先这里的 set 与
-        # 上面 get 之间没有锁，连点「听N」+「点歌 新词」交错时，旧 entry 的回写会
-        # 把刚写入的新列表顶掉（缓存与 KV 双写竞态）。
-        return song, action
+        consumed: dict = {}
+
+        def _consume(entry: dict) -> None:
+            songs = (entry.get("data") or {}).get("songs") or []
+            consumed["keyword"] = entry.get("keyword", "")
+            if not songs or not (1 <= n <= len(songs)):
+                # 越界/空列表：action 保留不清（与原 get 口径一致）
+                consumed["song"] = None
+                consumed["action"] = entry.get("action", "")
+                return
+            consumed["song"] = songs[n - 1]
+            consumed["action"] = entry.get("action", "")
+            if consumed["action"]:
+                entry["action"] = ""
+
+        entry = await self.sessions.mutate(scope, _consume)
+        if entry is None:
+            return None, "", ""
+        # 无 action 时 mutate 也会回写一次 KV：代价是一次小 JSON 落盘，
+        # 换取读改清的原子性（session.py 声明的整包回写竞态不适用于 mutate）
+        return consumed.get("song"), consumed.get("action", ""), consumed.get("keyword", "")
 
     # ──────────── 渲染 ────────────
     async def render_card(self, data: dict, tpl_name: str, source: str = "") -> str | None:
@@ -718,6 +1004,9 @@ class MusicService:
         if self.renderer.disabled:
             return None
         await apply_theme(data)
+        # 封面内联：Chromium 对 <img>/hero 自动跟随重定向，公网封面 302 到内网
+        # 可绕过构造层预检。内联后渲染通道对封面零网络请求（失败置空走占位）
+        await inline_cover_images(data)
         tpl_path = template_path(self.tmpl_dir, tpl_name)
         try:
             template = await load_template(tpl_path)
@@ -732,7 +1021,6 @@ class MusicService:
             bg = theme_bg(data, source or data.get("source", ""))
             ok = await self.renderer.render(html, out, bg)
             if ok:
-                self.schedule_unlink(out, 120)
                 return out
         except FileNotFoundError:
             self.log_warn(f"模板缺失: {tpl_name}")
@@ -750,9 +1038,13 @@ class MusicService:
         if path:
             try:
                 await self.send_chain(event, Image.fromFileSystem(path))
+                # 清理计时在发送完成之后才启动：渲染产物是唯一副本，慢上行超过
+                # 计时窗会把图片读空、静默退化成文本
+                self.schedule_unlink(path, 120)
                 return
             except Exception as e:  # noqa: BLE001
                 self.log_warn(f"卡片发送失败，回退文本: {e}")
+                self.schedule_unlink(path, 120)
         try:
             await self.reply(event, text_fn(data))
         except Exception as e:  # noqa: BLE001

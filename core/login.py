@@ -13,6 +13,8 @@ import asyncio
 import secrets
 import time
 
+from astrbot.api import logger
+
 from .errors import ApiError
 
 POLL_INTERVAL = 2.0
@@ -42,6 +44,8 @@ class LoginSession:
         self.uid = ""
         self.nickname = ""
         self.created = time.time()
+        # 终态落定时刻：gc 对终态会话保留宽限期（见 gc 注释），WebUI 轮询要能取走结果
+        self.finished_ts = 0.0
         self.done_evt: asyncio.Event = asyncio.Event()
         self.task: asyncio.Task | None = None
         # kg QQ 扫码上下文
@@ -72,6 +76,8 @@ class LoginSession:
         self.state = state if state in STATES else "wait"
         self.msg = msg or _STATE_TEXT.get(self.state, "")
         if self.state in ("done", "timeout", "refuse", "cancel"):
+            if self.finished_ts <= 0:
+                self.finished_ts = time.time()
             self.done_evt.set()
         return True
 
@@ -80,6 +86,8 @@ class LoginFlows:
     def __init__(self, service):
         self._service = service  # core.service.MusicService
         self.sessions: dict[str, LoginSession] = {}
+        # status() 惰性 gc 的节流时间戳（time.monotonic 基准），显式初始化免 getattr 兜底
+        self._gc_ts = 0.0
 
     # ──────────── 对外 ────────────
     async def start(self, source: str, login_type: str = "qq") -> LoginSession:
@@ -114,8 +122,17 @@ class LoginFlows:
         return self.sessions.get(ticket)
 
     async def status(self, ticket: str) -> dict | None:
+        # 先快照再 gc：gc 的回收（含终态弹出）不能抢在本轮询的应答前面，
+        # 否则扫码结果只在「gc 刚好没触发」的窗口里可读
         s = self.sessions.get(ticket)
-        return s.snapshot() if s else None
+        snap = s.snapshot() if s else None
+        # 轮询路径惰性 gc（60s 节流）：用户扫码中途放弃、前端只挂 status 轮询时，
+        # 弃置会话（含整张二维码 base64）只有 start() 才有别的回收机会
+        now = time.monotonic()
+        if now - self._gc_ts > 60:
+            self._gc_ts = now
+            await self.gc()
+        return snap
 
     async def cancel(self, ticket: str) -> None:
         s = self.sessions.get(ticket)
@@ -146,9 +163,20 @@ class LoginFlows:
 
         cancel() 只投递信号，不等落地就返回的话旧 _drive 仍会继续每 2 秒打上游，
         反复开扫码时会累积出大量在跑的轮询器。
-        """
+        终态会话的任务**不 cancel**：done 的 _drive 正在 finally 里把凭证写盘
+        （这是登录态唯一的持久化点），此刻取消等于白扫——改为等它自然收尾。
+
+        终态会话保留 60s 宽限期再回收：原先 done 即刻可被 gc 弹出，status() 的
+        惰性 gc（60s 节流）若恰好在 done 之后、前端下一次轮询之前触发，WebUI
+        会拿到 None——用户看到的是「失败/过期」而凭证其实已写盘，白白重新扫码。
+        宽限期内会话有界（终态后最多多留 60s），不构成无界累积。"""
         now = time.time()
-        stale = [t for t, s in self.sessions.items() if now - s.created > 600 or s.done_evt.is_set()]
+        stale = [
+            t
+            for t, s in self.sessions.items()
+            if now - s.created > 600
+            or (s.done_evt.is_set() and (s.finished_ts <= 0 or now - s.finished_ts > 60))
+        ]
         tasks: list[asyncio.Task] = []
         for t in stale:
             s = self.sessions.pop(t, None)
@@ -156,11 +184,23 @@ class LoginFlows:
                 continue
             if s.state in ("wait", "scanned"):
                 s.set_state("cancel")  # 唤醒仍在等 done_evt 的调用方
-            if s.task and not s.task.done():
-                s.task.cancel()
+                if s.task and not s.task.done():
+                    s.task.cancel()
+                    tasks.append(s.task)
+            elif s.task and not s.task.done():
+                # 终态收尾中（done 落盘 / 其余终态退出）：只等待，不打断
                 tasks.append(s.task)
         if tasks:
-            await asyncio.gather(*tasks, return_exceptions=True)
+            # 等待必须有界：_drive 依赖第三方库的事件流（qr_consume 等），异常形态下
+            # 可能永不返回——无界 gather 会把 gc 挂死，而 start()/status() 的惰性
+            # gc 都要过这里，扫码入口整体无响应。超时放弃等待，泄漏任务交给
+            # terminate 的统一取消兜底
+            try:
+                await asyncio.wait_for(
+                    asyncio.shield(asyncio.gather(*tasks, return_exceptions=True)), timeout=5
+                )
+            except asyncio.TimeoutError:
+                logger.warning("[music_hub] 登录会话清理等待超时（5s），残留任务交由退出兜底")
 
     async def cancel_source(self, source: str) -> None:
         """同一音源只保留一个活跃会话：先取消旧的再让调用方新建。
@@ -196,7 +236,9 @@ class LoginFlows:
         except ApiError as e:
             session.set_state("refuse", e.user_msg())
         except Exception as e:  # noqa: BLE001 - 登录失败不能崩插件
-            session.set_state("refuse", f"登录流程异常：{e}")
+            # 非 ApiError 原文可能带内部地址/库路径，不透给 WebUI 与聊天端
+            logger.warning(f"[music_hub] 登录流程异常: {e}")
+            session.set_state("refuse", "登录流程异常，请重试或查看运行日志")
         finally:
             if session.state == "done":
                 await self._finish(session)
@@ -207,12 +249,20 @@ class LoginFlows:
         key = session.extra
         deadline = time.time() + MAX_WAIT
         notified_scan = False
+        transient_fails = 0
         while time.time() < deadline:
             try:
                 r = await check(key)
+                transient_fails = 0
             except ApiError as e:
-                session.set_state("refuse", e.user_msg())
-                return
+                # 单次网络抖动/上游瞬断不该废掉整个扫码窗口（最长等 5 分钟）：
+                # 连续 3 次失败才判定登录服务不可用，间隔几秒重试
+                transient_fails += 1
+                if transient_fails >= 3:
+                    session.set_state("refuse", e.user_msg())
+                    return
+                await asyncio.sleep(3)
+                continue
             code = r.get("code")
             if session.source == "ncm":
                 if code == 802 and not notified_scan:
@@ -235,6 +285,10 @@ class LoginFlows:
                     session.nickname = str(r.get("nickname") or "")
                     session.set_state("done")
                     return
+                elif code == 3:
+                    # 手机端点了「取消授权」：不映射会空转到超时，状态还错报成二维码超时
+                    session.set_state("refuse", "已取消登录")
+                    return
                 elif code == 0:
                     session.set_state("timeout")
                     return
@@ -253,7 +307,12 @@ class LoginFlows:
             else:
                 session.set_state(state)
 
-        await client.qr_consume(self._qq_session_of(session), on_event)
+        qq_session = self._qq_session_of(session)
+        if qq_session is None:
+            # qr_start 异常形态下没拿到库会话对象：qr_consume(None) 行为不可控，直接判失败
+            session.set_state("refuse", "登录会话初始化失败，请重试")
+            return
+        await client.qr_consume(qq_session, on_event)
 
     def _qq_session_of(self, session: LoginSession):
         """qq 会话对象存在 session.poll_ctx（qr_start 时塞入）。"""
@@ -300,6 +359,7 @@ class LoginFlows:
             return
         uid = session.uid
         nickname = session.nickname
+        saved = False
         try:
             if source == "qq":
                 data = _json_load(cookie)
@@ -311,13 +371,41 @@ class LoginFlows:
                     uid = uid or status.get("uid", "")
                     nickname = nickname or status.get("nickname", "")
                 self._service.config.set_src_cookie(source, cookie, uid)
-            saved = await self._service.config.save_async()
+            # 落盘是凭证唯一的持久化点：此刻即便外层任务被 cancel（terminate 等），
+            # 也要让 save_async 跑完再响应取消。shield 只保证写盘本身不被打断，
+            # 外层 await 仍会立即抛 CancelledError——这里接住它、等写盘任务真正
+            # 落地后再重抛，否则 saved/msg 的赋值会被整段跳过（写盘成孤儿任务）
+            save_task = asyncio.ensure_future(self._service.config.save_async())
+            try:
+                saved = bool(await asyncio.shield(save_task))
+            except asyncio.CancelledError:
+                try:
+                    await save_task
+                    saved = True
+                except Exception:  # noqa: BLE001 - 取消路径只保证落盘尝试完成
+                    saved = False
+                session.uid = uid
+                session.nickname = nickname
+                session.msg = "登录成功" + ("" if saved else "（配置保存失败，仅本次会话生效）")
+                raise
             session.uid = uid
             session.nickname = nickname
             session.msg = "登录成功" + ("" if saved else "（配置保存失败，仅本次会话生效）")
         except Exception as e:  # noqa: BLE001
-            session.msg = f"登录成功但保存失败：{e}"
-        self._service.on_login_success(source)
+            # 原文可能带本地路径/内部地址：session.msg 进 WebUI 轮询与聊天端，
+            # 固定文案 + 日志留痕（对齐本模块 222 行「原文不透出」的纪律）
+            logger.warning(f"[music_hub] {source} 登录成功但配置保存失败：{type(e).__name__}: {e}")
+            session.msg = "登录成功但保存失败，详见运行日志"
+        finally:
+            # 回调放 finally：CancelledError 在写盘落地后穿透重抛时，原写法直接
+            # 跳过回调——凭证已落盘但特权缓存刷新与成功日志缺失。以「状态 done 且
+            # 已保存」为条件：保存失败/被取消打断的落盘不算登录成功。回调自身
+            # 吞异常——finally 里再抛会遮蔽正在传播的原异常
+            if session.state == "done" and saved:
+                try:
+                    self._service.on_login_success(source)
+                except Exception as e:  # noqa: BLE001
+                    logger.warning(f"[music_hub] 登录成功回调异常: {e}")
 
     async def _safe_status(self, source: str) -> dict:
         try:

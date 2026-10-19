@@ -10,8 +10,11 @@ from __future__ import annotations
 
 import asyncio
 import json
+import re
 import time
 from pathlib import Path
+
+from astrbot.api import logger
 
 from ..errors import KG_ERRORS, ApiError, NotEnabledError
 from ..quality import KG_LABEL, first, kg_hash_for, ladder_for
@@ -20,6 +23,7 @@ from .http import (
     data_of,
     format_duration,
     get_session,
+    harden_sensitive_file,
     list_of,
     num,
     opt_int,
@@ -27,6 +31,12 @@ from .http import (
     with_ts,
 )
 from .registry import register
+
+# 旧调用点的模块级别名：与 http.format_duration 同一实现，勿再复制
+_dur = format_duration
+
+# /top/song 新歌速递的榜单 type 值（酷狗上游协议魔数，rank 列表里「新歌」条目的 id）
+KG_NEW_SONG_RANK_ID = 21608
 
 
 def _upstream_msg(data: dict) -> str:
@@ -72,6 +82,10 @@ def normalize_song(item: dict, idx: int = 0) -> dict | None:
     timelength = ainfo.get("timelength") or item.get("timelength") or item.get("time_length") or 0
     # timelength 单位可静态确定为毫秒（见 _dur），显式传 "ms" 修复 <10s 音频被格式化成
     # 150:00 的问题；Duration/duration 单位未知，退回 "auto" 猜测
+    # 高档 hash 的子对象键大小写两种都出现过（同 filename 的口径，见上）：
+    # 只认大写 Hash 会让高档 hash 取空 → 阶梯静默降到 128
+    hq, sq = _sub(item, "HQ"), _sub(item, "SQ")
+    tp = item.get("trans_param") if isinstance(item.get("trans_param"), dict) else {}
     return {
         "index": idx + 1,
         "source": "kg",
@@ -87,12 +101,24 @@ def normalize_song(item: dict, idx: int = 0) -> dict | None:
         "trial": False,
         "mvid": "",
         "hash_128": h128,
-        "hash_320": str(ainfo.get("hash_320") or item.get("hash_320") or _sub(item, "HQ").get("Hash") or ""),
-        "hash_flac": str(
-            ainfo.get("hash_flac") or item.get("hash_flac") or _sub(item, "SQ").get("Hash") or ""
+        # trans_param 兜底：搜索条目常无 audio_info/HQ/SQ（高档 hash 只在
+        # trans_param.ogg_320_hash / ogg_flac_hash 里），漏读会让 kg_hash_for 取空
+        # → song_url_best 静默跳档，用户配了 flac 也恒播 128（与 _cover_of 同源取法）
+        "hash_320": str(
+            ainfo.get("hash_320")
+            or item.get("hash_320")
+            or hq.get("Hash")
+            or hq.get("hash")
+            or tp.get("ogg_320_hash")
+            or ""
         ),
-        "hash_high": str(
-            ainfo.get("hash_high") or item.get("hash_high") or _sub(item, "Res").get("Hash") or ""
+        "hash_flac": str(
+            ainfo.get("hash_flac")
+            or item.get("hash_flac")
+            or sq.get("Hash")
+            or sq.get("hash")
+            or tp.get("ogg_flac_hash")
+            or ""
         ),
         "raw": {},
     }
@@ -159,21 +185,6 @@ def _paid(item: dict) -> bool:
     return False
 
 
-def _dur(value: float, unit: str = "auto") -> str:
-    """时长 → mm:ss。unit="ms" 恒按毫秒；"auto" 是兼容未知单位的阈值猜测：≥10000
-    视为毫秒、否则视为秒。猜测的边界（已知局限）：小于 10s 的音频（如 9000ms 试听）
-    会被当成 9000 秒格式化成 150:00；超过 10000s（约 2h47m）的秒值会被当成毫秒。
-    单位依据：timelength 系字段恒为毫秒（上游 audio_match 页 formatDuration 按 ms
-    处理、插件 dtMs 亦按 ms 消费），可显式传 "ms"；搜索结果的 Duration/duration
-    系字段单位在上游代理源码中无从核实，只能保留 "auto"。"""
-    if value <= 0:
-        return ""
-    if unit == "ms" or (unit == "auto" and value >= 10000):
-        value /= 1000
-    sec = int(value)
-    return f"{sec // 60:02d}:{sec % 60:02d}"
-
-
 def normalize_playlist(item: dict, idx: int = 0) -> dict | None:
     if not isinstance(item, dict):
         return None
@@ -182,6 +193,7 @@ def normalize_playlist(item: dict, idx: int = 0) -> dict | None:
         return None
     return {
         "index": idx + 1,
+        "source": "kg",
         "id": str(
             item.get("global_collection_id")
             or item.get("specialid")
@@ -213,6 +225,7 @@ def normalize_album(item: dict, idx: int = 0) -> dict | None:
         return None
     return {
         "index": idx + 1,
+        "source": "kg",
         "id": str(item.get("albumid") or item.get("album_id") or item.get("id") or ""),
         "name": str(name),
         "cover": _cover_of(item) or str(item.get("img") or "").replace("{size}", "300"),
@@ -234,6 +247,7 @@ def normalize_artist(item: dict, idx: int = 0) -> dict | None:
         cover = str(dy or item.get("Avatar") or item.get("avatar") or "")
     return {
         "index": idx + 1,
+        "source": "kg",
         "id": str(
             item.get("AuthorId") or item.get("author_id") or item.get("singerid") or item.get("id") or ""
         ),
@@ -246,11 +260,17 @@ def normalize_artist(item: dict, idx: int = 0) -> dict | None:
 class KugouClient:
     source = "kg"
 
+    # 注册失败后的冷却时长：期间直接重抛，不再打 /register/dev（防限频正反馈）
+    _DEVICE_BACKOFF = 60.0
+
     def __init__(self, config, device_path: Path):
         self._config = config
         self._device_path = device_path  # device_cookies.json
         self._device_cookie = ""
         self._device_lock = asyncio.Lock()  # 并发首调只放一个进 /register/dev
+        self._device_fail_ts: float | None = None  # 注册失败冷却起点（monotonic）；None=从未失败
+        # 20028/20040 设备自愈只做一次：重注册后仍被拒时反复清 cookie 只会放大风控
+        self._device_reset_done = False
 
     def ready(self) -> bool:
         """无重依赖（走 HTTP 服务），配置了地址即可用。"""
@@ -259,23 +279,36 @@ class KugouClient:
     # ──────────── 设备 ────────────
     def load_device(self) -> None:
         try:
+            if not self._device_path:
+                # 工厂漏传 kg_device_path 时 None.read_text 是 AttributeError，
+                # 不在下方 except 捕获面里——显式拒绝比误写「None 文件」清晰
+                raise ValueError("kg 设备路径未配置")
             data = json.loads(self._device_path.read_text("utf-8"))
+            # 手工编辑/损坏可能产生合法 JSON 但非 dict（"dfid=..."、[]、null）：
+            # data.get 会抛 AttributeError 且不在捕获面内，initialize 阶段会拖垮整个插件
+            if not isinstance(data, dict):
+                raise ValueError("kg 设备文件不是 JSON 对象")
             self._device_cookie = str(data.get("cookie") or "")
         except (OSError, ValueError):
             self._device_cookie = ""
 
     def _jar_cookie(self) -> str:
-        """注册响应后从共享会话 cookie jar 取该域名下的完整设备 cookie 串。
+        """注册响应后从共享会话 cookie jar 取设备 cookie 串（按键名白名单过滤）。
 
         KuGouMusicApi 服务端会把 dfid + KUGOU_API_GUID/MID/DEV… 经 Set-Cookie 回写，
-        request.js 签名依赖这些键 —— 必须整串持久化，重启后不因缺 MID 触发 20028。
+        request.js 签名依赖这些键 —— 只保留 dfid/KUGOU_API_*：cookie jar 按 host
+        隔离不分端口，同主机部署时（127.0.0.1:3000 网易 + :4000 酷狗）其他音源
+        服务的活凭证（如 MUSIC_U）也会出现在该 host 的 jar 里，整串落盘等于把
+        无关凭证复制进 device_cookies.json 还随每次请求外发。
         """
         try:
             from yarl import URL
 
             jar = get_session().cookie_jar
             cookies = jar.filter_cookies(URL(self.base))
-            parts = [f"{k}={m.value}" for k, m in cookies.items()]
+            parts = [
+                f"{k}={m.value}" for k, m in cookies.items() if k == "dfid" or k.startswith("KUGOU_API_")
+            ]
             return "; ".join(p for p in parts if p)
         except Exception:  # noqa: BLE001 - jar 读取失败退回仅 dfid 的旧行为
             return ""
@@ -285,16 +318,31 @@ class KugouClient:
         第一次返回 dfid，其余返回空 data —— 必须判断 dfid 存在并复用缓存。
 
         磁盘读写走 to_thread：本方法被大量接口调用，裸同步 IO 会卡住整个事件循环。
+
+        失败冷却：search/suggest/comments 等 30+ 方法都以 ensure_device() 开头，失败后
+        不设冷却会维持限频窗口、形成正反馈 —— 冷却期内直接重抛同一错误不再打注册接口。
         """
         if self._device_cookie:
             return self._device_cookie
         async with self._device_lock:
             if self._device_cookie:  # 双检：等锁期间可能已被并发调用方填好
                 return self._device_cookie
+            # 哨兵判据：_device_fail_ts 为 None 表示从未失败过。monotonic() 的参考点
+            # 多取开机时刻，开机 60 秒内启动插件时 `BACKOFF - (mono - 0.0)` 恒为正，
+            # 会凭空报「设备注册失败 X 秒后重试」
+            if (
+                self._device_fail_ts is not None
+                and (wait := self._DEVICE_BACKOFF - (time.monotonic() - self._device_fail_ts)) > 0
+            ):
+                raise ApiError(
+                    f"设备注册失败：未拿到 dfid（上游静默限频），{int(wait) + 1} 秒后重试", source="kg"
+                )
             await asyncio.to_thread(self.load_device)
             if self._device_cookie:
                 return self._device_cookie
-            body = await self.request("/register/dev", {}, inject_cookie=False)
+            # timestamp 穿透服务端按完整 URL 的 2 分钟缓存（POST 同样缓存）：否则
+            # 冷却期结束后的重试会命中上一次的静默限频失败体（data:[]），冷却形同虚设
+            body = await self.request("/register/dev", self._ts({}), inject_cookie=False)
             dfid = str(data_of(body).get("dfid") or "")
             cookie = self._jar_cookie()
             if dfid and "dfid=" not in cookie:
@@ -305,19 +353,49 @@ class KugouClient:
             # 都被服务端注入随机 dfid（等于每次换新设备），放大 20028 风控 —— 宁可
             # 抛错让调用方稍后重试，也不落盘坏缓存。
             if not cookie or ("dfid=" not in cookie and not dfid):
+                self._device_fail_ts = time.monotonic()
                 raise ApiError("设备注册失败：未拿到 dfid（上游静默限频），稍后重试", source="kg")
+            self._device_fail_ts = None
+            # jar 读取失败（_jar_cookie 异常返回空串）会拼出纯 dfid 串：内存里本次可用
+            # （服务端每请求都会重新 Set-Cookie），但持久化等于落盘「缺 KUGOU_API_*、
+            # 重启触发 20028」的坏缓存 —— 与本模块 docstring 的风控约定矛盾，跳过落盘
+            if "KUGOU_API_" not in cookie:
+                self._device_cookie = cookie
+                return cookie
             await asyncio.to_thread(self._persist_device, cookie, dfid)
             self._device_cookie = cookie
             return cookie
 
     def _persist_device(self, cookie: str, dfid: str) -> None:
-        """落盘设备 cookie（同步，供 to_thread 调用）。"""
+        """落盘设备 cookie（同步，供 to_thread 调用）。落盘失败必须留痕：静默失败
+        意味着每次重启都重新注册设备，正是 docstring 要避免的风控放大场景。
+
+        dfid + KUGOU_API_* 是签名必需的完整设备身份（风控敏感数据），落盘后与 QQ
+        设备指纹同口径做 best-effort 权限收紧。"""
         try:
             self._device_path.parent.mkdir(parents=True, exist_ok=True)
             self._device_path.write_text(
                 json.dumps({"cookie": cookie, "dfid": dfid, "ts": int(time.time())}, ensure_ascii=False),
                 "utf-8",
             )
+        except OSError as e:
+            logger.warning(f"[music_hub] 酷狗设备 cookie 落盘失败（重启后需重新注册）: {e}")
+            return
+        harden_sensitive_file(self._device_path)
+
+    async def _reset_device_once(self) -> None:
+        """已带设备 cookie 仍被 20028/20040 拒绝时的一次性自愈：清内存并删落盘文件，
+        让下一轮 ensure_device 自动重新注册——服务端换设备密钥后旧 cookie 必 20028，
+        只能重注册自愈，不该再让用户手动删 device_cookies.json。
+        一次性守卫：新设备仍被拒时反复重注册只会放大风控，故每进程只清一次。"""
+        if self._device_reset_done or not self._device_cookie:
+            return
+        self._device_reset_done = True
+        self._device_cookie = ""
+        if not self._device_path:
+            return
+        try:
+            await asyncio.to_thread(self._device_path.unlink)
         except OSError:
             pass
 
@@ -362,13 +440,42 @@ class KugouClient:
             composed = self._compose_cookie(caller)
             if composed:
                 params["cookie"] = composed
+        # noCookie=true：上游不把模块 cookie 回写进响应 Set-Cookie。共享会话 jar
+        # 一旦收录登录 token（扫码成功响应的 Set-Cookie 带 token/userid），登出
+        # 只清配置不清 jar，残留的旧 token 会随后续请求原样送达上游（酷狗对
+        # Cookie 头是按键合并、无同名键覆盖）——已登出账号在插件重载前仍是事实
+        # 登录态，取流/VIP/关注写操作全部按旧账号生效。插件所有请求都显式传
+        # cookie 串、从不消费响应 Set-Cookie，唯一例外是 /register/dev：设备
+        # cookie（dfid/KUGOU_API_*）全靠 jar 收录后经 _jar_cookie 持久化
+        if pathname != "/register/dev":
+            params["noCookie"] = "true"
         status, body = await request_json("kg", "酷狗 API", base, pathname, params, method=method)
-        return self._handle(body, status)
+        try:
+            return self._handle(body, status)
+        except ApiError as e:
+            # 已带设备 cookie 仍被 20028（风控/设备失效）/20040 拒绝：设备身份已失效，
+            # 清掉让下一轮 ensure_device 自动重新注册。挂统一出口而不是只挂 song_url：
+            # 纯浏览路径（搜索/歌词/评论）命中时同样自愈，否则要等某次点歌取流才恢复。
+            # 错误照常上抛由各调用方归因
+            if opt_int(e.code) in (20028, 20040):
+                await self._reset_device_once()
+            raise
 
     def _handle(self, body: dict, status: int) -> dict:
         """业务级错误映射。传输/解析层（网络异常、非 JSON）在 http.request_json；
         status==0 是 KuGouMusicApi 的上游故障约定（HTTP 可能仍是 502/200）。"""
-        if status >= 400 or body.get("status") == 0:
+        # status 用字符串口径比较：自建服务分叉实现可能回 "0"（字符串），
+        # 严格 == 0 会把上游故障误判成业务成功、走进字段解析炸出难懂的 KeyError
+        # ssa-code 二次验证（滑块/短信）：上游 request.js 在成功与失败两条路径都把
+        # 该头注入响应体 ssaCode 字段——命中时换任何接口重试同样被拦，给出可行动
+        # 文案而不是泛化错误（成功响应也要拦：字段解析会拿到空数据误导为「无结果」）
+        if body.get("ssaCode"):
+            raise ApiError(
+                "酷狗触发风控，需要二次安全验证（滑块/短信）：请在酷狗 App 完成验证后重试",
+                source="kg",
+                payload=body,
+            )
+        if status >= 400 or str(body.get("status")) == "0":
             code = body.get("error_code") or body.get("errcode") or body.get("err_code")
             msg = _upstream_msg(body)
             c = opt_int(code)
@@ -376,28 +483,44 @@ class KugouClient:
             raise ApiError(err_msg, code=c, source="kg", payload=body)
         return body
 
-    # 实现收敛到 http（with_ts / format_duration）；保留旧名以维持内部调用点与
-    # tests/test_v3_api 对 kg._dur 的引用不漂移
+    # 实现收敛到 http（with_ts / format_duration）；保留旧名以维持内部调用点
+    # （_ts 遍布全文件）与 _dur 的既有别名不漂移
     _ts = staticmethod(with_ts)
     _dur = staticmethod(format_duration)
 
     # ──────────── 搜索 ────────────
-    def require_login(self) -> None:
+    def require_login(self, what: str = "搜索") -> None:
         """酷狗已禁止匿名搜索（error_code=152）：占位 cookie 与设备 cookie 均无效。
 
         未登录时提前拦截，避免发出注定失败的请求，也让上层能给出扫码引导。
+        浏览类端点（日推/云盘/最近在听等）匿名一律 20010 泛化文案，同样在此
+        统一提前拦出口径；what 仅用于文案点出功能名。
         """
         if not self.cookie:
             # 不带 code：错误码表里 20010 是泛化文案，会盖掉这里的扫码引导（errors.user_msg 优先查表）
-            raise ApiError("酷狗搜索需登录，请先发送「kg登录」扫码", source="kg")
+            raise ApiError(f"酷狗{what}需登录，请先发送「kg登录」扫码", source="kg")
 
     async def search(self, keyword: str, limit: int = 10, type_: str = "song", page: int = 1) -> list[dict]:
         """page 从 1 起（ncm 是 0 起）——三源 page 语义不统一，调用方传值时注意。"""
         self.require_login()
         await self.ensure_device()
-        body = await self.request(
-            "/search", {"keywords": keyword, "type": type_, "pagesize": limit, "page": page}
-        )
+        try:
+            body = await self.request(
+                "/search", {"keywords": keyword, "type": type_, "pagesize": limit, "page": page}
+            )
+        except ApiError as e:
+            # 152 = 上游按匿名拒绝搜索。走到这里必然已带登录 cookie（require_login
+            # 已拦住无 cookie 的调用）：token 被上游拒绝——常见于标准版/概念版
+            # 部署不匹配、服务端重启换设备密钥、或登录态过期。面板账号页会一直
+            # 显示「已登录」（只看 cookie 存在性），没有这条提示用户无从下手。
+            # 不带 code：错误码表 152 是泛化文案，user_msg 优先查表会盖掉扫码引导
+            if str(e.code) == "152":
+                raise ApiError(
+                    "酷狗登录态已失效（token 被上游拒绝，常见于 API 服务重启或平台版本不匹配），"
+                    "请发送「kg登录」重新扫码",
+                    source="kg",
+                ) from e
+            raise
         lists = data_of(body).get("lists")
         if type_ == "song":
             return collect(lists, normalize_song, limit)
@@ -411,6 +534,9 @@ class KugouClient:
         return []
 
     async def suggest(self, keyword: str) -> list[dict]:
+        # 与文件内其他方法一致先 ensure_device：设备未注册时请求缺 dfid/
+        # 签名键，会触发 20028（本方法原先唯二漏调，另一个是 hot_search）
+        await self.ensure_device()
         body = await self.request("/search/suggest", self._ts({"keywords": keyword}))
         data = data_of(body)
         out = []
@@ -427,6 +553,7 @@ class KugouClient:
         return out[:10]
 
     async def hot_search(self) -> list[dict]:
+        await self.ensure_device()
         body = await self.request("/search/hot")
         items = list_of(data_of(body).get("list"))
         return [
@@ -451,10 +578,17 @@ class KugouClient:
                 url = str(v)
             if url:
                 break
-        return {"url": url, "status": body.get("status"), "extName": body.get("extName") or "", "raw": body}
+        # extName 统一无点小写，与 qq/ncm 的 ext 字段同格式
+        ext = str(body.get("extName") or "").lstrip(".").lower()
+        return {"url": url, "status": body.get("status"), "extName": ext, "raw": body}
 
     @staticmethod
     def _is_trial_url(url: str) -> bool:
+        """凭文件名形态猜试听片段：URL 含 p_0_ 且不含 full 视为 60s 试听。
+
+        纯启发式，无上游出处佐证（已知局限）：误判会把整曲标成试听（卡片错标
+        「试听 60s」、队列提前切歌）；漏判则试听片段被当整曲播，60s 后断流。
+        """
         u = (url or "").lower()
         return "p_0_" in u and "full" not in u
 
@@ -473,9 +607,17 @@ class KugouClient:
             except ApiError as e:
                 if e.timeout:
                     raise
+                # 会话级失败（需登录/未登录/风控/设备失效）换音质档重试同样必失败：
+                # 20028/20040 的设备自愈已在 request 出口先行触发，这里短路只是
+                # 不再空烧剩余档位——对齐 ncm/qq 的会话级短路口径
+                if opt_int(e.code) in (20010, 20017, 20028, 20040):
+                    raise
                 last_err = e
                 continue
-            if r.get("url") and r.get("status") == 1:
+            # status 与 _handle 同口径走宽松整型：分叉上游回 "1"（字符串）时严格
+            # ==1 会把已拿到的有效 URL 当失败丢弃，错误归因也跟着错
+            status = opt_int(r.get("status"))
+            if r.get("url") and status == 1:
                 trial = self._is_trial_url(r["url"])
                 return {
                     "url": r["url"],
@@ -483,9 +625,10 @@ class KugouClient:
                     "qualityLabel": KG_LABEL.get("128", "") if trial else KG_LABEL.get(q, q),
                     "trial": trial,
                     "extName": r.get("extName") or "",
+                    "ext": r.get("extName") or "",
                     "raw": r.get("raw"),
                 }
-            if r.get("status") == 2:
+            if status == 2:
                 last_paid = True
         if trial_fallback and self._config.src_quality_unblock("kg"):
             h128 = kg_hash_for(song, "128")
@@ -497,21 +640,27 @@ class KugouClient:
                         raise
                     last_err = e
                 else:
-                    if r.get("url") and r.get("status") == 1:
+                    # free_part=1 只对部分歌曲生效：上游可能照样回整曲 URL，不验证
+                    # 就标 trial=True 会让队列按 60s 误切歌（与 _is_trial_url 的漏判
+                    # 方向互补）。URL 判不出试听形态时按整曲 128 档返回
+                    if r.get("url") and opt_int(r.get("status")) == 1:
+                        trial = self._is_trial_url(r["url"])
                         return {
                             "url": r["url"],
                             "quality": "128",
-                            "qualityLabel": "试听 60s",
-                            "trial": True,
+                            "qualityLabel": "试听 60s" if trial else KG_LABEL.get("128", "128"),
+                            "trial": trial,
                             "extName": r.get("extName") or "",
+                            "ext": r.get("extName") or "",
                             "raw": r.get("raw"),
                         }
         if last_err is not None and opt_int(last_err.code) in (20010, 20017, 20028, 20040):
             raise last_err
         if last_paid:
-            # 不带 code=20017：那在 KG_ERRORS 表里会被 user_msg() 覆盖成
-            # 「需要登录或 Token 失效」，这里语义是付费/VIP，落原始 message
-            raise ApiError("该歌曲为付费/VIP，未登录无法获取完整播放链接", source="kg")
+            # status==2 只说明「该音质不可用」，免费歌部分档位不可用也会置位——
+            # 归因模糊时两种可能都交代，避免把免费歌误导成「去扫码登录」。
+            # 不带 code=20017：那在 KG_ERRORS 表里会被 user_msg() 覆盖成登录失效文案
+            raise ApiError("未能获取播放链接：歌曲可能为付费/VIP，或当前可用音质均不可用", source="kg")
         if last_err is not None:
             raise last_err
         raise ApiError("无法获取播放链接（可能已下架或无版权）", source="kg")
@@ -561,18 +710,31 @@ class KugouClient:
         )
 
     async def song_lyric(self, song: dict) -> dict:
-        """song 协议：普通歌词（LRC）。候选定位 → 取内容两步在源内闭环。"""
+        """song 协议：普通歌词（LRC）。候选定位 → 取内容两步在源内闭环。
+
+        空内容跳过试下一个候选（与 song_lyric_karaoke 同纪律）：首个候选
+        （常按 hash 定位）decodeContent 为空不代表其余候选也没有。
+        单个候选的 accesskey 失效等 ApiError 同样只放弃该候选——它是「这条线索
+        取不到」，不是「整首歌没有歌词」。"""
         for c in await self._locate_candidates(song):
             if c.get("id") and c.get("accesskey"):
-                content = await self.lyric(c["id"], c["accesskey"], "lrc")
-                return {"lrc": content, "tlyric": "", "yrc": ""}
+                try:
+                    content = await self.lyric(c["id"], c["accesskey"], "lrc")
+                except ApiError:
+                    continue
+                if content:
+                    return {"lrc": content, "tlyric": "", "yrc": ""}
         return {"lrc": "", "tlyric": "", "yrc": ""}
 
     async def song_lyric_karaoke(self, song: dict) -> dict:
-        """song 协议：逐字歌词（KRC）。无候选或全无 accesskey 时返回空 yrc。"""
+        """song 协议：逐字歌词（KRC）。无候选或全无 accesskey 时返回空 yrc。
+        单候选 ApiError 跳过试下一个，理由同 song_lyric。"""
         for c in await self._locate_candidates(song):
             if c.get("id") and c.get("accesskey"):
-                content = await self.lyric(c["id"], c["accesskey"], "krc")
+                try:
+                    content = await self.lyric(c["id"], c["accesskey"], "krc")
+                except ApiError:
+                    continue
                 if content:
                     return {"lrc": "", "tlyric": "", "yrc": content}
         return {"lrc": "", "tlyric": "", "yrc": ""}
@@ -594,7 +756,8 @@ class KugouClient:
         if isinstance(data, list) and data:
             d0 = data[0]
         elif isinstance(data, dict):
-            d0 = data.get(hash_) or data.get(str(hash_).lower()) or data
+            # 只认本曲 hash 的键：兜底整个 data 会把同响应里别首歌的高潮片段当本曲返回
+            d0 = data.get(hash_) or data.get(str(hash_).lower())
         if not isinstance(d0, dict):
             return {}
         return {"start_ms": int(num(d0.get("start_time"))), "end_ms": int(num(d0.get("end_time")))}
@@ -636,7 +799,7 @@ class KugouClient:
             songs = list_of(body.get("data"))
         return collect(songs, normalize_song, limit)
 
-    async def new_songs(self, rank_id: int = 21608) -> list[dict]:
+    async def new_songs(self, rank_id: int = KG_NEW_SONG_RANK_ID) -> list[dict]:
         await self.ensure_device()
         body = await self.request("/top/song", {"type": rank_id})
         return collect(list_of(body.get("data")), normalize_song, 20)
@@ -648,8 +811,10 @@ class KugouClient:
 
     async def top_card(self, type_: str = "") -> list[dict]:
         await self.ensure_device()
-        path = "/top/card" + (f"/{type_}" if type_ else "")
-        body = await self.request(path, {})
+        # type_ 拼进 pathname 前先过白名单式校验：当前唯一调用点无参传入，
+        # 防将来接入用户输入时变成路径注入
+        seg = f"/{type_}" if re.fullmatch(r"[0-9A-Za-z_-]{1,32}", str(type_) or "") else ""
+        body = await self.request("/top/card" + seg, {})
         return collect(list_of(body.get("data")), normalize_song, 20)
 
     async def rank_top(self) -> list[dict]:
@@ -773,12 +938,14 @@ class KugouClient:
 
     # ──────────── 推荐 / FM ────────────
     async def everyday_recommend(self) -> list[dict]:
+        self.require_login("每日推荐")
         await self.ensure_device()
         body = await self.request("/everyday/recommend", self._ts({}))
         data = data_of(body)
         return collect(list_of(data.get("song_list") or data.get("songs")), normalize_song, 30)
 
     async def personal_fm(self) -> list[dict]:
+        self.require_login("私人 FM")
         await self.ensure_device()
         body = await self.request("/personal/fm", self._ts({}))
         return collect(list_of(data_of(body).get("song_list")), normalize_song, 10)
@@ -786,7 +953,11 @@ class KugouClient:
     # ──────────── 评论 / MV ────────────
     async def comments(self, mixsongid: str, limit: int = 12, kind: str = "music") -> dict:
         await self.ensure_device()
-        path = {"music": "/comment/music", "playlist": "/comment/playlist", "album": "/comment/album"}[kind]
+        path = {"music": "/comment/music", "playlist": "/comment/playlist", "album": "/comment/album"}.get(
+            kind
+        )
+        if not path:
+            raise ApiError(f"不支持的评论类型：{kind}", source="kg")
         params = {"page": 1, "pagesize": limit}
         # /comment/music 认 mixsongid；歌单/专辑评论的参数名是 id（module 里 childrenid: params.id）
         if kind == "music":
@@ -810,7 +981,11 @@ class KugouClient:
         user = item.get("user") if isinstance(item.get("user"), dict) else {}
         like = item.get("like") if item.get("like") is not None else item.get("praise")
         ts = num(item.get("time"))
-        time_str = time.strftime("%Y-%m-%d", time.localtime(ts / 1000)) if ts > 100000000 else ""
+        # ≥1e11 视为毫秒（13 位），否则按秒：1e8 的旧阈值对秒/毫秒毫无区分力，
+        # 秒级时间戳会被 /1000 显示成 1970 年
+        time_str = (
+            time.strftime("%Y-%m-%d", time.localtime(ts / 1000 if ts > 10**11 else ts)) if ts > 0 else ""
+        )
         return {
             "index": idx + 1,
             "nick": user.get("nickname") or item.get("nickname") or "酷狗用户",
@@ -823,9 +998,15 @@ class KugouClient:
 
     async def mv_url(self, hash_: str) -> dict:
         await self.ensure_device()
-        body = await self.request("/video/url", {"hash": hash_})
+        # 酷狗 hash 规范为小写：入参先统一小写再发请求与查响应键——
+        # 大写入参时请求原样发出、响应键却按 lower 查，必然 miss 空返回
+        h = str(hash_ or "").strip().lower()
+        body = await self.request("/video/url", {"hash": h})
         data = data_of(body)
-        node = data.get(str(hash_).lower()) if isinstance(data.get(str(hash_).lower()), dict) else {}
+        node = data.get(h) if isinstance(data.get(h), dict) else {}
+        if not node and h != str(hash_ or ""):
+            # 服务端按原样回显键的兜底
+            node = data.get(str(hash_ or "")) if isinstance(data.get(str(hash_ or "")), dict) else {}
         return {"url": str(node.get("downurl") or "")}
 
     async def song_mv_url(self, song: dict) -> dict:
@@ -853,7 +1034,10 @@ class KugouClient:
                     "name": name,
                     "artist": _singers(it),
                     "cover": _cover_of(it).replace("{size}", "300"),
-                    "duration": _dur(num(it.get("Duration") or it.get("timelength"))),
+                    # timelength 恒为毫秒（见 normalize_song 的 _dur 注释），混入 auto
+                    # 阈值会把 <10s 的条目格式化成 150:00，显式按 ms；Duration 单位
+                    # 未知，保持 auto 猜测
+                    "duration": _dur(num(it.get("Duration"))) or _dur(num(it.get("timelength")), "ms"),
                     "playCount": 0,
                 }
             )
@@ -863,7 +1047,18 @@ class KugouClient:
     async def login_status(self) -> dict:
         if not self.cookie:
             return {"loggedIn": False, "uid": "", "nickname": "", "avatar": ""}
-        await self.ensure_device()
+        try:
+            await self.ensure_device()
+        except ApiError:
+            # 设备注册限频/失败不挡状态展示：本方法只用于账号页展示「本地有无
+            # cookie」，cookie 存在性判断不需要设备；上游昵称核验等下一轮刷新自会补上，
+            # 挡在这里会让账号页在 60s 冷却窗内显示「设备注册失败」而非登录状态
+            return {
+                "loggedIn": True,
+                "uid": str(self._config.src_uid("kg") or ""),
+                "nickname": "",
+                "avatar": "",
+            }
         try:
             body = await self.request("/user/detail", self._ts({}))
             data = data_of(body)
@@ -877,10 +1072,21 @@ class KugouClient:
         except ApiError as e:
             if opt_int(e.code) in (20010, 20017, 35002):
                 return {"loggedIn": False, "uid": "", "nickname": "", "avatar": ""}
+            if opt_int(e.code) == 20018:
+                # /user/detail 在凭证缺失/失效/平台不匹配时上游实际回 20018（实测，
+                # 垃圾与空 cookie 同码）：归一为「凭证无效」而非透传——透传会让账号页
+                # 显示「查询失败」，与总览页「已登录」（配置口径）矛盾，用户无从下手
+                return {"loggedIn": False, "uid": "", "nickname": "凭证已失效，请重新扫码", "avatar": ""}
             raise
 
     async def vip_info(self) -> dict:
-        await self.ensure_device()
+        # 设备注册冷却不挡 VIP 展示（与 login_status 同口径）：/user/vip/detail
+        # 走已登录请求，设备 cookie 已在 _compose_cookie 里；裸调 ensure_device
+        # 会在 60s 冷却窗内让账号页 VIP 行缺失（下游 vip_summary 吞异常归空）
+        try:
+            await self.ensure_device()
+        except ApiError:
+            pass
         body = await self.request("/user/vip/detail", self._ts({}))
         data = data_of(body)
         row = data.get("row") if isinstance(data.get("row"), list) else []
@@ -888,8 +1094,15 @@ class KugouClient:
         expire = ""
         for it in row:
             if isinstance(it, dict) and it.get("token"):
-                level = max(level, int(num(it.get("level"))))
-                expire = str(it.get("end_time") or "")
+                # level 与 expire 必须取自同一行：只在行级更高时整体覆盖——
+                # `>=` 会让同级多行的后一行（含 end_time 为空的行）无条件
+                # 清掉已有到期日，与「取自同一行」的意图相悖
+                row_level = int(num(it.get("level")))
+                if row_level > level:
+                    level = row_level
+                    expire = str(it.get("end_time") or "")
+                elif row_level == level and not expire:
+                    expire = str(it.get("end_time") or "")
         return {"vipLevel": level, "expire": expire}
 
     async def user_grade(self) -> dict:
@@ -899,18 +1112,21 @@ class KugouClient:
         return {"p_grade": int(num(data.get("p_grade"))), "d_sec": num(data.get("d_sec"))}
 
     async def user_playlists(self) -> list[dict]:
+        self.require_login("浏览歌单")
         await self.ensure_device()
         body = await self.request("/user/playlist", self._ts({}))
         data = data_of(body)
         return collect(list_of(data.get("list") or data.get("info")), normalize_playlist, 30)
 
     async def recent_songs(self, limit: int = 30) -> list[dict]:
+        self.require_login("查看最近在听")
         await self.ensure_device()
         body = await self.request("/user/listen", self._ts({}))
         songs = list_of(data_of(body).get("songs") or body.get("data"))
         return collect(songs, normalize_song, limit)
 
     async def history_recommend(self) -> list[dict]:
+        self.require_login("历史推荐")
         await self.ensure_device()
         body = await self.request("/everyday/history", self._ts({"mode": "song"}))
         data = data_of(body)
@@ -921,6 +1137,7 @@ class KugouClient:
         return await self.everyday_recommend()
 
     async def cloud_songs(self, limit: int = 30) -> list[dict]:
+        self.require_login("云盘")
         await self.ensure_device()
         body = await self.request("/user/cloud", {"page": 1, "pagesize": limit})
         data = data_of(body)
@@ -941,6 +1158,7 @@ class KugouClient:
         return out
 
     async def purchased_songs(self, limit: int = 30) -> list[dict]:
+        self.require_login("已购音乐")
         await self.ensure_device()
         body = await self.request("/user/purchased/songs", {})
         return collect(
@@ -953,6 +1171,7 @@ class KugouClient:
         return "已关注歌手" if follow else "已取消关注"
 
     async def followed_new_songs(self, limit: int = 30) -> list[dict]:
+        self.require_login("关注歌手新歌")
         await self.ensure_device()
         body = await self.request("/artist/follow/newsongs", {})
         return collect(list_of(data_of(body).get("songs") or body.get("data")), normalize_song, limit)
@@ -961,7 +1180,9 @@ class KugouClient:
     async def qr_key(self) -> str:
         body = await self.request("/login/qr/key", self._ts({}))
         data = data_of(body)
-        key = data.get("qr_key") or data.get("key") or ""
+        # 现版 KuGouMusicApi 的 key 在 data.qrcode（响应里还直接带 qrcode_img 二维码图），
+        # 旧版字段 qr_key / key 保留兜底，兼容未升级的自建服务
+        key = data.get("qrcode") or data.get("qr_key") or data.get("key") or ""
         if not key:
             raise ApiError("获取二维码 Key 失败", source="kg")
         return str(key)
@@ -986,7 +1207,7 @@ class KugouClient:
             "uid": "",
             "nickname": "",
             "msg": {0: "二维码已过期", 1: "等待扫码", 2: "已扫码，请在手机上确认", 4: "登录成功"}.get(
-                status, f"状态 {status}"
+                status, "未知状态" if status is None else f"状态 {status}"
             ),
         }
         if status == 4:
@@ -1003,4 +1224,13 @@ class KugouClient:
         return out
 
 
-register("kg", lambda config, kg_device_path=None, **kw: KugouClient(config, kg_device_path))
+def _create(config, kg_device_path=None, **kw):
+    # device_path 是必传 kwarg（service 恒传）：漏传时 load_device 的显式拒绝会被
+    # except (OSError, ValueError) 吞成空串、注册照发，成功后 _persist_device 对
+    # None 抛 AttributeError——入口显式拒绝，报错可读（对齐 qq._create）
+    if not kg_device_path:
+        raise NotEnabledError("酷狗音源缺少设备 cookie 路径（kg_device_path）", source="kg")
+    return KugouClient(config, kg_device_path)
+
+
+register("kg", _create)

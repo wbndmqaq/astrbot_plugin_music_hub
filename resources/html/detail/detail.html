@@ -44,7 +44,7 @@
 <div class="page">
   <div class="hero">
     <div class="cover-wrap">
-      {% if data.cover %}<img class="cover" src="{{ data.cover }}" referrerpolicy="no-referrer" />
+      {% if data.cover %}<img class="cover" src="{{ data.cover }}" referrerpolicy="no-referrer" onerror="var d=document.createElement('div');d.className='cover-ph';d.textContent='♪';this.replaceWith(d)" />
       {% else %}<div class="cover-ph">♪</div>{% endif %}
     </div>
     <div class="src-line"><span class="dot"></span>{{ data.sourceName }}{% if data.sourceLabel %} · {{ data.sourceLabel }}{% endif %}</div>

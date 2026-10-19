@@ -123,14 +123,35 @@ class Stats:
         self.daily: dict[str, dict] = {}  # day -> {source: {action: count}}
         self.totals: dict[str, dict] = {}  # source -> {action: count}
         self.recent: list[dict] = []  # 最近调用流水
+        # record() 跨天检测的参考点：空串让首条记录触发一次 _prune（等效启动清理）
+        self._last_day = ""
 
     # ──────────── 持久化 ────────────
+    @staticmethod
+    def _clean_per(per: dict) -> dict:
+        # 计数值必须是数字：手改 JSON 把值写成 str/None 时，record() 的 +1 与
+        # _sum 的 sum() 抛 TypeError——前者经 queue._player 的通用 except 误报
+        # 「点歌台异常暂停」，后者让 stats 接口 500（docstring 承诺「统计失败
+        # 只丢数据不影响主流程」，值级校验是 node 级校验的另一半）
+        return {k: v for k, v in per.items() if isinstance(v, (int, float)) and not isinstance(v, bool)}
+
     def _load(self) -> None:
         try:
             data = json.loads(self._path.read_text("utf-8"))
             if isinstance(data, dict):
-                self.daily = data.get("daily", {}) if isinstance(data.get("daily"), dict) else {}
-                self.totals = data.get("totals", {}) if isinstance(data.get("totals"), dict) else {}
+                # 逐日/逐源值必须是 dict：手改 JSON 写成 list/str 时，
+                # record() 的 setdefault 链会 AttributeError（且发生在 call() 的
+                # except 块里时会顶替真实异常）
+                raw_daily = data.get("daily") if isinstance(data.get("daily"), dict) else {}
+                self.daily = {
+                    day: {s: self._clean_per(per) for s, per in node.items() if isinstance(per, dict)}
+                    for day, node in raw_daily.items()
+                    if isinstance(node, dict)
+                }
+                raw_totals = data.get("totals") if isinstance(data.get("totals"), dict) else {}
+                self.totals = {
+                    s: self._clean_per(per) for s, per in raw_totals.items() if isinstance(per, dict)
+                }
                 recent = data.get("recent")
                 self.recent = (
                     [r for r in recent if isinstance(r, dict)][-MAX_RECENT:]
@@ -140,6 +161,16 @@ class Stats:
         except (OSError, ValueError):
             pass
         self._prune()
+
+    def _sweep_tmp(self) -> None:
+        # 写盘中途失败（磁盘满/权限）残留的孤儿 tmp：replace 没落下去的半截文件，
+        # 启动时清一次（此时无并发写盘者）。glob 必须与 _write_payload 的实际命名
+        # 同口径（stem.*.tmp）——with_suffix 会替换掉 .json，产物是 stats.<hex>.tmp
+        try:
+            for p in self._path.parent.glob(f"{self._path.stem}.*.tmp"):
+                p.unlink(missing_ok=True)
+        except OSError:
+            pass
 
     def _prune(self) -> None:
         cutoff = (datetime.now() - timedelta(days=self._retention)).strftime("%Y-%m-%d")
@@ -152,6 +183,7 @@ class Stats:
 
     async def start(self) -> None:
         await asyncio.to_thread(self._load)  # 恢复历史统计（文件读不占事件循环）
+        await asyncio.to_thread(self._sweep_tmp)
         self._flush_task = asyncio.create_task(self._flush_loop())
 
     async def _flush_loop(self) -> None:
@@ -188,8 +220,10 @@ class Stats:
 
     def _write_payload(self, payload: dict) -> None:
         # tmp 名带随机后缀（同 session.py 的做法）：固定名会被并发的孤儿写盘
-        # 互踩——线程池里上一轮还没 replace，下一轮已经覆盖写同一个 tmp
-        tmp = self._path.with_suffix(f".{os.urandom(4).hex()}.tmp")
+        # 互踩——线程池里上一轮还没 replace，下一轮已经覆盖写同一个 tmp。
+        # 用 with_name 拼接保留 .json 段（with_suffix 会把它替换掉，_sweep_tmp
+        # 的 glob 就永远匹配不上了），产物形如 stats.json.<hex>.tmp
+        tmp = self._path.with_name(f"{self._path.name}.{os.urandom(4).hex()}.tmp")
         tmp.write_text(json.dumps(payload, ensure_ascii=False), "utf-8")
         tmp.replace(self._path)
 
@@ -197,9 +231,17 @@ class Stats:
         if self._flush_task:
             self._flush_task.cancel()
             try:
-                await self._flush_task
+                await asyncio.shield(self._flush_task)
             except asyncio.CancelledError:
-                pass
+                # 两种取消源在此汇合（同 scheduler.stop 的口径）：flush_task 吸收
+                # 自己的 cancel 是常规收尾路径，吞掉后照常 flush 落盘；外层取消
+                # （terminate 被撤）由 terminate._safe 的 shield 层记账上抛，
+                # 这里不打断——统计落盘优先于取消协议
+                if not self._flush_task.done():
+                    try:
+                        await self._flush_task
+                    except asyncio.CancelledError:
+                        pass
             self._flush_task = None
         await self.flush()
 
@@ -211,10 +253,20 @@ class Stats:
         :meth:`flush` 会在锁内深拷贝快照后再交线程池写盘，故与本方法的并发是安全的。
         """
         if not self.enabled or source not in SOURCES:
+            # 未知音源的记账静默丢弃会让「WebUI 播放量与实际投递量对不上」无从
+            # 排查（remote_play 用 song.get("source","") 时上游行残缺即触发）——
+            # debug 留痕不刷屏
+            if self.enabled and source:
+                logger.debug(f"{_TAG} 忽略未知音源的统计记录: {source!r} ({action})")
             return
         if action not in ACTIONS:
             action = "other"
         day = _day_key()
+        # 跨天触发一次过期清理：_prune 原本只在启动 _load 时跑，长驻进程的
+        # retentionDays 语义退化成「重启后只保留 N 天」，daily 按天单调增长
+        if day != self._last_day:
+            self._last_day = day
+            self._prune()
         day_node = self.daily.setdefault(day, {})
         src_node = day_node.setdefault(source, {})
         src_node[action] = src_node.get(action, 0) + 1

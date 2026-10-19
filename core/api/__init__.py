@@ -14,7 +14,7 @@ from . import kg as _kg  # noqa: F401,E402
 from . import ncm as _ncm  # noqa: F401,E402
 from . import qq as _qq  # noqa: F401,E402
 from .base import SourceClient, missing_methods
-from .http import close_session, get_session
+from .http import close_session, get_session, reset_http, set_api_timeout_provider
 from .kg import KugouClient  # noqa: E402
 from .ncm import NeteaseClient  # noqa: E402
 from .qq import QQClient  # noqa: E402
@@ -31,6 +31,8 @@ __all__ = [
     "qq_available",
     "get_session",
     "close_session",
+    "reset_http",
+    "set_api_timeout_provider",
     "create",
     "register",
     "registered",

@@ -22,8 +22,10 @@
     background:rgba(255,255,255,.18)}
   .lyric-box{background:linear-gradient(180deg,var(--mh-card-a),var(--mh-card-b));padding:20px 28px 24px}
   .lyric{max-height:1120px;overflow:hidden;position:relative}
+  /* 歌词正文软换行：产物是图片、无法展开，nowrap+ellipsis 会把超长行（外文/长句）
+  以「…」截断丢内容——这是唯一把正文截断而非换行的模板 */
   .lyric p{font-size:16.5px;line-height:2.15;color:var(--mh-text);font-weight:500;
-    white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+    white-space:pre-wrap;word-break:break-word;overflow-wrap:anywhere}
   .lyric p.em{color:var(--mh-nm);font-weight:800}
   .lyric p.trans{color:var(--mh-muted);font-size:14px;font-weight:500}
   .lyric p.sec{color:var(--mh-nm);font-weight:800;letter-spacing:2px;font-size:14px;margin-top:8px}
@@ -36,19 +38,22 @@
 <div class="page">
   <div class="hero">
     <div class="hero-row">
-      {% if data.cover %}<img class="cover" src="{{ data.cover }}" referrerpolicy="no-referrer" />
+      {% if data.cover %}
+      {# onerror 兜底与 comment/detail/generic/list 同口径：裂图不进截图 #}
+      <img class="cover" src="{{ data.cover }}" referrerpolicy="no-referrer" onerror="var d=document.createElement('div');d.className='cover-ph';d.textContent='♪';this.replaceWith(d)" />
       {% else %}<div class="cover-ph">♪</div>{% endif %}
       <div class="meta">
         <div class="src-tag">{{ data.sourceName }} · LYRIC</div>
         <div class="title">{{ data.songName }}</div>
         <div class="artist">{{ data.singerName }}{% if data.albumName %} · {{ data.albumName }}{% endif %}</div>
       </div>
-      <div class="pill">{{ data.lineCount }} 行{% if data.pageTotal > 1 %} · {{ data.page }}/{{ data.pageTotal }}{% endif %}</div>
+      {# 先判存在再比较：ChainableUndefined 参与比较运算会抛 UndefinedError 整卡崩溃 #}
+      <div class="pill">{{ data.lineCount }} 行{% if data.pageTotal and data.pageTotal > 1 %} · {{ data.page }}/{{ data.pageTotal }}{% endif %}</div>
     </div>
   </div>
   <div class="lyric-box">
     <div class="lyric">
-      {% for line in data.lines %}
+      {% for line in data.lines or [] %}
       <p class="{% if line.startswith('──') %}sec{% endif %}">{{ line }}</p>
       {% endfor %}
     </div>

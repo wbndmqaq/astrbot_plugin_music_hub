@@ -25,28 +25,64 @@
     var d = new Date(ts * 1000);
     return ("0" + d.getHours()).slice(-2) + ":" + ("0" + d.getMinutes()).slice(-2) + ":" + ("0" + d.getSeconds()).slice(-2);
   }
+  // 最近调用流水用：非今天的条目带 MM-DD 前缀，跨天记录不再无法区分
+  function fmtFeedTime(ts) {
+    if (!ts) return "--";
+    var d = new Date(ts * 1000);
+    var now = new Date();
+    if (d.getFullYear() === now.getFullYear() && d.getMonth() === now.getMonth() && d.getDate() === now.getDate()) {
+      return fmtTime(ts);
+    }
+    return ("0" + (d.getMonth() + 1)).slice(-2) + "-" + ("0" + d.getDate()).slice(-2) + " " + fmtTime(ts);
+  }
   function fmtDateTime(ts) {
     if (!ts) return "--";
     var d = new Date(ts * 1000);
     return d.getFullYear() + "-" + ("0" + (d.getMonth() + 1)).slice(-2) + "-" + ("0" + d.getDate()).slice(-2) + " " + fmtTime(ts);
   }
-  // 一次性快照的问题：用户在系统里改「减少动态效果」后本页面不再降级。
-  // 改为实时值 + change 监听。
+  // 减少动态效果实时降级：CSS 由 @media (prefers-reduced-motion) 直接生效，
+  // JS 只需提供实时查询（motionReduced 供动画代码判断），不设类切换
+  // （.reduced-motion 选择器不存在，切换是空操作）
   var reduceQuery = window.matchMedia ? matchMedia("(prefers-reduced-motion: reduce)") : null;
   function motionReduced() { return !!(reduceQuery && reduceQuery.matches); }
-  if (reduceQuery && reduceQuery.addEventListener) {
-    reduceQuery.addEventListener("change", function () {
-      document.documentElement.classList.toggle("reduced-motion", motionReduced());
-    });
-  }
   var ACT_NAMES = { search: "搜索", play: "点歌", url: "取流", lyric: "歌词", detail: "详情", comment: "评论", mv: "MV", rank: "排行榜", playlist: "歌单", explore: "浏览", login: "登录", resolve: "解析", other: "其他" };
   var SRC_NAMES = { ncm: "网易云", kg: "酷狗", qq: "QQ音乐" };
 
   /* ─────────── Toast ─────────── */
+  function srcLogoImg(source, cls) {
+    // 平台 logo 统一经白名单映射再拼静态路径（与 srcTagHtml 同一口径）：
+    // esc() 不拦 "/"，异常 source 直接拼进 URL 会构成同源路径遍历 URL（仅 404，
+    // 且有全局 img error 兜底，但口径必须统一）
+    if (!SRC_NAMES[source]) return "";
+    return '<img class="' + (cls || "") + '" src="/webui/logos/' + esc(source) + '.png" alt="" />';
+  }
   function srcTagHtml(source, cls) {
-    return '<span class="' + cls + " " + esc(source) + '">' +
+    // 平台名经白名单映射后再拼静态资源路径：esc() 不拦 "/"，异常 source 直接拼
+    // 进 URL 会构成（同源静态文件内的）路径遍历；映射不中的回退内联音符占位
+    var known = SRC_NAMES[source];
+    if (!known) {
+      // 未知音源不把原始名拼进 class（会产出任意 class token，可能撞上既有类名）：
+      // 统一固定占位类 src-other，原名只进文本（esc 转义）
+      return '<span class="' + cls + ' src-other">♪ ' + esc(source) + "</span>";
+    }
+    return (
+      '<span class="' + cls + " " + esc(source) + '">' +
       '<img src="/webui/logos/' + esc(source) + '.png" alt="" />' +
-      esc(SRC_NAMES[source] || source) + "</span>";
+      esc(known) + "</span>"
+    );
+  }
+
+  // 音源名 → class token 的白名单映射（vchip/src-dot 等直接拼 class 的位点统一
+  // 走这里）：未知音源回退固定类 src-other，原始名不进 class（防任意 class token）
+  function srcClass(source) {
+    return SRC_NAMES[source] ? esc(source) : "src-other";
+  }
+
+  // 服务端来源键的颜色查表走 own-property 白名单口径（与 srcClass 一致）：
+  // 裸 table[key] 命中原型链（"constructor"/"hasOwnProperty"）会取到函数，
+  // String(fn) 被拼进 style 属性——不构成逃逸但样式尽毁
+  function srcVar(table, key, fallback) {
+    return Object.prototype.hasOwnProperty.call(table, key) ? table[key] : fallback;
   }
 
   var TOAST_MAX = 4;
@@ -60,7 +96,13 @@
     // live region，同一条消息被读屏播报两次
     box.appendChild(el);
     // 「检测连通性」一次发 3 条，不封顶会把屏幕塞满
-    while (box.childElementCount > TOAST_MAX) box.removeChild(box.firstElementChild);
+    while (box.childElementCount > TOAST_MAX) {
+      // 被挤出容器的条目先清定时器：游离节点上的 _t1/_t2 触发是无害空转，但没必要留
+      var dropped = box.firstElementChild;
+      clearTimeout(dropped._t1);
+      clearTimeout(dropped._t2);
+      box.removeChild(dropped);
+    }
     el._t1 = setTimeout(function () { el.classList.add("toast-hide"); }, 2600);
     el._t2 = setTimeout(function () { el.remove(); }, 3000);
   }
@@ -76,26 +118,79 @@
 
   /* ─────────── API ─────────── */
   var authGen = 0;
-  var DEFAULT_TIMEOUT = 15000;
+  var DEFAULT_TIMEOUT = 15000;   // 单请求超时，慢接口在调用处覆盖
+  // 分散在各处的轮询间隔集中声明：调整节奏时改这里即可，不必多点同步
+  var SEARCH_TIMEOUT_MS = 25000; // 搜索是三平台并行扇出 + 去重，比普通请求慢
+  var QR_POLL_MS = 1500;         // 扫码状态轮询
+  var LOG_POLL_MS = 2500;        // 运行日志轮询
+  var OVERVIEW_POLL_MS = 10000;  // 总览静默轮询
   function withTimeout(opt, ms) {
     // 裸 fetch 没有超时：上游挂住时按钮永远停在 pending
     var ctrl = new AbortController();
     var timer = setTimeout(function () { ctrl.abort(); }, ms || DEFAULT_TIMEOUT);
     var outer = opt.signal;
+    var onOuterAbort = function () { ctrl.abort(); };
     if (outer) {
       if (outer.aborted) ctrl.abort();
-      else outer.addEventListener("abort", function () { ctrl.abort(); });
+      else outer.addEventListener("abort", onOuterAbort);
     }
     opt.signal = ctrl.signal;
-    return { opt: opt, done: function () { clearTimeout(timer); } };
+    return {
+      opt: opt,
+      done: function () {
+        clearTimeout(timer);
+        // 外层 signal 的 abort 监听必须随 settle 移除：请求结束后 outer 再 abort
+        // 时监听器只会白触发一次，还会把本请求的 ctrl 长期滞留在 outer 上
+        if (outer) outer.removeEventListener("abort", onOuterAbort);
+      }
+    };
   }
   async function api(url, opt, timeout) {
     opt = opt || {};
     var gen = authGen;
     var t = withTimeout(opt, timeout);
-    var r;
     try {
-      r = await fetch(url, t.opt);
+      var r = await fetch(url, t.opt);
+      // 超时覆盖必须延伸到 body 读取：服务端 body 中途停顿时 r.json()/r.text()
+      // 会永久挂起（骨架屏长亮）；abort 后读到 AbortError，统一走下方 catch。
+      // body 解析失败单独兜住：非 JSON 的 2xx（如反代错误页）按无 body 处理，
+      // 而不是把 SyntaxError 裸抛给各 loader
+      var data = null;
+      try {
+        var ct = r.headers.get("content-type") || "";
+        data = ct.includes("json") ? await r.json() : await r.text();
+      } catch (be) {
+        if (be && be.name === "AbortError") throw be;
+        data = null;
+      }
+      if (!r.ok) {
+        var b = {};
+        try { b = typeof data === "string" ? JSON.parse(data) : (data || {}); } catch (e) {}
+        if (r.status === 401 && gen === authGen && !(opt && opt.skip401)) enterLoggedOut();
+        var err2 = new Error(b.error || ("HTTP " + r.status));
+        err2.status = r.status;
+        throw err2;
+      }
+      // 2xx 协议归一：body 解析出标量（string/number）一律视为协议错误。
+      // 所有 /api/* 都应返回 JSON 对象（core/webui/_util.py json_response），
+      // 2xx 拿到 string 只可能是反代/网关注入的错误页；原样返回会让各 loader
+      // 把 string 当空数据降级出假空态（如 loadSessions 显示「暂无会话」）。
+      // 按协议错误抛出，走与 HTTP 错误相同的 catch 链（2xx 必非 401，
+      // skip401 语义不受影响）
+      if (data !== null && typeof data !== "object") {
+        var err3 = new Error("响应格式异常");
+        err3.status = r.status;
+        throw err3;
+      }
+      if (data === null) {
+        // 2xx + JSON 解析失败（Content-Type 声明 json 但体为空/截断）：返回 null
+        // 会让 loadScopes/saveConfig/openQR/doResolve 等调用点抛 TypeError 把
+        // V8 原文当错误信息弹给用户——统一按协议错误走 HTTP 错误相同的 catch 链
+        var err4 = new Error("响应格式异常（空响应体）");
+        err4.status = r.status;
+        throw err4;
+      }
+      return data;
     } catch (e) {
       if (e && e.name === "AbortError") {
         var err = new Error("请求超时或已取消");
@@ -106,29 +201,36 @@
     } finally {
       t.done();
     }
-    if (!r.ok) {
-      var b = {};
-      try { b = await r.json(); } catch (e) {}
-      if (r.status === 401 && gen === authGen) enterLoggedOut();
-      var err2 = new Error(b.error || ("HTTP " + r.status));
-      err2.status = r.status;
-      throw err2;
-    }
-    var ct = r.headers.get("content-type") || "";
-    return ct.includes("json") ? r.json() : r.text();
   }
   function jget(u, opt, timeout) { return api(u, opt, timeout); }
-  async function jpost(u, body) {
-    return api(u, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body || {}) });
+  async function jpost(u, body, opt) {
+    var o = opt || {};
+    o.method = "POST";
+    o.headers = o.headers || { "Content-Type": "application/json" };
+    o.body = JSON.stringify(body || {});
+    return api(u, o);
   }
 
   /* ─────────── 主题 ─────────── */
+  // 与 index.html 两枚 meta theme-color、style.css 的 --bg（light/dark 两处）
+  // 三方保持一致：meta 标签吃不到 CSS 变量，重复不可避免——改配色时三处同步
+  // （手动切换主题后移动端地址栏跟着变，meta 的 prefers-color-scheme 只跟随系统）
+  var THEME_META_COLORS = { light: "#fff0f6", dark: "#171129" };
+  function syncThemeMeta() {
+    var mode = document.documentElement.dataset.theme || "light";
+    var metas = document.querySelectorAll('meta[name="theme-color"]');
+    for (var i = 0; i < metas.length; i++) {
+      metas[i].setAttribute("media", "");
+      metas[i].setAttribute("content", THEME_META_COLORS[mode] || THEME_META_COLORS.light);
+    }
+  }
   function applyTheme(mode) {
     var dark = window.matchMedia("(prefers-color-scheme: dark)").matches;
     var d = document.documentElement;
     d.dataset.themeMode = mode;
     d.dataset.theme = mode === "auto" ? (dark ? "dark" : "light") : mode;
     try { localStorage.setItem("mh-theme", mode); } catch (e) {}
+    syncThemeMeta();
   }
   function cycleTheme() {
     var cur = document.documentElement.dataset.themeMode || "auto";
@@ -137,9 +239,14 @@
     toast("主题：" + (next === "auto" ? "跟随系统" : next === "dark" ? "夜间紫" : "樱花粉"), "ok");
   }
   if (window.matchMedia) {
-    matchMedia("(prefers-color-scheme: dark)").addEventListener("change", function () {
+    // 与下方 reduceQuery 同一守卫口径：旧 Safari 的 MediaQueryList 没有
+    // addEventListener（只有 addListener），IIFE 顶层抛错会挂掉整个应用
+    var darkQuery = matchMedia("(prefers-color-scheme: dark)");
+    var onSchemeChange = function () {
       if (document.documentElement.dataset.themeMode === "auto") applyTheme("auto");
-    });
+    };
+    if (darkQuery.addEventListener) darkQuery.addEventListener("change", onSchemeChange);
+    else if (darkQuery.addListener) darkQuery.addListener(onSchemeChange);
   }
 
   /* ─────────── 花瓣 ─────────── */
@@ -188,7 +295,11 @@
   /* ─────────── countUp ─────────── */
   function countUp(el, target) {
     target = num(target);
-    if (motionReduced()) { el.textContent = fmtCount(target); return; }
+    // 可访问名称直接给终值：动画中间帧不被读屏当现值播报
+    el.setAttribute("aria-label", String(target));
+    // 后台页签的 rAF 不触发（浏览器节流），动画会永远停在首帧「0」直到下一次
+    // 轮询 patchNumbers 才纠正——隐藏时直接写终值
+    if (motionReduced() || document.hidden) { el.textContent = fmtCount(target); return; }
     var start = null, dur = 900;
     function step(ts) {
       if (!start) start = ts;
@@ -199,6 +310,324 @@
     }
     requestAnimationFrame(step);
   }
+
+  /* ─────────── 自定义下拉框（替代原生 <select> 弹层） ───────────
+     原生 select 的展开列表由浏览器绘制：套不进面板主题、做不了动画。
+     原 <select> 留在 DOM（display:none）只作 value 载体，展示与交互全部由
+     手写 widget 承接；选值后同步回 select 并派发 change，业务代码零改动。 */
+  var CSEL_SEQ = 0;
+  var CSEL_OPEN = null;  // 全局同时只允许一个展开中的下拉
+
+  function cselClose(w) {
+    if (!w || !w.isOpen) return;
+    w.isOpen = false;
+    if (CSEL_OPEN === w) CSEL_OPEN = null;
+    w.root.classList.remove("open");
+    w.btn.setAttribute("aria-expanded", "false");
+    w.btn.removeAttribute("aria-activedescendant");
+    var pop = w.pop;
+    var finish = function () {
+      pop.hidden = true;
+      pop.classList.remove("closing");
+      pop.removeEventListener("animationend", finish);
+      clearTimeout(w._closeTimer);
+      w._closeFinish = null;
+    };
+    if (motionReduced()) { finish(); return; }
+    pop.classList.add("closing");
+    pop.addEventListener("animationend", finish);
+    w._closeFinish = finish;
+    w._closeTimer = setTimeout(finish, 240);  // animationend 兜底：动画被中断时也能收起
+  }
+
+  // 收起动画进行中重新展开：必须撤销挂起的 finish，否则它会在新动画结束时
+  // 把弹层再藏掉（closing 类的 forwards 填充也会把弹层停在透明态）
+  function cselCancelClose(w) {
+    if (!w._closeFinish) return;
+    w.pop.removeEventListener("animationend", w._closeFinish);
+    clearTimeout(w._closeTimer);
+    w.pop.classList.remove("closing");
+    w._closeFinish = null;
+  }
+
+  function cselRenderOptions(w) {
+    var sel = w.sel;
+    var opts = [];
+    for (var i = 0; i < sel.options.length; i++) {
+      opts.push({ value: sel.options[i].value, text: sel.options[i].textContent });
+    }
+    w.opts = opts;
+    var cur = sel.value;
+    var html = "";
+    for (var j = 0; j < opts.length; j++) {
+      var on = opts[j].value === cur;
+      html += '<div class="csel-opt' + (on ? " sel" : "") + '" role="option" data-i="' + j +
+        '" id="' + w.optIdPrefix + j + '" aria-selected="' + (on ? "true" : "false") + '">' +
+        esc(opts[j].text) + "</div>";
+    }
+    w.pop.innerHTML = html;
+    var label = "";
+    for (var k = 0; k < opts.length; k++) {
+      if (opts[k].value === cur) { label = opts[k].text; break; }
+    }
+    w.labelEl.textContent = label;
+  }
+
+  function cselSetActive(w, idx) {
+    if (!w.opts.length) return;
+    w.active = Math.max(0, Math.min(w.opts.length - 1, idx));
+    var nodes = w.pop.children;
+    for (var i = 0; i < nodes.length; i++) nodes[i].classList.toggle("active", i === w.active);
+    w.btn.setAttribute("aria-activedescendant", w.optIdPrefix + w.active);
+    // 手动滚动替代 scrollIntoView：弹层是 fixed 定位，scrollIntoView 会连带滚动页面
+    var node = nodes[w.active];
+    if (!node) return;
+    var top = node.offsetTop, bottom = top + node.offsetHeight;
+    if (top < w.pop.scrollTop) w.pop.scrollTop = top;
+    else if (bottom > w.pop.scrollTop + w.pop.clientHeight) w.pop.scrollTop = bottom - w.pop.clientHeight;
+  }
+
+  // 弹层 portal 到 body 后用 fixed 定位：配置分组为折叠动画设了 overflow:hidden，
+  // 绝对定位的弹层会被裁掉；同时按视口剩余空间动态决定上/下展开与列表高度
+  function cselPosition(w) {
+    var r = w.btn.getBoundingClientRect();
+    var below = window.innerHeight - r.bottom - 12;
+    var above = r.top - 12;
+    var up = below < 236 && above > below;  // 236 ≈ 弹层常规高度，余量留给边距
+    var h = Math.max(96, Math.min(264, (up ? above : below) - 16));
+    w.pop.style.left = r.left + "px";
+    w.pop.style.width = r.width + "px";
+    w.pop.style.maxHeight = h + "px";
+    if (up) {
+      w.pop.style.top = "auto";
+      w.pop.style.bottom = window.innerHeight - r.top + 8 + "px";
+    } else {
+      w.pop.style.bottom = "auto";
+      w.pop.style.top = r.bottom + 8 + "px";
+    }
+    w.pop.classList.toggle("up", up);
+  }
+
+  function cselOpen(w) {
+    if (w.isOpen || !w.opts.length) return;
+    cselClose(CSEL_OPEN);
+    cselCancelClose(w);
+    w.isOpen = true;
+    CSEL_OPEN = w;
+    w.pop.hidden = false;
+    cselPosition(w);
+    w.root.classList.add("open");
+    w.btn.setAttribute("aria-expanded", "true");
+    var selIdx = 0;
+    for (var i = 0; i < w.opts.length; i++) {
+      if (w.opts[i].value === w.sel.value) { selIdx = i; break; }
+    }
+    cselSetActive(w, selIdx);
+  }
+
+  function cselPick(w, idx) {
+    var o = w.opts[idx];
+    if (!o) return;
+    if (w.sel.value !== o.value) {
+      w.sel.value = o.value;
+      try { w.sel.dispatchEvent(new Event("change", { bubbles: true })); } catch (err) { /* 老浏览器忽略 */ }
+    }
+    cselRenderOptions(w);
+    cselClose(w);
+    w.btn.focus();
+  }
+
+  // 原生 select 的首字快速定位：连续输入 500ms 内的字符拼成前缀循环匹配
+  function cselTypeAhead(w, ch) {
+    var now = Date.now();
+    w.typeBuf = (now - (w.typeAt || 0) < 500 ? w.typeBuf : "") + ch.toLowerCase();
+    w.typeAt = now;
+    clearTimeout(w.typeTimer);
+    w.typeTimer = setTimeout(function () { w.typeBuf = ""; }, 500);
+    for (var i = 0; i < w.opts.length; i++) {
+      var idx = ((w.active < 0 ? -1 : w.active) + 1 + i) % w.opts.length;
+      if ((w.opts[idx].text || "").toLowerCase().indexOf(w.typeBuf) === 0) { cselSetActive(w, idx); return; }
+    }
+  }
+
+  function cselLabelFor(sel) {
+    var lbl = sel.id ? document.querySelector('label[for="' + sel.id + '"]') : null;
+    return lbl ? lbl.textContent.trim() : "";
+  }
+
+  function enhanceSelect(sel) {
+    if (!sel || sel.dataset.cselSrc) return;
+    sel.dataset.cselSrc = "1";
+    var n = ++CSEL_SEQ;
+    var root = document.createElement("div");
+    root.className = "csel";
+    if (sel.classList.contains("sel-narrow")) root.classList.add("sel-narrow");
+    var btn = document.createElement("button");
+    btn.type = "button";
+    btn.className = "csel-btn input";
+    var lbl = cselLabelFor(sel);
+    if (lbl) btn.setAttribute("aria-label", lbl);
+    btn.setAttribute("role", "combobox");
+    btn.setAttribute("aria-expanded", "false");
+    btn.setAttribute("aria-haspopup", "listbox");
+    btn.setAttribute("aria-autocomplete", "list");
+    btn.innerHTML = '<span class="csel-label"></span>' +
+      '<svg class="csel-arrow" viewBox="0 0 12 7" width="12" height="7" aria-hidden="true">' +
+      '<path d="M1 1l5 5 5-5" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>';
+    var pop = document.createElement("div");
+    pop.className = "csel-pop";
+    pop.id = "csel-pop-" + n;
+    pop.setAttribute("role", "listbox");
+    pop.hidden = true;
+    btn.setAttribute("aria-controls", pop.id);
+    root.appendChild(btn);
+    // 弹层挂到 body（fixed 定位）：避免被折叠组/卡片等 overflow:hidden 祖先裁剪
+    document.body.appendChild(pop);
+    pop._cselOwner = sel;  // 面板重渲染后按属主是否断连清孤儿弹层（见 cselSweep）
+    sel.insertAdjacentElement("afterend", root);
+    sel.tabIndex = -1;
+
+    var w = {
+      sel: sel, root: root, btn: btn, pop: pop,
+      labelEl: btn.querySelector(".csel-label"),
+      optIdPrefix: "csel-opt-" + n + "-",
+      opts: [], active: -1, isOpen: false, typeBuf: "", typeAt: 0, typeTimer: null
+    };
+    cselRenderOptions(w);
+
+    btn.addEventListener("keydown", function (e) {
+      var k = e.key;
+      if (!w.isOpen) {
+        if (k === "ArrowDown" || k === "ArrowUp" || k === "Enter" || k === " ") {
+          e.preventDefault(); cselOpen(w);
+        } else if (k.length === 1 && !e.ctrlKey && !e.metaKey && !e.altKey) {
+          cselOpen(w); cselSetActive(w, 0); cselTypeAhead(w, k);
+        }
+        // 其余按键（含 Esc）未展开时不拦截，原样冒泡给全局处理器
+        return;
+      }
+      if (k === "ArrowDown") { e.preventDefault(); cselSetActive(w, w.active + 1); }
+      else if (k === "ArrowUp") { e.preventDefault(); cselSetActive(w, w.active - 1); }
+      else if (k === "Home") { e.preventDefault(); cselSetActive(w, 0); }
+      else if (k === "End") { e.preventDefault(); cselSetActive(w, w.opts.length - 1); }
+      else if (k === "PageDown") { e.preventDefault(); cselSetActive(w, w.active + 7); }
+      else if (k === "PageUp") { e.preventDefault(); cselSetActive(w, w.active - 7); }
+      else if (k === "Enter" || k === " ") { e.preventDefault(); cselPick(w, w.active); }
+      else if (k === "Escape") { e.preventDefault(); e.stopPropagation(); cselClose(w); }
+      else if (k === "Tab") { cselClose(w); }  // 不拦 Tab：焦点照常走，仅收起弹层
+      else if (k.length === 1 && !e.ctrlKey && !e.metaKey && !e.altKey) cselTypeAhead(w, k);
+    });
+    btn.addEventListener("click", function () { w.isOpen ? cselClose(w) : cselOpen(w); });
+    pop.addEventListener("click", function (e) {
+      var opt = e.target.closest(".csel-opt");
+      if (opt) cselPick(w, Number(opt.dataset.i));
+    });
+    pop.addEventListener("mousemove", function (e) {
+      var opt = e.target.closest(".csel-opt");
+      if (opt && Number(opt.dataset.i) !== w.active) cselSetActive(w, Number(opt.dataset.i));
+    });
+    sel._csel = w;
+  }
+
+  // 面板重渲染（innerHTML 整体重建）会销毁 .csel root，但 portal 到 body 的弹层
+  // 不会随之消失——按「属主 select 已断连」清掉孤儿弹层，否则反复进出配置页
+  // 会无界累积（弹层及其 click/mousemove 监听器都是活引用）
+  function cselSweep() {
+    $$(".csel-pop").forEach(function (pop) {
+      var owner = pop._cselOwner;
+      if (!owner || !owner.isConnected) {
+        if (CSEL_OPEN && CSEL_OPEN.pop === pop) CSEL_OPEN = null;
+        pop.remove();
+      }
+    });
+  }
+  function enhanceSelects(root) {
+    cselSweep();
+    var list = (root || document).querySelectorAll("select.input");
+    for (var i = 0; i < list.length; i++) enhanceSelect(list[i]);
+  }
+  // loadScopes 等直接改写 select innerHTML/value 的调用点之后手动同步一次
+  function syncSelect(sel) {
+    if (sel && sel._csel) { cselClose(sel._csel); cselRenderOptions(sel._csel); }
+  }
+  document.addEventListener("click", function (e) {
+    // 弹层 portal 到 body 了：点外判定必须同时认 root 和 pop
+    if (CSEL_OPEN && !CSEL_OPEN.root.contains(e.target) && !CSEL_OPEN.pop.contains(e.target)) {
+      cselClose(CSEL_OPEN);
+    }
+  });
+  window.addEventListener("resize", function () { cselClose(CSEL_OPEN); });
+  // 弹层是 fixed 定位：页面/容器滚动时实时跟随按钮，否则会视觉脱锚
+  var _cselRepositionQueued = false;
+  window.addEventListener("scroll", function () {
+    if (!CSEL_OPEN || _cselRepositionQueued) return;
+    _cselRepositionQueued = true;
+    requestAnimationFrame(function () {
+      _cselRepositionQueued = false;
+      if (CSEL_OPEN) cselPosition(CSEL_OPEN);
+    });
+  }, { capture: true, passive: true });
+
+  /* ─────────── 自定义 tooltip（替代浏览器原生 title 气泡） ───────────
+     原生 title 提示由浏览器绘制，样式不可控且延迟约 1s；改读 data-tip
+     属性，悬停 / 键盘聚焦 300ms 后浮出，滚动或移出即收。 */
+  var tipEl = null, tipTarget = null, tipTimer = null;
+  function tipShow(target) {
+    var text = target.getAttribute("data-tip");
+    if (!text) return;
+    if (!tipEl) {
+      tipEl = document.createElement("div");
+      tipEl.className = "tip";
+      tipEl.setAttribute("role", "tooltip");
+      tipEl.hidden = true;
+      document.body.appendChild(tipEl);
+    }
+    tipEl.textContent = text;
+    tipTarget = target;
+    var r = target.getBoundingClientRect();
+    tipEl.hidden = false;
+    tipEl.style.left = "0px"; tipEl.style.top = "0px";  // 先归零再测量，避免首次定位跳动
+    var tw = tipEl.offsetWidth, th = tipEl.offsetHeight;
+    var x = Math.min(Math.max(8, r.left + r.width / 2 - tw / 2), window.innerWidth - tw - 8);
+    var y = r.top - th - 8;
+    if (y < 8) y = r.bottom + 8;  // 上方放不下 → 目标下方
+    tipEl.style.left = x + "px";
+    tipEl.style.top = y + "px";
+  }
+  function tipHide() {
+    clearTimeout(tipTimer);
+    tipTimer = null;
+    tipTarget = null;
+    if (tipEl) tipEl.hidden = true;
+  }
+  document.addEventListener("mouseover", function (e) {
+    var t = e.target.closest ? e.target.closest("[data-tip]") : null;
+    if (t === tipTarget) return;
+    clearTimeout(tipTimer);
+    if (!t) { tipHide(); return; }
+    tipHide();
+    tipTimer = setTimeout(function () { tipShow(t); }, 300);
+  });
+  document.addEventListener("focusin", function (e) {
+    var t = e.target.closest ? e.target.closest("[data-tip]") : null;
+    clearTimeout(tipTimer);
+    if (!t) { tipHide(); return; }
+    tipHide();
+    tipTimer = setTimeout(function () { tipShow(t); }, 300);
+  });
+  document.addEventListener("focusout", tipHide);
+  document.addEventListener("click", tipHide);
+  document.addEventListener("scroll", tipHide, true);
+  // role=button 的 data-tip 宿主（详情单元格等）用 Enter/Space 立即出泡/收起：
+  // 按钮 role 承诺了键盘激活行为，没有 handler 就是假 affordance
+  document.addEventListener("keydown", function (e) {
+    if (e.key !== "Enter" && e.key !== " ") return;
+    var t = e.target.closest ? e.target.closest('[data-tip][role="button"]') : null;
+    if (!t) return;
+    e.preventDefault();
+    if (tipTarget === t && tipEl && !tipEl.hidden) tipHide();
+    else tipShow(t);
+  });
 
   /* ─────────── 导航 ─────────── */
   var ICONS = {
@@ -215,11 +644,28 @@
        （"♪/Σ/网/狗/Q" 属把字符当图标，且与总览的图形体系冲突） */
     music: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><circle cx="7" cy="17.5" r="2.6"/><circle cx="18" cy="15.5" r="2.6"/><path d="M9.6 17.5V7l10.9-2.4v10.9"/></svg>',
     sigma: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><path d="M17 5.5H7l5 6.5-5 6.5h10"/></svg>',
-    trend: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><path d="M4 17.5l5-5.5 3.5 3L20 7.5"/><path d="M15.5 7.5H20V12"/></svg>',
     ncm: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><circle cx="12" cy="12" r="8.5"/><path d="M12 3.5v17A8.5 8.5 0 0 0 12 3.5z" fill="currentColor" stroke="none"/></svg>',
     kg: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><path d="M4 14c3-6 13-6 16 0"/><circle cx="12" cy="15" r="2.4"/><path d="M6 8.5c1.6 1.2 2.4 1.2 4 0M14 8.5c1.6 1.2 2.4 1.2 4 0"/></svg>',
     qq: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><path d="M4 11.5c0-4 3.6-7 8-7s8 3 8 7c0 4-3.6 7.5-8 7.5-1 0-2-.2-2.8-.5L5 20l1-3.2A7 7 0 0 1 4 11.5z"/></svg>'
   };
+
+  /* 平台 logo 加载失败统一兜底：换成对应 SVG 图标。
+     error 事件不冒泡，用捕获监听——覆盖 innerHTML 注入的全部 logo 位点
+     （统计卡/流水/版本芯片/音源状态/账号卡），后端加音源或静态白名单
+     未同步时不再出现碎图；未知音源没有对应图标，直接隐藏 */
+  document.addEventListener(
+    "error",
+    function (e) {
+      var t = e.target;
+      if (!(t && t.tagName === "IMG") || t.dataset.fbDone) return;
+      var m = (t.getAttribute("src") || "").match(/\/webui\/logos\/([a-z]+)\.png/);
+      if (!m) return;
+      t.dataset.fbDone = "1";
+      if (ICONS[m[1]]) t.src = "data:image/svg+xml," + encodeURIComponent(ICONS[m[1]]);
+      else t.style.visibility = "hidden";
+    },
+    true
+  );
   var NAV_ITEMS = [
     { id: "overview", name: "总览" },
     { id: "search", name: "多音源搜索" },
@@ -290,6 +736,12 @@
     if (!sheet) return;
     sheet.hidden = false;
     renderNav();
+    // 焦点主动移入抽屉：焦点陷阱只圈住 Tab 循环，不移入的话键盘/读屏用户
+    // 感知不到抽屉已展开（焦点还停在被遮住的底栏按钮上）。
+    // 归还目标不能在此捕获：renderNav 刚重建了底栏，「更多」按钮是全新节点，
+    // closeMore 按选择器重新查询（捕获的 activeElement 只会是即将被销毁的旧节点）
+    var first = $$(FOCUSABLE, sheet)[0];
+    if (first) first.focus();
   }
   function closeMore() {
     if (!moreOpen) return;
@@ -297,15 +749,55 @@
     var sheet = $("#moreSheet");
     if (sheet) sheet.hidden = true;
     renderNav();
+    // 焦点归还底栏的「更多」按钮：renderNav 在打开与关闭时各重建一次底栏，
+    // 捕获式归还（openMore 时存 activeElement）拿到的是已被销毁的旧节点
+    var trigger = $('button[data-act="more-toggle"]');
+    if (trigger) trigger.focus();
   }
 
+  // 面板 loader 唯一事实来源：switchPanel 与 panel-retry 共用，避免两份
+  // 字面量漂移（retry 版此前漏了 search，搜索面板错误态重试成了空操作）
+  // 面板级在途请求闸：离开面板时中止该面板未完成的初载请求（响应不再渲染进
+  // 隐藏面板、也不再浪费带宽）。loaders 用 panelSignal(panel) 取 signal 传入 jget
+  var _panelCtrls = {};
+  function panelSignal(panel) {
+    var c = _panelCtrls[panel];
+    if (!c || c.signal.aborted) {
+      c = new AbortController();
+      _panelCtrls[panel] = c;
+    }
+    return c.signal;
+  }
+  function abortPanelRequests(panel) {
+    var c = _panelCtrls[panel];
+    if (c) {
+      c.abort();
+      delete _panelCtrls[panel];
+    }
+  }
+  var PANEL_LOADERS = { overview: loadOverview, search: loadSearchExtras, accounts: loadAccounts,
+    stats: loadStats, acl: loadAcl, config: loadConfig, resolve: null, sessions: loadSessions, logs: loadLogsPanel };
   function switchPanel(id) {
     curPanel = id;
     closeMore();
     if (id !== "logs") stopLogsPoll();
+    // 中止其它面板的在途初载（与上方搜索扇出中止同口径；各 loader 的 seq 守卫
+    // 仍保留——abort 只是省流量，代际判定照旧兜并发重入）
+    Object.keys(_panelCtrls).forEach(function (k) {
+      if (k !== id) abortPanelRequests(k);
+    });
     // 离开搜索面板即停止试听：否则音频在后台继续播，且按钮已随 DOM 销毁，
     // _previewBtn 指向游离节点，再点其它试听时状态判定彻底错乱
-    if (id !== "search") { stopPreview(); abortPreview(); }
+    if (id !== "search") {
+      stopPreview(); abortPreview();
+      // 在途的搜索防抖一并取消：250ms 内切走时定时器到点仍会向三平台
+      // 扇出一次无人看到的搜索并渲染进隐藏面板（浪费上游配额）
+      clearTimeout(_debounceTimer);
+      _debounceTimer = null;
+      // 已扇出的搜索请求一并中止：请求不随面板隐藏而取消，响应回来仍会
+      // 渲染进隐藏面板（与 teardownLocal 的清理同口径）
+      if (_searchCtrl) { _searchCtrl.abort(); _searchCtrl = null; }
+    }
     $$(".panel").forEach(function (p) { p.classList.toggle("on", p.id === "panel-" + id); });
     $$(".side-item,.bn-item").forEach(function (b) {
       var on = b.dataset.panel === id;
@@ -314,13 +806,18 @@
       else b.removeAttribute("aria-current");
     });
     window.scrollTo({ top: 0, behavior: motionReduced() ? "auto" : "smooth" });
-    var loaders = { overview: loadOverview, search: loadSearchExtras, accounts: loadAccounts, stats: loadStats, acl: loadAcl, config: loadConfig, resolve: null, sessions: loadSessions, logs: loadLogsPanel };
-    var fn = loaders[id];
+    var fn = PANEL_LOADERS[id];
     if (typeof fn === "function") {
-      Promise.resolve(fn()).catch(function (e) {
-        if (e && e.aborted) return;
-        toast(e.message, "error");
-      });
+      Promise.resolve(fn())
+        .then(function () {
+          // 异步渲染完成后再测一次：面板切换帧里 scrollHeight 还是旧值，
+          // 配置/日志这类大块内容渲染后进度条比例会失准
+          requestAnimationFrame(measureScroll);
+        })
+        .catch(function (e) {
+          if (e && e.aborted) return;
+          toast(e.message, "error");
+        });
     }
     // 文档高度只在 boot/resize 测过：面板渲染后 scrollHeight 可能翻倍，
     // 旧值会让进度条提前走满。下一帧重测（复用 measureScroll，避免每帧重查节点）
@@ -329,16 +826,30 @@
   function loadSearchExtras() {
     focusSearch();
     loadScopes();
+    // 首访/回到搜索页：结果区空白时给一条引导空态。残留骨架屏（搜索进行中切走、
+    // switchPanel abort 后 catch 跳过渲染）也归位成空态——否则回来永远停在 shimmer
+    var box = $("#searchResults");
+    if (box && (!box.childElementCount || box.querySelector(".skeleton"))) {
+      box.innerHTML = '<div class="empty-state">输入关键词开始搜索</div>';
+    }
   }
   var _focusTimer = null;
   function focusSearch() {
     // 200ms 延迟 + 触发时校验 curPanel：面板已切走时绝不抢焦点。
     // clearTimeout 只防快速连续触发导致定时器堆叠，无需在 switchPanel 里取消。
+    // 键盘用户正在 Tab 导航时（activeElement 不是 body）不抢焦点：
+    // 焦点突然飞进输入框会打断动线（WCAG 2.4.3 焦点顺序）
     clearTimeout(_focusTimer);
     _focusTimer = setTimeout(function () {
       _focusTimer = null;
       var el = $("#searchInput");
-      if (el && window.innerWidth > 768 && curPanel === "search") el.focus();
+      if (
+        el &&
+        window.innerWidth > 768 &&
+        curPanel === "search" &&
+        (document.activeElement === document.body || document.activeElement === null)
+      )
+        el.focus();
     }, 200);
   }
   function httpsUrl(url) {
@@ -353,14 +864,47 @@
 
   /* ─────────── 登录 ─────────── */
   var loginShown = false;
-  // 登出与 401 必须走同一条路径：停音频、停二维码/日志轮询、关弹窗一次做完
-  function enterLoggedOut() {
+  // 手动登出 / 401 共用的现场清理：停音频、停二维码/日志轮询、收悬浮层、
+  // 取消在途请求。必须收敛到一处——原先三处各自复制，已漏过确认框与防抖定时器
+  function teardownLocal() {
     stopPreview();
     abortPreview();
     closeQR();
     stopLogsPoll();
     clearInterval(overviewTimer);
+    // 悬浮层一并收掉：自定义确认框（z-index 高于登录遮罩）若开着，
+    // 会悬浮在登录页上永不关闭，_confirmResolve 悬挂泄漏
+    closeConfirm(false);
+    closeMore();
+    // 在途的搜索防抖一并取消：定时器到点会向三平台扇出一次无人看到的搜索
+    clearTimeout(_debounceTimer);
+    _debounceTimer = null;
+    clearTimeout(_focusTimer);
+    _focusTimer = null;
+    // 在途搜索/解析一并中止：登出后旧响应回来不应渲染进已登出的面板
+    if (_searchCtrl) { _searchCtrl.abort(); _searchCtrl = null; }
+    if (_resolveCtrl) { _resolveCtrl.abort(); _resolveCtrl = null; }
+  }
+  // 登出与 401 必须走同一条路径：清理现场后各面板 seq 整体自增作废——
+  // 重新登录 boot() 会重跑当前面板 loader，迟到的旧响应（含旧关键词搜索结果）不得顶掉新数据
+  function enterLoggedOut() {
+    // 单次守卫：会话过期后多个在途请求会接连吃 401，第一个已收完现场；
+    // 重复 teardown 会让 closeQR/定时器清理路径被反复驱动（曾是 cancel 无限
+    // 循环的放大器）。重新登录 hideLogin 会复位 loginShown
+    if (loginShown) return;
+    teardownLocal();
+    invalidatePanelState();
     showLogin();
+  }
+  // teardown 之后的「现场作废」段，登出与 401 两条路径共用（手动登出曾漏掉
+  // 这一半：代际未推进、配置快照未清——重登后 loadConfig 早退，展示登出前的
+  // 旧配置 DOM，编辑保存会以陈旧基线整包覆盖服务端配置）
+  function invalidatePanelState() {
+    _ovSeq++; _searchSeq++; _scopeSeq++; _acctSeq++; _stSeq++; _histSeq++;
+    _aclSeq++; _cfgSeq++; _ssSeq++; _logSeq++; _logLoadSeq++;
+    // 配置页「已加载」状态一并作废：重登后 boot() 重跑 loadConfig，保留快照
+    // 会被早退判据拦下，展示的是重登前的旧配置 DOM（编辑保存以陈旧基线覆盖）
+    _cfgForget();
   }
   function showLogin() {
     if (loginShown) return;
@@ -375,20 +919,27 @@
     $("#loginErr").hidden = true;
     $("#loginPwd").value = "";
   }
+  // Enter 键与按钮可同时触发 doLogin：请求进行中直接拒绝重入，避免并发双 POST
+  var _loginInFlight = false;
   async function doLogin() {
+    if (_loginInFlight) return;
     var btn = $("#loginBtn");
     var pwd = $("#loginPwd").value;
     if (!pwd) { shakeLogin("请输入密码"); return; }
+    _loginInFlight = true;
     btn.disabled = true;
     btn.textContent = "验证中…";
     try {
-      await jpost("/api/auth/login", { password: pwd });
+      // skip401：登录接口自身的 401 是「密码错误」业务反馈，
+      // 不该触发全局 enterLoggedOut（会多余地 closeQR/清轮询）
+      await jpost("/api/auth/login", { password: pwd }, { skip401: true });
       authGen++;
       hideLogin();
       boot();
     } catch (e) {
       shakeLogin(e.message || "密码错误");
     } finally {
+      _loginInFlight = false;
       btn.disabled = false;
       btn.textContent = "进入面板";
     }
@@ -435,8 +986,17 @@
     if (!el) return;
     busy(sel, false);
     el.removeAttribute("data-rendered");
-    el.innerHTML = '<div class="empty-state">⚠ ' + esc(msg) +
+    var inner = '<div class="empty-state">⚠ ' + esc(msg) +
       '<br><button class="btn btn-ghost btn-sm" style="margin-top:10px" data-act="panel-retry">重试</button></div>';
+    if (el.tagName === "TBODY") {
+      // tbody 的合法子元素只有 tr：直接塞 div 会被 HTML 解析器 foster-parent 到表格外
+      var table = el.closest("table");
+      var headRow = table && table.querySelector("thead tr");
+      var cols = headRow ? headRow.children.length : 1;
+      el.innerHTML = '<tr><td colspan="' + cols + '">' + inner + "</td></tr>";
+      return;
+    }
+    el.innerHTML = inner;
   }
   function setLoaded(sel) { busy(sel, false); }
   // 统计卡 markup 两处共用（总览 / 调用统计）：icon 优先用 c.src 的平台 logo，
@@ -445,9 +1005,9 @@
     return cards.map(function (c) {
       return '<div class="stat-card' + (c.tone ? " tone-" + c.tone : "") + '">' +
         '<div class="icon">' +
-        (c.src ? '<img src="/webui/logos/' + esc(c.src) + '.png" alt="" />' : ICONS[c.ico]) + "</div>" +
+        (c.src ? srcLogoImg(c.src) : ICONS[c.ico]) + "</div>" +
         '<div class="label">' + esc(c.label) + "</div>" +
-        '<div class="num" data-n="' + c.num + '">0</div>' +
+        '<div class="num" role="img" aria-label="' + num(c.num) + '" data-n="' + num(c.num) + '">0</div>' +
         '<div class="foot">' + esc(c.foot) + "</div></div>";
     }).join("");
   }
@@ -464,18 +1024,32 @@
     var seq = ++_ovSeq;
     var d;
     try {
-      d = await jget("/api/overview");
+      d = await jget("/api/overview", { signal: panelSignal("overview") });
     } catch (e) {
       if (seq !== _ovSeq || (e && e.aborted)) return;
-      // 错误必须写进容器（骨架屏与错误态互斥），否则骨架屏会一直闪
-      if (!silent) { renderError("#statGrid", e.message); renderError("#svcGrid", e.message); }
+      // 错误必须写进容器（骨架屏与错误态互斥），否则骨架屏会一直闪；
+      // 顶栏状态芯片一并复位为「状态未知」，否则初次加载失败后会永久
+      // 停留在初始文案「加载中」（中性灰点），错误态下显示假状态
+      if (!silent) {
+        renderError("#statGrid", e.message);
+        renderError("#svcGrid", e.message);
+        var mc = $("#chipMaster");
+        if (mc) {
+          mc.className = "chip";
+          mc.innerHTML = '<span class="dot"></span>状态未知';
+        }
+      }
       return;
     }
     if (seq !== _ovSeq) return;
     if (!d) { if (!silent) { renderError("#statGrid", "总览数据为空"); renderError("#svcGrid", "总览数据为空"); } return; }
     setLoaded("#statGrid");
     setLoaded("#svcGrid");
-    $("#chipVersion").innerHTML = '<span class="dot"></span>v' + esc(d.version);
+    var chip = $("#chipVersion");
+    chip.innerHTML = '<span class="dot"></span>v' + esc(d.version);
+    // init 时未登录拿到的是空版本（/api/meta 仅对已登录会话下发）会把徽章藏掉，
+    // 登录后走本路径渲染真版本号，hidden 也要一并复位，否则徽章永远不出现
+    chip.hidden = !d.version;
     var master = $("#chipMaster");
     // 加载完成前用中性灰点，绿色只表示「运行中」
     master.className = "chip " + (d.enable ? "ok" : "warn");
@@ -483,7 +1057,9 @@
     var aclChip = $("#chipAcl");
     var aclMode = d.acl && d.acl.mode;
     aclChip.className = "chip" + (aclMode === "off" ? "" : " warn");
-    aclChip.innerHTML = '<span class="dot"></span>ACL ' + (aclMode === "off" ? "关闭" : aclMode === "blacklist" ? "黑名单" : "白名单");
+    // 未知模式显式显示原值：后端加新模式时兜底分支静默显示「白名单」会造成误读
+    var aclText = aclMode === "off" ? "关闭" : aclMode === "blacklist" ? "黑名单" : aclMode === "whitelist" ? "白名单" : esc(aclMode || "关闭");
+    aclChip.innerHTML = '<span class="dot"></span>ACL ' + aclText;
 
     var first = !_ovInited;
     _ovInited = true;
@@ -523,6 +1099,8 @@
       var next = fmtCount(c.num);
       if (el.textContent !== next) el.textContent = next;
       el.dataset.n = c.num;
+      // 终值同步可访问名称：数字滚动动画的中间帧不被读屏当现值播报
+      el.setAttribute("aria-label", String(c.num));
       if (foots[i] && c.foot != null) foots[i].textContent = c.foot;
     });
   }
@@ -532,22 +1110,28 @@
     if (!sources.length) {
       grid.classList.remove("no-anim");
       grid.removeAttribute("data-rendered");
+      grid.removeAttribute("data-svc-sig");
       grid.innerHTML = '<div class="empty-state">没有可用的音源服务</div>';
       return;
     }
     // 与 statGrid 同理：音源状态每 10 秒轮询一次，不能整块重建。
     // 判据用显式标记而不是 childElementCount —— 后者与骨架屏的行数
     // （skeletonRows(3,84) 恰好也是 3）会撞车，导致骨架屏永久驻留。
-    if (grid.getAttribute("data-rendered") !== "1" || grid.childElementCount !== sources.length) {
+    // 来源签名补齐「数量不变但音源集合变化」的盲区：改配置增删平台后
+    // 若只看数量会命中原地补丁分支，卡片身份（data-src/logo/名字）停留在首渲染值
+    var svcSig = sources.map(function (s) { return s.source; }).join(",");
+    if (grid.getAttribute("data-rendered") !== "1" || grid.childElementCount !== sources.length ||
+        grid.getAttribute("data-svc-sig") !== svcSig) {
       grid.classList.remove("no-anim");
       grid.innerHTML = sources.map(function (s) {
-        var ava = '<img class="svc-logo" src="/webui/logos/' + esc(s.source) + '.png" alt="" />';
+        var ava = srcLogoImg(s.source, "svc-logo");
         return '<div class="svc" data-src="' + esc(s.source) + '">' +
           '<div class="svc-head">' + ava +
           '<span class="svc-name">' + esc(s.name) + '</span><span class="svc-tag"></span></div>' +
           '<div class="svc-meta"></div></div>';
       }).join("");
       grid.setAttribute("data-rendered", "1");
+      grid.setAttribute("data-svc-sig", svcSig);
     } else {
       grid.classList.add("no-anim");
     }
@@ -557,10 +1141,18 @@
     sources.forEach(function (s, i) {
       var card = cards[i];
       if (!card) return;
-      var tag = !s.enabled ? "未配置" : s.logged ? "已登录" : s.source === "qq" ? "匿名可用" : "匿名";
+      // 依赖缺失优先于登录态展示：配置开着但客户端自检不过（qqmusic-api-python
+      // 未装等）时，搜到的结果永远不含该源——标「已登录/匿名可用」会误导
+      var missing = !!s.enabled && s.ready === false;
+      var tag = !s.enabled ? "未配置" : missing ? "依赖缺失" : s.logged ? "已登录" : s.source === "qq" ? "匿名可用" : "匿名";
       var tagEl = card.querySelector(".svc-tag");
-      tagEl.className = "svc-tag " + (!s.enabled ? "bad" : s.logged ? "ok" : "wait");
+      tagEl.className = "svc-tag " + (!s.enabled || missing ? "bad" : s.logged ? "ok" : "wait");
       tagEl.textContent = tag;
+      // 概览的「已登录」按配置有无登录凭证判定（不实时探测）：凭证失效时与
+      // 「账号」页的实时状态会不一致——tooltip 说明口径，避免误读成矛盾
+      tagEl.title = missing
+        ? "音源已配置但客户端不可用（运行依赖缺失或初始化失败），详情见运行日志"
+        : s.logged ? "按配置中的登录凭证判定（不实时探测），实时状态见「账号」页" : "";
       card.querySelector(".svc-meta").innerHTML =
         "API：" + esc(s.apiBase) + "<br>音质：" + esc(s.quality);
     });
@@ -570,9 +1162,16 @@
     var feed = $("#recentFeed");
     if (!recent.length) {
       feed.classList.remove("no-anim");
+      feed.removeAttribute("data-feed-sig");
       feed.innerHTML = '<div class="empty-state">暂无调用记录，去群里点首歌试试</div>';
       return;
     }
+    // 内容没变就不整块重建：与 statGrid 的 patchNumbers 同一动机——
+    // 轮询 innerHTML 会清掉用户的文本选区。feed 无逐项数字可 patch，
+    // 用全量签名对比跳过无变化的重建（有变化时才换 innerHTML）
+    var sig = JSON.stringify(recent);
+    if (feed.getAttribute("data-feed-sig") === sig) return;
+    feed.setAttribute("data-feed-sig", sig);
     feed.classList.toggle("no-anim", animate === false);
     feed.innerHTML = recent.map(function (r, i) {
       // 静默更新不写 animation-delay：入场动画只应在首载播一次，
@@ -582,7 +1181,7 @@
       return '<div class="feed-item' + (r.ok ? "" : " err") + '"' + delay + ">" +
         '<span class="fi-ic ' + (r.ok ? "ok" : "bad") + '" aria-hidden="true">' + (r.ok ? "✓" : "✕") + "</span>" +
         '<span class="sr-only">' + (r.ok ? "成功：" : "失败：") + "</span>" +
-        '<span class="fi-time">' + fmtTime(r.ts) + "</span>" +
+        '<span class="fi-time">' + fmtFeedTime(r.ts) + "</span>" +
         srcTagHtml(r.source, "fi-src") +
         '<span class="fi-txt">' + esc(ACT_NAMES[r.action] || r.action) + (r.detail ? " · " + esc(r.detail) : "") + "</span></div>";
     }).join("");
@@ -612,7 +1211,7 @@
       _audio.load();
       _audio = null;
     }
-    if (_previewBtn) { _previewBtn.textContent = "▶ 试听"; _previewBtn.classList.remove("playing"); _previewBtn = null; }
+    if (_previewBtn) { _previewBtn.textContent = "▶︎ 试听"; _previewBtn.classList.remove("playing"); _previewBtn = null; }
   }
   function abortPreview() {
     if (_previewCtrl) { _previewCtrl.abort(); _previewCtrl = null; }
@@ -639,7 +1238,7 @@
         stopPreview();
         toast("浏览器拦截了自动播放，请再点一次试听", "warn");
       });
-      btn.textContent = "⏸ 播放中" + (r.label ? " · " + r.label : "");
+      btn.textContent = "⏸︎ 播放中" + (r.label ? " · " + r.label : "");
       btn.classList.add("playing");
       a.onended = stopPreview;
       a.onerror = function () {
@@ -651,7 +1250,7 @@
       if (seq === _previewSeq && !(e && e.aborted)) toast(e.message, "error");
     } finally {
       btn.disabled = false;
-      if (_previewBtn !== btn) btn.textContent = "▶ 试听";
+      if (_previewBtn !== btn) btn.textContent = "▶︎ 试听";
     }
   }
   async function deliverPlay(source, sid, btn) {
@@ -668,24 +1267,43 @@
     }
   }
   var _scopeSeq = 0;
+  // loadScopes 失败提示的去重标记：成功后复位（见 loadScopes 的 catch）
+  var _scopesFailToasted = false;
   async function loadScopes() {
     var sel = $("#remoteScope");
     if (!sel) return;
     var seq = ++_scopeSeq;
     try {
-      var d = await jget("/api/remote/scopes");
+      var d = await jget("/api/remote/scopes", { signal: panelSignal("search") });
       if (seq !== _scopeSeq) return;  // 快速切面板时丢弃过期响应
       var cur = sel.value;
       sel.innerHTML = (d.scopes || []).map(function (s) {
         return '<option value="' + esc(s.umo) + '">' + esc(s.scope) + "</option>";
       }).join("") || '<option value="">暂无会话（群里先发一次指令）</option>';
       $("#remoteBar").hidden = false;
-      if (cur) sel.value = cur;
+      // 按值遍历比对而不是拼属性选择器：umo 含引号时 querySelector 会抛
+      // SyntaxError，被外层 catch 误报成「会话列表加载失败」
+      var hasCur = false;
+      for (var oi = 0; oi < sel.options.length; oi++) {
+        if (sel.options[oi].value === cur) { hasCur = true; break; }
+      }
+      if (cur && hasCur) {
+        sel.value = cur;
+      } else if (sel.options.length && sel.selectedIndex < 0) {
+        // 之前选中的会话已消失：回落第一项，避免自定义下拉按钮渲染成空白
+        sel.selectedIndex = 0;
+      }
+      syncSelect(sel);  // 自定义下拉框重建选项与按钮文案（见 enhanceSelects）
+      _scopesFailToasted = false;
     } catch (e) {
       if (seq !== _scopeSeq || (e && e.aborted)) return;
-      // 失败也要展开投递条：保留手动刷新入口，且不能静默
+      // 失败也要展开投递条：保留手动刷新入口，且不能静默。
+      // 同一次会话内连续失败只弹一次 toast（每次切到搜索页都重试，重复弹窗是噪音）
       $("#remoteBar").hidden = false;
-      toast(e.message, "error");
+      if (!_scopesFailToasted) {
+        _scopesFailToasted = true;
+        toast(e.message, "error");
+      }
     }
   }
   async function doSearch() {
@@ -707,9 +1325,13 @@
     try {
       // 搜索比普通请求慢（三平台并行 + 去重），单独给 25s
       d = await jget("/api/search?keyword=" + encodeURIComponent(keyword) + "&type=" + encodeURIComponent(searchType),
-        { signal: ctrl.signal }, 25000);
+        { signal: ctrl.signal }, SEARCH_TIMEOUT_MS);
     } catch (e) {
-      if (seq === _searchSeq && !(e && e.aborted)) box.innerHTML = '<div class="empty-state">⚠ ' + esc(e.message) + "</div>";
+      if (seq === _searchSeq && !(e && e.aborted)) {
+        // 错误态带「重试」：与其它面板的错误范式一致，失败不再是一句死文案
+        box.innerHTML = '<div class="empty-state">⚠ ' + esc(e.message) +
+          '<div style="margin-top:12px"><button class="btn btn-ghost btn-sm" data-act="do-search">重试</button></div></div>';
+      }
       return;
     }
     if (seq !== _searchSeq) return;
@@ -718,8 +1340,30 @@
     updateFilterBar();
     renderSearchResults(true);
     var empty = searchType === "song" ? !searchGroups.length : !searchItems.length;
-    if (empty) box.innerHTML = '<div class="empty-state">没有搜到「' + esc(keyword) + '」相关的' + esc(TYPED_NAMES[searchType] || "内容") + "</div>";
-    else toast("找到 " + (searchType === "song" ? searchGroups.length : searchItems.length) + " 条结果", "ok");
+    // 读屏摘要写入独立的 live region：结果列表已移出 live 语义（整表进 live region
+    // 会让读屏整段播报几十条结果）
+    var live = $("#searchLive");
+    if (live) live.textContent = empty ? "没有搜到相关内容" : "找到 " + (searchType === "song" ? searchGroups.length : searchItems.length) + " 条结果";
+    if (empty) {
+      // 零结果时优先展示后端聚合收集的登录提示（kg 禁匿名搜索是常态），
+      // 只给一句「没有搜到」会让用户不知道该去扫码
+      var notices = (d.notices || []).filter(Boolean);
+      box.innerHTML = '<div class="empty-state">没有搜到「' + esc(keyword) + '」相关的' +
+        esc(TYPED_NAMES[searchType] || "内容") +
+        (notices.length ? "<br>" + notices.map(function (n) { return "ℹ " + esc(n); }).join("<br>") : "") +
+        "</div>";
+    } else {
+      toast("找到 " + (searchType === "song" ? searchGroups.length : searchItems.length) + " 条结果", "ok");
+      // 有结果但部分音源本次取数失败：结果顶部给一条提示，避免「只剩 QQ」
+      // 被误读成「别的源没有这首歌」
+      var partial = (d.notices || []).filter(Boolean);
+      if (partial.length) {
+        box.insertAdjacentHTML(
+          "afterbegin",
+          '<div class="src-notice">ℹ ' + partial.map(function (n) { return esc(n); }).join("<br>ℹ ") + "</div>"
+        );
+      }
+    }
   }
   // 筛选条显隐只认一处判据：歌单 tab 切回单曲且输入为空时，
   // 不能露出一个点了必然空结果的筛选条。
@@ -745,6 +1389,18 @@
       if (searchFilter === "multi") return (g.versions || []).length > 1;
       return (g.versions || []).some(function (v) { return v.source === searchFilter; });
     });
+    if (!list.length && searchFilter !== "all" && searchGroups.length) {
+      // 新搜索在激活的筛选下零命中时自动回落「全部」：保留筛选跨搜索是刻意的
+      // （连续找同音源），但「结果比预期少还停在空态」是死胡同——回落并同步
+      // 筛选条高亮，用户注意不到筛选条也不会卡住
+      searchFilter = "all";
+      $$(".sfilter").forEach(function (x) {
+        var on = x.dataset.f === "all";
+        x.classList.toggle("on", on);
+        x.setAttribute("aria-pressed", on ? "true" : "false");
+      });
+      list = searchGroups;
+    }
     if (!list.length) {
       box.innerHTML = '<div class="empty-state">该筛选条件下没有结果</div>';
       return;
@@ -752,8 +1408,10 @@
     box.innerHTML = list.map(function (g, i) {
       var vers = (g.versions || []).map(function (v) {
         // 类名不带 v- 前缀：CSS 定义的是 .vchip.ncm
-        return '<span class="vchip ' + esc(v.source) + '" title="' + esc(v.sourceName) + (v.pay ? " · VIP" : "") + '">' +
-          '<img src="/webui/logos/' + esc(v.source) + '.png" alt="' + esc(v.sourceName) + '" />' +
+        // aria-label 带上 data-tip 的完整信息（含 VIP）：tooltip 是纯视觉实现，读屏拿不到
+        return '<span class="vchip ' + srcClass(v.source) + '" tabindex="0" role="img" aria-label="' +
+          esc(v.sourceName) + (v.pay ? "（VIP 版本）" : "") + '" data-tip="' + esc(v.sourceName) + (v.pay ? " · VIP" : "") + '">' +
+          srcLogoImg(v.source) +
           (v.pay ? "<small>VIP</small>" : "") + "</span>";
       }).join("");
       var primary = (g.versions || [])[0] || {};
@@ -762,14 +1420,18 @@
         // httpsUrl 可能拒绝非 http(s) 地址返回空串：外层三元必须判净化结果，
         // 否则输出 src=""（部分浏览器会当当前页 URL 发请求）
         ((g.cover && httpsUrl(g.cover))
-          ? '<img class="result-cover" src="' + esc(httpsUrl(g.cover)) + '" referrerpolicy="no-referrer" alt="" />'
+          ? '<img class="result-cover" src="' + esc(httpsUrl(g.cover)) + '" referrerpolicy="no-referrer" loading="lazy" decoding="async" alt="" />'
           : '<div class="result-cover-ph" aria-hidden="true">♪</div>') +
         '<div class="result-main"><div class="result-name">' + esc(g.name) + "</div>" +
         '<div class="result-sub">' + esc(g.artist) + (g.album ? " · " + esc(g.album) : "") + "</div></div>" +
         '<div class="result-vers">' + vers + "</div>" +
         '<div class="row-actions">' +
-        (canPlay ? '<button class="btn btn-ghost btn-sm" data-act="preview" data-source="' + esc(primary.source) + '" data-sid="' + esc(primary.sid) + '">▶ 试听</button>' : "") +
-        '<button class="btn btn-blue btn-sm" data-act="deliver" data-source="' + esc(primary.source) + '" data-sid="' + esc(primary.sid) + '">投递</button>' +
+        // 无 sid 的歌（如酷狗 VIP 拿不到定位键）试听与投递都注定失败：
+        // 两个按钮都不渲染，给占位文案而不是必报错的按钮
+        (primary.sid
+          ? (canPlay ? '<button class="btn btn-ghost btn-sm" data-act="preview" data-source="' + esc(primary.source) + '" data-sid="' + esc(primary.sid) + '">▶︎ 试听</button>' : "") +
+            '<button class="btn btn-blue btn-sm" data-act="deliver" data-source="' + esc(primary.source) + '" data-sid="' + esc(primary.sid) + '">投递</button>'
+          : '<span class="result-sub">暂无可播放版本</span>') +
         "</div>" +
         '<div class="result-dur">' + esc(g.duration || "") + "</div></div>";
     }).join("");
@@ -781,11 +1443,11 @@
     box.innerHTML = searchItems.map(function (it, i) {
       return '<div class="result-row"' + (animate === false ? "" : ' style="animation-delay:' + Math.min(i * 45, 240) + 'ms"') + ">" +
         ((it.cover && httpsUrl(it.cover))
-          ? '<img class="result-cover" src="' + esc(httpsUrl(it.cover)) + '" referrerpolicy="no-referrer" alt="" />'
+          ? '<img class="result-cover" src="' + esc(httpsUrl(it.cover)) + '" referrerpolicy="no-referrer" loading="lazy" decoding="async" alt="" />'
           : '<div class="result-cover-ph" aria-hidden="true">♪</div>') +
         '<div class="result-main"><div class="result-name">' + esc(it.name) + "</div>" +
         '<div class="result-sub">' + esc(it.sub || "") + (it.count ? " · " + esc(it.count) + " 首" : "") + "</div></div>" +
-        '<div class="result-vers"><span class="src-dot ' + esc(it.source) + '">' + esc(it.sourceName || it.source) + "</span></div>" +
+        '<div class="result-vers"><span class="src-dot ' + srcClass(it.source) + '">' + esc(it.sourceName || it.source) + "</span></div>" +
         '<div class="result-dur"><span class="badge">' + esc(TYPED_NAMES[searchType] || searchType) + "</span></div></div>";
     }).join("") || '<div class="empty-state">没有搜到相关结果</div>';
     bindCoverFallback(box);
@@ -811,7 +1473,15 @@
       x.setAttribute("aria-pressed", on ? "true" : "false");  // 与视觉选中态保持一致
     });
     updateFilterBar();
-    if ($("#searchInput").value.trim()) doSearch();
+    if ($("#searchInput").value.trim()) {
+      doSearch();
+    } else {
+      // 空关键词切 tab：清掉旧类型的结果与筛选状态，别让「歌单」标签下挂着单曲结果
+      searchGroups = [];
+      searchItems = [];
+      searchFilter = "all";
+      $("#searchResults").innerHTML = '<div class="empty-state">输入关键词开始搜索</div>';
+    }
   });
   $("#srcFilter").addEventListener("click", function (e) {
     var b = e.target.closest(".sfilter");
@@ -822,7 +1492,16 @@
       x.classList.toggle("on", on);
       x.setAttribute("aria-pressed", on ? "true" : "false");
     });
+    // 重建列表会销毁试听按钮所在的 DOM：先停掉在播的试听，否则 _audio 继续播放
+    // 而界面上不再存在任何停止控件（与 doSearch 开头的清理同口径）
+    stopPreview();
+    abortPreview();
     renderSearchResults(false);
+    // 读屏同步筛选后的条数：搜索时的 live 播报是未筛选总数，筛选后不更新
+    // 会让读屏用户对「实际可见条数」拿着旧数
+    var visible = $$("#searchResults .result-row").length;
+    var live = $("#searchLive");
+    if (live) live.textContent = searchFilter === "all" ? "已显示全部音源，" + visible + " 条结果" : "已按音源筛选，" + visible + " 条结果";
   });
   $("#searchInput").addEventListener("keydown", function (e) {
     if (e.key === "Enter") { e.preventDefault(); doSearch(); }
@@ -831,7 +1510,15 @@
   $("#searchInput").addEventListener("input", function () {
     clearTimeout(_debounceTimer);
     var v = this.value.trim();
-    if (!v) { updateFilterBar(); return; }
+    if (!v) {
+      // 清空输入时同步清掉旧关键词的结果：结果区与输入框状态错配会误导
+      searchGroups = [];
+      searchItems = [];
+      searchFilter = "all";
+      updateFilterBar();
+      $("#searchResults").innerHTML = '<div class="empty-state">输入关键词开始搜索</div>';
+      return;
+    }
     _debounceTimer = setTimeout(function () { doSearch(); }, 250);
   });
 
@@ -842,7 +1529,7 @@
     withSkeleton("#acctGrid", skeletonRows(3, 110));
     var d;
     try {
-      d = await jget("/api/accounts");
+      d = await jget("/api/accounts", { signal: panelSignal("accounts") });
     } catch (e) {
       if (seq !== _acctSeq || (e && e.aborted)) return;
       renderError("#acctGrid", e.message);
@@ -859,8 +1546,8 @@
       // 落回平台 logo 占位而不是 src=""
       var ava = ok && a.avatar && httpsUrl(a.avatar)
         ? '<img src="' + esc(httpsUrl(a.avatar)) + '" alt="" referrerpolicy="no-referrer" />'
-        : '<img class="acct-src-logo" src="/webui/logos/' + esc(a.source) + '.png" alt="" />';
-      return '<div class="acct" style="--sc:' + (colors[a.source] || "#888") + ';--sci:' + (inks[a.source] || "var(--sub)") + ';animation-delay:' + i * 70 + 'ms">' +
+        : srcLogoImg(a.source, "acct-src-logo");
+      return '<div class="acct" style="--sc:' + srcVar(colors, a.source, "var(--sub, #888)") + ';--sci:' + srcVar(inks, a.source, "var(--sub)") + ';animation-delay:' + i * 70 + 'ms">' +
         '<div class="acct-head"><div class="acct-ava' + (ok ? " ok" : "") + '">' + ava + "</div>" +
         '<div><div class="acct-name">' + esc(a.name) + "</div>" +
         '<div class="acct-sub">' + (ok ? esc(a.nickname || a.uid || "已登录") : "未登录") + "</div></div>" +
@@ -900,11 +1587,12 @@
     $("#qrImgWrap").classList.remove("expired");
     setQRState("正在获取二维码…", "");
     try {
+      // type 是二维码样式参数（后端按平台分支绘制），与音源枚举里的 qq 无关
       var r = await jpost("/api/qr/start", { source: source, type: "qq" });
       // 弹窗已关 / 已被另一次 openQR 取代：这次的 ticket 直接取消，
       // 否则会成为服务端孤儿会话，且下面的轮询还会一直打 /api/qr/status
       if (token !== _qrOpenToken || $("#qrMask").hidden) {
-        if (r && r.ticket) jpost("/api/qr/cancel", { ticket: r.ticket }).catch(function () {});
+        if (r && r.ticket) jpost("/api/qr/cancel", { ticket: r.ticket }, { skip401: true }).catch(function () {});
         return;
       }
       qrTicket = r.ticket;
@@ -914,8 +1602,14 @@
       var qrData = typeof r.qr === "string" && r.qr.indexOf("data:image/png;base64,") === 0 ? r.qr : "";
       if (qrData) { $("#qrImg").src = qrData; setQRState("请使用手机 App 扫码", ""); }
       else if (r.qrUrl) {
-        // 纯文本 URL 不可点
-        setQRStateHTML('<a href="' + esc(httpsUrl(r.qrUrl)) + '" target="_blank" rel="noopener">点此打开二维码页面</a>（或复制链接到浏览器）');
+        // httpsUrl 白名单拒绝时不渲染 <a href="">（点击等于刷新当前页）：
+        // 降级成纯文本展示，用户仍可复制
+        var safeUrl = httpsUrl(r.qrUrl);
+        if (safeUrl) {
+          setQRStateHTML('<a href="' + esc(safeUrl) + '" target="_blank" rel="noopener">点此打开二维码页面</a>（或复制链接到浏览器）');
+        } else {
+          setQRStateHTML('<span class="mono">' + esc(r.qrUrl) + "</span>（复制到浏览器打开）");
+        }
       }
       else { setQRState("未获取到二维码，请刷新重试", "bad"); return; }
       pollQR();
@@ -929,11 +1623,21 @@
   function pollQR() { scheduleQRPoll(_qrOpenToken); }
   function scheduleQRPoll(token) {
     clearTimeout(qrTimer);
-    qrTimer = setTimeout(function () { pollQROnce(token); }, 1500);
+    qrTimer = setTimeout(function () { pollQROnce(token); }, QR_POLL_MS);
   }
   async function pollQROnce(token) {
     qrTimer = null;
-    if (_qrPollBusy || token !== _qrOpenToken || !qrTicket || $("#qrMask").hidden) return;
+    if (token !== _qrOpenToken || !qrTicket || $("#qrMask").hidden) return;
+    // 页签在后台时暂停查询但照常重排（与 pollLogsOnce 同口径）：扫码弹窗开着
+    // 切走页签不该空转轮询；直接 return 会杀掉自递归定时器，切回后不再感知扫码
+    if (document.hidden) { scheduleQRPoll(token); return; }
+    if (_qrPollBusy) {
+      // 上一个（已作废代次的）查询仍在途：本轮让路但不放弃——原地重排。直接
+      // return 会把新代次的轮询一次性杀死（旧请求返回时 token 失配早退、不负责
+      // 恢复新轮询），「刷新二维码」后弹窗永久停在「请扫码」不感知扫码结果
+      scheduleQRPoll(token);
+      return;
+    }
     _qrPollBusy = true;
     try {
       var s = await jget("/api/qr/status?ticket=" + encodeURIComponent(qrTicket));
@@ -944,7 +1648,10 @@
       else if (s.state === "done") {
         setQRState("登录成功 " + (s.nickname || ""), "ok");
         toast(SRC_NAMES[qrSource] + " 登录成功", "ok");
-        setTimeout(closeQR, 900);
+        // 捕获代次再关窗：裸定时器会在 900ms 窗口内关掉并 cancel 用户刚开的新
+        // 扫码会话（closeQR 发的是当下 qrTicket，新会话被无声取消、弹窗闪退）
+        var tok = _qrOpenToken;
+        setTimeout(function () { if (tok === _qrOpenToken) closeQR(); }, 900);
         loadAccounts();
         return;
       } else if (s.state === "timeout") {
@@ -984,12 +1691,17 @@
     _qrOpenToken++;   // 作废在途的 openQR，其返回后不会再赋值/轮询
     clearTimeout(qrTimer);
     qrTimer = null;
-    // 无条件发 cancel（后端有 ticket 校验，多发无害）：openQR 请求飞行期间关窗时
-    // qrTicket 还是 null，漏发会让服务端会话成孤儿。
-    jpost("/api/qr/cancel", { ticket: qrTicket }).catch(function () {});
+    // 只在有真实 ticket 时发 cancel。start 在途关窗时 qrTicket 为 null，发出去
+    // 的 { ticket: null } 会被服务端 str() 成 "None" 查表落空、必然浪费——
+    // 真正的取消发生在 start 响应返回后的「弹窗已关」分支（token 不匹配即补发）
+    if (qrTicket) {
+      jpost("/api/qr/cancel", { ticket: qrTicket }, { skip401: true }).catch(function () {});
+    }
     qrTicket = null;
     $("#qrMask").hidden = true;
-    if (_qrPrevFocus && _qrPrevFocus.focus) _qrPrevFocus.focus();  // 焦点归位
+    // isConnected 守卫对齐 closeMore：触发按钮随面板重渲染销毁后，
+    // focus() 落在游离节点上等于焦点丢失到 body
+    if (_qrPrevFocus && _qrPrevFocus.isConnected && _qrPrevFocus.focus) _qrPrevFocus.focus();
     _qrPrevFocus = null;
   }
 
@@ -1003,7 +1715,7 @@
     withSkeleton("#errList", skeletonRows(3, 40));
     var d;
     try {
-      d = await jget("/api/stats?days=14");
+      d = await jget("/api/stats?days=14", { signal: panelSignal("stats") });
     } catch (e) {
       if (seq !== _stSeq || (e && e.aborted)) return;
       renderError("#statGrid2", e.message);
@@ -1044,7 +1756,10 @@
     var max = Math.max.apply(null, top.map(function (t) { return num(t.count); })) || 1;
     box.innerHTML = top.map(function (t, i) {
       return '<div class="err-row" style="animation-delay:' + Math.min(i * 40, 200) + 'ms">' +
-        '<div class="err-detail" title="' + esc(t.detail) + '">' + esc(t.detail) + "</div>" +
+        // tabindex=0 让 data-tip 宿主可键盘聚焦：focusin 才有机会触发 tooltip。
+        // aria-label 同步全文：tooltip 是纯视觉实现，读屏拿不到 data-tip
+        // （与结果徽标 vchip 的 aria-label 做法一致）
+        '<div class="err-detail" role="button" tabindex="0" aria-label="' + esc(t.detail) + '" data-tip="' + esc(t.detail) + '">' + esc(t.detail) + "</div>" +
         '<div class="err-bar-wrap"><div class="err-bar" style="--w:' + (num(t.count) / max).toFixed(4) + '"></div></div>' +
         '<div class="err-count">× ' + num(t.count) + "</div></div>";
     }).join("");
@@ -1056,7 +1771,7 @@
     withSkeleton("#historyFeed", skeletonRows(2, 60));
     var d;
     try {
-      d = await jget("/api/history");
+      d = await jget("/api/history", { signal: panelSignal("stats") });
     } catch (e) {
       if (seq !== _histSeq || (e && e.aborted)) return;
       renderError("#historyFeed", e.message);
@@ -1094,7 +1809,18 @@
         '<br><button class="btn btn-ghost btn-sm" style="margin-top:10px" data-act="panel-retry">重试</button></div>';
     }
     if (wrap) wrap.classList.add("has-state");
-    if (svg) svg.setAttribute("aria-busy", "false");
+    if (svg) {
+      // 二次加载失败时清掉上一轮的旧图：否则错误提示与旧图上下/叠加显示。
+      // innerHTML 清空会带走 aria-labelledby 引用的 <title>，悬空引用让读屏
+      // 退化成读「graphic」——错误态先摘掉引用，重绘成功后由绘制方补回
+      svg.innerHTML = "";
+      svg.removeAttribute("aria-labelledby");
+      svg.setAttribute("aria-busy", "false");
+    }
+    // 上一轮成功时生成的 sr-only 数据表一并清掉：留着会让读屏在错误态
+    // 继续播报陈旧的逐日数据（与 drawTrend 开头的移除对齐）
+    var old = $("#trendTable");
+    if (old) old.remove();
   }
   function chartReady() {
     var sk = $("#chartSkeleton"), wrap = $("#chartWrap"), svg = $("#trendChart");
@@ -1142,6 +1868,9 @@
       parts.push('<text x="' + (x + w / 2) + '" y="' + (H - 8) + '" text-anchor="middle" font-size="9" fill="currentColor">' + esc(d.label) + "</text>");
     });
     svg.innerHTML = parts.join("");
+    // chartError 的错误态摘掉了 aria-labelledby（<title> 随 innerHTML 清空）：
+    // 重绘成功后 <title id="trendA11y"> 已重建，引用要补回来
+    svg.setAttribute("aria-labelledby", "trendA11y");
     chartReady();
     // 键盘/读屏用户拿不到 <rect><title>（hover-only）：补一份 sr-only 数据表
     var old = $("#trendTable");
@@ -1178,7 +1907,7 @@
     box.innerHTML = shown.map(function (r, i) {
       return '<div class="bar-row" style="animation:rowPop .4s var(--bounce) both;animation-delay:' + i * 50 + 'ms">' +
         "<span>" + srcTagHtml(r.src, "src-tag") + " " + esc(ACT_NAMES[r.act] || r.act) + "</span>" +
-        '<span class="bar-track"><span class="bar-fill" style="--bc:' + (colors[r.src] || "var(--blue)") + ';--w:0"></span></span>' +
+        '<span class="bar-track"><span class="bar-fill" style="--bc:' + srcVar(colors, r.src, "var(--blue)") + ';--w:0"></span></span>' +
         '<span class="bar-num">' + fmtCount(r.n) + "</span></div>";
     }).join("");
     // 先落 0 再在下一帧设目标值，触发 scaleX 过渡
@@ -1202,7 +1931,10 @@
         "<td>" + srcTagHtml(r.source, "src-tag") + "</td>" +
         "<td>" + esc(ACT_NAMES[r.action] || r.action) + "</td>" +
         '<td><span class="badge ' + (r.ok ? "ok" : "err") + '">' + (r.ok ? "成功" : "失败") + "</span></td>" +
-        '<td style="max-width:260px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">' + esc(r.detail || "--") + "</td></tr>";
+        // 详情列单行截断（td.cell-detail 承担）：补 data-tip 让全文可查（tooltip
+        // 系统支持键盘 focus 触发），aria-label 同步全文给读屏（与 err-detail 同口径）
+        '<td class="cell-detail"><span role="button" tabindex="0" aria-label="' +
+        esc(r.detail || "--") + '" data-tip="' + esc(r.detail || "--") + '">' + esc(r.detail || "--") + "</span></td></tr>";
     }).join("");
   }
 
@@ -1210,17 +1942,25 @@
   var aclData = { mode: "off", blacklist: [], whitelist: [] };
   var _aclSeq = 0;
   var _aclSaving = false;
-  async function loadAcl() {
+  async function loadAcl(silent) {
     var seq = ++_aclSeq;
-    withSkeleton("#blackList", skeletonRows(3, 44));
-    withSkeleton("#whiteList", skeletonRows(3, 44));
+    // silent（保存后的刷新）：已有数据，跳过骨架屏原地重绘，否则每增删一条
+    // 列表都闪一次 3 行 shimmer
+    if (!silent) {
+      withSkeleton("#blackList", skeletonRows(3, 44));
+      withSkeleton("#whiteList", skeletonRows(3, 44));
+    }
     var d;
     try {
-      d = await jget("/api/acl");
+      d = await jget("/api/acl", { signal: panelSignal("acl") });
     } catch (e) {
       if (seq !== _aclSeq || (e && e.aborted)) return;
-      renderError("#blackList", e.message);
-      renderError("#whiteList", e.message);
+      // silent（保存后的静默刷新）失败时保留现视图：数据已确认落盘（服务端
+      // 返回 ok 才走到这里），把刚保存成功的列表打成错误态是误导
+      if (!silent) {
+        renderError("#blackList", e.message);
+        renderError("#whiteList", e.message);
+      }
       return;
     }
     if (seq !== _aclSeq) return; // 快速切面板时丢弃过期响应
@@ -1251,7 +1991,7 @@
       return;
     }
     box.innerHTML = items.map(function (it, i) {
-      return '<div class="le-item"><span>' + esc(it) + '</span><button data-act="acl-del" data-list="' + sel.slice(1) + '" data-i="' + i + '" title="删除" aria-label="删除 ' + esc(it) + '">✕</button></div>';
+      return '<div class="le-item"><span>' + esc(it) + '</span><button data-act="acl-del" data-list="' + sel.slice(1) + '" data-i="' + i + '" data-tip="删除" aria-label="删除 ' + esc(it) + '">✕</button></div>';
     }).join("");
   }
   // 必须 return：调用方（事件委托层）靠返回的 promise 决定何时解 busy 锁。
@@ -1269,8 +2009,11 @@
     var merged = Object.assign({}, aclData, patch);
     return jpost("/api/acl/save", merged).then(function (r) {
       _aclSaving = false;
-      if (r.ok) { aclData = merged; toast("黑白名单已保存", "ok"); return loadAcl().then(function () { return true; }); }
-      toast(r.error || "保存失败", "error");
+      // silent 重绘：数据已在本地（merged），成功后只需同步视图，不闪骨架屏。
+      // r 需判空（2xx 空体/解析失败时 api() 返回 null）：直接 r.ok 会抛
+      // TypeError 变成 unhandled rejection，输入框不清空、无提示
+      if (r && r.ok) { aclData = merged; toast("黑白名单已保存", "ok"); return loadAcl(true).then(function () { return true; }); }
+      toast((r && r.error) || "保存失败", "error");
       return false;
     }, function (e) {
       _aclSaving = false;
@@ -1334,14 +2077,49 @@
   // 用户会误以为插件没关掉）。改配置分组时对照 _conf_schema.json 核对。
   var CORE_TOGGLES = ["enable", "enableSongRequest"];
   var FEATURE_TOGGLES = ["enableResolve", "resolveCards", "renderListCard"];
+  // 配置表单「干净态快照」：renderConfig 完成时记录全部控件值，cfgDirty() 用
+  // 实时 DOM 与之比对。面板 DOM 常驻（切面板只隐藏不销毁），干净时重入不再
+  // 重拉重渲染——原先每次进配置页都整块重建，改了一半的内容切个面板就丢
+  var _cfgCleanSnapshot = "";
+  function cfgFormSnapshot() {
+    var parts = [];
+    $$("#configBody input,#configBody select").forEach(function (el) { parts.push(el.id + "=" + el.value); });
+    $$("#configBody .sw").forEach(function (el) { parts.push(el.id + "=" + (el.classList.contains("on") ? "1" : "0")); });
+    return parts.join("|");
+  }
+  function cfgDirty() {
+    return !!(_cfgCleanSnapshot && $("#configBody .cfg-group") && cfgFormSnapshot() !== _cfgCleanSnapshot);
+  }
+  function _cfgForget() {
+    // 清掉「已加载」状态：错误态 / 登出现场里 DOM 已不代表服务端配置，
+    // 保留快照会让 loadConfig 早退（重试按钮空转）、saveConfig 拿旧基线整包覆盖
+    _cfgCleanSnapshot = "";
+    cfgData = null;
+  }
   async function loadConfig() {
+    // 早退判据必须同时确认 DOM 在位：renderError 后 #configBody 没有 .cfg-group，
+    // 只看快照会把错误态误判成「干净已加载」，错误态里的「重试」永久空转
+    if (_cfgCleanSnapshot && $("#configBody .cfg-group") && !cfgDirty()) {
+      // 已加载且无未保存修改：跳过重拉（DOM 与服务端一致），不闪骨架屏
+      setLoaded("#configBody");
+      return;
+    }
+    if (_cfgCleanSnapshot && cfgDirty()) {
+      var go = await confirmBox({
+        title: "未保存的配置",
+        text: "配置页有未保存的修改，重新载入将丢弃这些修改。",
+        okText: "丢弃并重载",
+      });
+      if (!go) return;
+    }
     var seq = ++_cfgSeq;
     withSkeleton("#configBody", skeletonRows(4, 88));
     var d;
     try {
-      d = await jget("/api/config");
+      d = await jget("/api/config", { signal: panelSignal("config") });
     } catch (e) {
       if (seq !== _cfgSeq || (e && e.aborted)) return;
+      _cfgForget();
       renderError("#configBody", e.message);
       return;
     }
@@ -1349,7 +2127,11 @@
     setLoaded("#configBody");
     // 后端返回 200 但没有 config 字段时不能悄悄留着骨架屏：
     // renderConfig 会直接 return，用户永远看到 shimmer
-    if (!d || !d.config) { renderError("#configBody", "配置数据为空，请检查插件端 /api/config 响应"); return; }
+    if (!d || !d.config) {
+      _cfgForget();
+      renderError("#configBody", "配置数据为空，请检查插件端 /api/config 响应");
+      return;
+    }
     cfgData = d.config;
     renderConfig();
   }
@@ -1384,10 +2166,16 @@
 
     // count 由调用处显式传入：按 inner 里 "cfg-item" 出现次数统计，
     // label 含该字面量就会算错
+    // 折叠组不再用原生 <details>（展开是瞬间完成、无法动画）：
+    // 手写 .cfg-head + grid-template-rows 0fr/1fr 过渡实现高度动画
+    var _cfgSeq2 = 0;
     function group(title, inner, count) {
-      return '<details class="cfg-group" open><summary><span class="arrow" aria-hidden="true">▶</span>' + esc(title) +
-        '<span class="cfg-count">' + (count != null ? count : 0) + " 项</span></summary>" +
-        '<div class="cfg-items">' + inner + "</div></details>";
+      var gid = "cfgbody-" + (++_cfgSeq2);
+      return '<div class="cfg-group open">' +
+        '<button type="button" class="cfg-head" aria-expanded="true" aria-controls="' + gid + '">' +
+        '<span class="arrow" aria-hidden="true">▶︎</span>' + esc(title) +
+        '<span class="cfg-count">' + (count != null ? count : 0) + " 项</span></button>" +
+        '<div class="cfg-body" id="' + gid + '"><div class="cfg-body-in"><div class="cfg-items">' + inner + "</div></div></div></div>";
     }
     function textItem(id, label, desc, value, type, extra) {
       return '<div class="cfg-item"><label for="cfg-' + esc(id) + '">' + esc(label) + "</label>" +
@@ -1405,9 +2193,14 @@
         (desc ? '<div class="desc">' + esc(desc) + "</div>" : "") + "</div>";
     }
     function selectItem(id, label, desc, value, options) {
+      // 配置里存着已下架档位（旧版面板曾提供 kg viper 系）时 select 匹配不到任何
+      // option，value 变 ""：显示空白且保存必被服务端拒绝成死锁。回落到第一项
+      // （恒为 auto），下次保存顺带把无效旧值归位
+      var known = options.some(function (o) { return o[0] === value; });
+      var cur = known ? value : options[0][0];
       return '<div class="cfg-item"><label for="cfg-' + esc(id) + '">' + esc(label) + "</label>" +
         '<select class="input" id="cfg-' + esc(id) + '">' +
-        options.map(function (o) { return '<option value="' + esc(o[0]) + '"' + (o[0] === value ? " selected" : "") + ">" + esc(o[1]) + "</option>"; }).join("") +
+        options.map(function (o) { return '<option value="' + esc(o[0]) + '"' + (o[0] === cur ? " selected" : "") + ">" + esc(o[1]) + "</option>"; }).join("") +
         "</select>" + (desc ? '<div class="desc">' + esc(desc) + "</div>" : "") + "</div>";
     }
     function staticItem(label, text) {
@@ -1425,6 +2218,7 @@
     general += textItem("identifyPrefix", "识别信息前缀", "", c.identifyPrefix); generalCount++;
     general += textItem("cooldownSec", "点歌冷却 (秒)", "同群两次点歌最小间隔，0 = 关闭", c.cooldownSec, "number", ' min="0" step="1"'); generalCount++;
     general += textItem("rateLimitMs", "音源限速 (ms)", "每请求最小间隔，防突发风控，0 = 关闭", c.rateLimitMs, "number", ' min="0" step="100"'); generalCount++;
+    general += textItem("apiTimeoutSec", "音源请求超时 (秒)", "5-120，弱网或自建上游响应慢时调大，改完即时生效", c.apiTimeoutSec, "number", ' min="5" max="120" step="1"'); generalCount++;
     html += group("基础", general, generalCount);
 
     /* 功能开关：解析 / 卡片 / 图片渲染 */
@@ -1435,17 +2229,18 @@
     });
     html += group("功能开关", feat, FEATURE_TOGGLES.length);
 
-    var srcQ = [["auto", "自动"], ["standard", "标准"], ["higher", "较高"], ["exhigh", "极高"], ["lossless", "无损"], ["hires", "Hi-Res"], ["jyeffect", "高清臻音"], ["sky", "沉浸环绕"], ["dolby", "杜比"], ["jymaster", "超清母带"]];
-    var kgQ = [["auto", "自动"], ["128", "标准"], ["320", "HQ"], ["flac", "无损"], ["high", "Hi-Res"], ["super", "Super"], ["viper_clear", "蝰蛇超清"], ["viper_tape", "蝰蛇母带"]];
+    var srcQ = [["auto", "自动"], ["standard", "标准"], ["higher", "较高"], ["exhigh", "极高"], ["lossless", "无损"], ["hires", "Hi-Res"], ["jyeffect", "高清臻音"], ["vivid", "臻音全景声"], ["sky", "沉浸环绕"], ["dolby", "杜比"], ["jymaster", "超清母带"]];
+    // kg 只有旧 /song/url 支持的三档（quality.py 排除说明）：high/super/viper 属新端点，选了也无效
+    var kgQ = [["auto", "自动"], ["128", "标准"], ["320", "HQ"], ["flac", "无损"]];
     var qqQ = [["auto", "自动"], ["128", "标准"], ["320", "HQ"], ["flac", "无损"], ["atmos", "全景声"], ["master", "臻品母带"], ["atmos_db", "杜比"]];
 
-    var ncmHtml = textItem("ncm-apiBase", "API 地址", "网易云 API 服务，默认已填公共实例；自建默认端口 3000", c.ncm.apiBase);
+    var ncmHtml = textItem("ncm-apiBase", "API 地址", "网易云 API 服务（api-enhanced），留空则停用网易云音源；自建默认端口 3000", c.ncm.apiBase);
     ncmHtml += selectItem("ncm-quality", "最高音质", "", c.ncm.quality, srcQ);
     ncmHtml += boolItem("ncm-qualityUnblock", "VIP 歌自动解灰", "拿不到 URL 时用 unblock 音源兜底", c.ncm.qualityUnblock);
     ncmHtml += staticItem("登录状态", c.ncm.hasCookie ? "已有 Cookie" : "匿名（可在「账号扫码」登录）");
     html += group("网易云音乐", ncmHtml, 4);
 
-    var kgHtml = textItem("kg-apiBase", "API 地址", "酷狗 API 服务，本机自建默认端口 4000", c.kg.apiBase);
+    var kgHtml = textItem("kg-apiBase", "API 地址", "酷狗 API 服务（KuGouMusicApi），留空则停用酷狗音源；本机自建默认端口 4000", c.kg.apiBase);
     kgHtml += selectItem("kg-quality", "最高音质", "", c.kg.quality, kgQ);
     kgHtml += boolItem("kg-trialFallback", "VIP 歌发试听", "未登录时发 60 秒试听", c.kg.trialFallback);
     kgHtml += staticItem("登录状态", c.kg.hasCookie ? "已有 Cookie" : "匿名（搜索需登录，请先「账号扫码」）");
@@ -1463,15 +2258,18 @@
       delivery += boolItem(spec[0], spec[1], spec[2], c[spec[0]]);
       deliveryCount++;
     });
-    delivery += textItem("compressBitrate", "压缩码率 (kbps)", "0 = 不压缩", c.compressBitrate, "number", ' min="0" max="320" step="8"'); deliveryCount++;
-    delivery += textItem("downloadTimeout", "下载超时 (ms)", "", c.downloadTimeout, "number", ' min="1000" step="1000"'); deliveryCount++;
-    delivery += textItem("keepFileSec", "临时文件保留 (秒)", "", c.keepFileSec, "number", ' min="0" step="10"'); deliveryCount++;
+    delivery += textItem("compressBitrate", "压缩码率 (kbps)", "32-320，与服务端限制一致（关闭压缩用「失败压缩重试」开关）", c.compressBitrate, "number", ' min="32" max="320" step="32"'); deliveryCount++;
+    delivery += textItem("downloadTimeout", "下载超时 (ms)", "5000-600000", c.downloadTimeout, "number", ' min="5000" max="600000" step="5000"'); deliveryCount++;
+    delivery += textItem("keepFileSec", "临时文件保留 (秒)", "5-3600", c.keepFileSec, "number", ' min="5" max="3600" step="5"'); deliveryCount++;
     html += group("发送通道（多平台适配）", delivery, deliveryCount);
 
     var webuiHtml = boolItem("webui-enable", "启用 WebUI", "", c.webui.enable);
     webuiHtml += textItem("webui-host", "监听地址", "0.0.0.0 允许局域网访问", c.webui.host);
     webuiHtml += textItem("webui-port", "端口", "改动需重载插件生效", c.webui.port, "number", ' min="1" max="65535" step="1"');
-    html += group("WebUI 面板", webuiHtml, 3);
+    webuiHtml += textItem("webui-sessionHours", "会话有效期 (小时)", "1-168，登录态的有效时长，改完对新登录生效", c.webui.sessionHours, "number", ' min="1" max="168" step="1"');
+    webuiHtml += textItem("webui-hostAllowlist", "域名白名单", "逗号分隔完整主机名（精确匹配，不含子域名）；留空只允许 IP / localhost", (c.webui.hostAllowlist || []).join(", "));
+    webuiHtml += boolItem("webui-secureCookie", "Cookie Secure 标志", "https 反代访问时开启；http 直连必须保持关闭，否则无法登录", c.webui.secureCookie);
+    html += group("WebUI 面板", webuiHtml, 6);
 
     var sched = c.scheduler || {};
     var schedHtml = boolItem("sched-enable", "启用定时任务", "每日签到 / 凭证保活 / 订阅推送", sched.enable);
@@ -1488,6 +2286,19 @@
         sw.setAttribute("aria-checked", sw.classList.contains("on") ? "true" : "false");
       });
     });
+    // 折叠组头部：点击切换 .open，高度动画交给 CSS 的 grid-template-rows 过渡
+    $$(".cfg-head", body).forEach(function (head) {
+      head.addEventListener("click", function () {
+        var g = head.closest(".cfg-group");
+        if (!g) return;
+        var open = g.classList.toggle("open");
+        head.setAttribute("aria-expanded", open ? "true" : "false");
+      });
+    });
+    // 配置页的下拉框同样走自定义 widget（原生弹层无法套主题/动画）
+    enhanceSelects(body);
+    // 渲染完成即「干净态」基线：之后 cfgDirty() 以实时 DOM 与此比对
+    _cfgCleanSnapshot = cfgFormSnapshot();
   }
   function collectConfig() {
     var patch = {};
@@ -1496,6 +2307,7 @@
     patch.identifyPrefix = bind("identifyPrefix");
     patch.cooldownSec = numOr(bind("cooldownSec"), 0);
     patch.rateLimitMs = numOr(bind("rateLimitMs"), 0);
+    patch.apiTimeoutSec = numOr(bind("apiTimeoutSec"), 20);
     patch.ncm = { apiBase: bind("ncm-apiBase"), quality: bind("ncm-quality"), qualityUnblock: swVal("ncm-qualityUnblock") };
     patch.kg = { apiBase: bind("kg-apiBase"), quality: bind("kg-quality"), trialFallback: swVal("kg-trialFallback") };
     patch.qq = { quality: bind("qq-quality"), trialFallback: swVal("qq-trialFallback") };
@@ -1505,7 +2317,18 @@
     patch.compressBitrate = numOr(bind("compressBitrate"), 128);
     patch.downloadTimeout = numOr(bind("downloadTimeout"), 120000);
     patch.keepFileSec = numOr(bind("keepFileSec"), 60);
-    patch.webui = { enable: swVal("webui-enable"), host: bind("webui-host"), port: numOr(bind("webui-port"), 17818) };
+    patch.webui = {
+      enable: swVal("webui-enable"),
+      host: bind("webui-host"),
+      port: numOr(bind("webui-port"), 17818),
+      sessionHours: numOr(bind("webui-sessionHours"), 12),
+      // 逗号/中文逗号分隔 → 字符串数组（后端逐项归一：去空白/去前导点/小写）
+      hostAllowlist: bind("webui-hostAllowlist")
+        .split(/[,，]/)
+        .map(function (s) { return s.trim(); })
+        .filter(Boolean),
+      secureCookie: swVal("webui-secureCookie"),
+    };
     patch.scheduler = {
       enable: swVal("sched-enable"),
       signinHour: numOr(bind("sched-signinHour"), 0),
@@ -1523,23 +2346,77 @@
       else cfgData[k] = v;
     });
   }
+  // 只回填一个配置控件（被拒项用）：开关按 role="switch" 的 .sw.on 结构，
+  // 其余按输入框 value 赋值；select 是自定义下拉（.csel），只写隐藏载体的
+  // value 可见标签不会变——必须走 syncSelect 同步按钮文案
+  function setCfgField(id, v) {
+    var el = $("#cfg-" + id);
+    if (!el) return;
+    if (el.classList.contains("sw")) {
+      el.classList.toggle("on", !!v);
+      el.setAttribute("aria-checked", el.classList.contains("on") ? "true" : "false");
+    } else {
+      el.value = v == null ? "" : String(v);
+      if (el.tagName === "SELECT") syncSelect(el);
+    }
+  }
   async function saveConfig() {
-    if (!cfgData) return;
+    // DOM 在位守卫：错误态/骨架屏期间（.cfg-group 不存在）cfgData 仍是旧值，
+    // collectConfig 对缺失控件全取默认值会整包 POST 覆盖服务端真实配置
+    if (!cfgData || !$("#configBody .cfg-group")) {
+      toast("配置页尚未加载完成，稍后再试", "warn");
+      return;
+    }
     var patch = collectConfig();
     var btn = $('[data-act="cfg-save"]');
     if (btn) { btn.disabled = true; btn.textContent = "保存中…"; }
     try {
       var r = await jpost("/api/config/save", { config: patch });
       if (r.rejected && r.rejected.length) {
-        // 有被拒项时本地 patch 不等于实际生效值：原地同步会把「没存进去的值」
-        // 留在面板上误导用户，必须重拉服务端真实配置回填
-        toast("部分项被拒绝：" + r.rejected.join(", "), "warn");
+        // 有被拒项时本地 patch 不等于实际生效值：被拒字段必须回填服务端真实值
+        // 否则面板上留着「没存进去的值」误导用户。只回填被拒字段、不全量重渲染
+        // ——renderConfig() 会把其它分组未保存的编辑一并清掉（违背本页约定）
+        var reasons = r.rejected.map(function (k) {
+          var why = r.rejectedReasons && r.rejectedReasons[k];
+          return why ? k + "（" + why + "）" : k;
+        });
+        toast("部分项被拒绝：" + reasons.join(", "), "warn");
         var fresh = await jget("/api/config");
-        if (fresh && fresh.config) { cfgData = fresh.config; renderConfig(); }
+        if (fresh && fresh.config) {
+          cfgData = fresh.config;
+          r.rejected.forEach(function (key) {
+            var parts = String(key).split(".");
+            if (parts.length === 2) {
+              var node = fresh.config[parts[0]];
+              if (node && typeof node === "object") {
+                // 控件 id 前缀与配置节点名不同（scheduler 节点的控件 id 是 sched-*），
+                // 直接拼节点名会 setCfgField 落空、被拒值留在界面上还被快照标成已保存
+                var idPrefix = parts[0] === "scheduler" ? "sched" : parts[0];
+                setCfgField(idPrefix + "-" + parts[1], node[parts[1]]);
+              }
+            } else {
+              var topVal = fresh.config[key];
+              if (topVal && typeof topVal === "object") {
+                // 整节点被拒（如 scheduler「写入底层配置失败」）：节点全部字段都
+                // 留在服务端值，逐一回填——只按节点名 setCfgField 会落空，用户
+                // 未保存的值反被快照标成「已保存」
+                var p2 = key === "scheduler" ? "sched" : key;
+                Object.keys(topVal).forEach(function (f) {
+                  setCfgField(p2 + "-" + f, topVal[f]);
+                });
+              } else {
+                setCfgField(key, topVal);
+              }
+            }
+          });
+        }
       } else {
         toast("配置已保存" + (r.note ? " " + r.note : ""), "ok");
         syncConfigView(patch);
       }
+      // 保存流程结束后的 DOM 状态即新基线：成功分支（DOM=已保存值）与回填分支
+      // （被拒字段已还原成服务端值、其余未保存修改继续算脏）都成立
+      _cfgCleanSnapshot = cfgFormSnapshot();
     } catch (e) {
       toast(e.message, "error");
     } finally {
@@ -1571,7 +2448,10 @@
         "<br>展开后链接：" + esc(r.expanded || "") + "</div>";
     } catch (e) {
       if (e && e.aborted) return;
-      box.innerHTML = '<div class="rr-name">解析失败</div><div class="rr-sub">' + esc(e.message) + "</div>";
+      // 失败态带重试入口（与其他面板错误态的 panel-retry 同款交互）
+      box.innerHTML =
+        '<div class="rr-name">解析失败</div><div class="rr-sub">' + esc(e.message) +
+        '<br><button class="btn btn-ghost btn-sm" style="margin-top:10px" data-act="do-resolve">重试</button></div>';
     }
   }
 
@@ -1582,7 +2462,7 @@
     withSkeleton("#sessTbl tbody", '<tr><td colspan="4"><div class="skeleton" aria-hidden="true" style="height:60px"></div></td></tr>');
     var d;
     try {
-      d = await jget("/api/auth/sessions");
+      d = await jget("/api/auth/sessions", { signal: panelSignal("sessions") });
     } catch (e) {
       if (seq !== _ssSeq || (e && e.aborted)) return;
       renderError("#sessTbl tbody", e.message);
@@ -1597,7 +2477,10 @@
       return;
     }
     tb.innerHTML = d.sessions.map(function (s) {
-      return "<tr><td>" + esc(s.id) + (s.current ? ' <span class="badge ok">当前</span>' : "") + "</td>" +
+      return "<tr><td>" + esc(s.id) + (s.current ? ' <span class="badge ok">当前</span>' : "") +
+        // 服务端检测到会话异 IP 重放（疑似被窃）时标警：_auth 下发 ipChanged
+        // 就是给「我的会话」看的，漏渲染等于设计好的可见性缺失
+        (s.ipChanged ? ' <span class="badge err" data-tip="该会话的来源 IP 发生变化，若非本人操作请立即下线">⚠ IP 变化</span>' : "") + "</td>" +
         "<td>" + fmtDateTime(s.created) + "</td>" +
         "<td>" + fmtDateTime(s.lastSeen) + "</td>" +
         "<td>" + (s.current ? "--" : '<button class="btn btn-ghost btn-sm" data-act="sess-revoke" data-id="' + esc(s.id) + '">下线</button>') + "</td></tr>";
@@ -1606,9 +2489,11 @@
 
   /* ─────────── 运行日志 ─────────── */
   var _logSeq = 0;
+  var _logLoadSeq = 0; // loadLogsPanel 的进入序号：快速切走再切回时作废旧请求的渲染
   var _logTimer = null;
   var _logBusy = false;
-  var _clearedAt = 0;   // 清屏时刻（秒），之后过滤更早条目
+  var _clearedAt = 0;   // 清屏界线（秒）：之后的条目才显示
+  var _logNewestTs = 0; // 已见条目里最大的服务端 ts（清屏以它为界，避免客户端时钟偏移吞日志）
   function logLine(e) {
     var cls = e.level === "ERROR" ? "err" : e.level === "WARNING" ? "warn" : "info";
     // 后端存的是结构化字段：级别徽标 / 时间 / 正文分开渲染，
@@ -1618,18 +2503,26 @@
   }
   function renderLogEntries(entries) {
     var box = $("#logConsole");
+    // 清屏界线同样要过滤整屏渲染：服务端重启走 seq 回退全量重取时，
+    // 不过滤会把已清掉的日志整屏带回来（append 路径有过滤，这里也要有）。
+    // 全量路径同样按 LOG_MAX 封顶：反复触发回退重取时整屏重建不受
+    // append 路径的节点数上限约束，会无界累积
+    entries = entries.filter(function (e) { return num(e.ts) > _clearedAt; }).slice(-LOG_MAX);
     if (!entries.length) {
-      box.innerHTML = '<div class="empty-state">暂无日志</div>';
+      box.innerHTML = _clearedAt ? '<div class="empty-state">已清屏（仅本地显示）</div>' : '<div class="empty-state">暂无日志</div>';
       return;
     }
+    _logNewestTs = entries.reduce(function (m, e) { return Math.max(m, num(e.ts)); }, _logNewestTs);
     box.innerHTML = entries.map(logLine).join("");
     box.scrollTop = box.scrollHeight;
   }
   var LOG_MAX = 400;   // DOM 节点数封顶：面板开久了 insertAdjacentHTML 会累积上万节点
   function appendLogEntries(entries) {
     var box = $("#logConsole");
-    // 清屏后不立刻被 2.5s 后的新日志覆盖掉「已清屏」提示：过滤更早条目
-    entries = entries.filter(function (e) { return num(e.ts) >= _clearedAt; });
+    // 清屏后不立刻被 2.5s 后的新日志覆盖掉「已清屏」提示：过滤界线前的条目。
+    // 严格大于：界线取的是清屏时最新一条的 ts，等于界线的恰是已被清掉的那条
+    entries = entries.filter(function (e) { return num(e.ts) > _clearedAt; });
+    _logNewestTs = entries.reduce(function (m, e) { return Math.max(m, num(e.ts)); }, _logNewestTs);
     // 先判空再清理：全被过滤时直接退，否则 empty-state 被抹掉后控制台变无提示黑屏
     if (!entries.length) return;
     if (box.querySelector(".empty-state")) box.innerHTML = "";
@@ -1649,31 +2542,37 @@
   async function loadLogsPanel() {
     stopLogsPoll();
     _clearedAt = 0;
+    // seq 守卫对齐其它面板 loader：快速切走再切回时，第一次的 await 返回后
+    // 不得覆盖第二次的骨架屏（离开面板时 curPanel 变化，这里以进入序号判定）
+    var seq = ++_logLoadSeq;
     $("#logConsole").innerHTML = '<div class="skeleton" aria-hidden="true" style="height:60px"></div>';
     try {
-      var d = await jget("/api/logs");
-      // 服务端重启后 seq 归零：检测回退并全量重取，
-      // 否则 after=<旧大值> 永远等不到新日志
+      var d = await jget("/api/logs", { signal: panelSignal("logs") });
+      // api() 对 2xx 空体/解析失败统一抛协议错误（不再返回 null），d 恒为对象
       if (d.seq < _logSeq) {
+        // 服务端重启后 seq 归零：检测回退并全量重取，
+        // 否则 after=<旧大值> 永远等不到新日志
         _logSeq = 0;
         var full = await jget("/api/logs");
+        if (seq !== _logLoadSeq) return;
         _logSeq = num(full.seq);
         renderLogEntries(full.entries || []);
       } else {
+        if (seq !== _logLoadSeq) return;
         _logSeq = num(d.seq);
         renderLogEntries(d.entries || []);
       }
     } catch (e) {
       // 与其它面板 loader 一致：失败渲染错误态 + 重试按钮，别让骨架屏长亮
-      if (!(e && e.aborted)) renderError("#logConsole", e.message);
+      if (!(e && e.aborted) && seq === _logLoadSeq) renderError("#logConsole", e.message);
     }
-    scheduleLogPoll();
+    if (seq === _logLoadSeq) scheduleLogPoll();
   }
   // 递归 setTimeout 而非 setInterval：interval 会与上一次请求重叠，
   // 没有 in-flight 守卫时同一批日志可能被追加两次
   function scheduleLogPoll() {
     if (_logTimer) clearTimeout(_logTimer);
-    _logTimer = setTimeout(pollLogsOnce, 2500);
+    _logTimer = setTimeout(pollLogsOnce, LOG_POLL_MS);
   }
   async function pollLogsOnce() {
     _logTimer = null;
@@ -1682,12 +2581,17 @@
     if (curPanel !== "logs") return;
     if (document.hidden || !$("#loginMask").hidden || _logBusy) { scheduleLogPoll(); return; }
     _logBusy = true;
+    // 代际快照：in-flight 期间用户切走再切回，loadLogsPanel 会全量重渲染并推进
+    // _logLoadSeq——旧请求返回后不得再追加（否则已有条目重复一遍）或回写旧 _logSeq
+    var gen = _logLoadSeq;
     try {
-      var d2 = await jget("/api/logs?after=" + _logSeq);
+      var d2 = await jget("/api/logs?after=" + _logSeq, { signal: panelSignal("logs") });
+      if (gen !== _logLoadSeq) return;
       if (num(d2.seq) < _logSeq) {
         // seq 回退 = 服务端重启，必须全量重取
         _logSeq = 0;
-        var full = await jget("/api/logs");
+        var full = await jget("/api/logs", { signal: panelSignal("logs") });
+        if (gen !== _logLoadSeq) return;
         _logSeq = num(full.seq);
         renderLogEntries(full.entries || []);
       } else {
@@ -1695,7 +2599,10 @@
         if ((d2.entries || []).length) appendLogEntries(d2.entries);
       }
     } catch (e) { /* 下轮重试 */ }
-    _logBusy = false;
+    finally {
+      // 复位必须走 finally：早退 return（代际失配）跳过复位会让轮询永久停摆
+      _logBusy = false;
+    }
     if (curPanel === "logs") scheduleLogPoll();
   }
 
@@ -1703,6 +2610,9 @@
   var _confirmPrevFocus = null;
   var _confirmResolve = null;
   function confirmBox(opts) {
+    // 重入守卫：mask 全屏拦截下物理上开不了第二个，但 promise 级的防重入
+    // 保证并发调用不会覆盖 _confirmResolve 导致第一个调用永远挂起
+    if (_confirmResolve) return Promise.resolve(false);
     return new Promise(function (resolve) {
       var mask = $("#confirmMask");
       var dlg = $("#confirmDialog");
@@ -1723,7 +2633,7 @@
     mask.hidden = true;
     var r = _confirmResolve;
     _confirmResolve = null;
-    if (_confirmPrevFocus && _confirmPrevFocus.focus) _confirmPrevFocus.focus();
+    if (_confirmPrevFocus && _confirmPrevFocus.isConnected) _confirmPrevFocus.focus();
     _confirmPrevFocus = null;
     if (r) r(ok);
   }
@@ -1731,6 +2641,10 @@
   $("#confirmCancel").addEventListener("click", function () { closeConfirm(false); });
   $("#confirmMask").addEventListener("click", function (e) {
     if (e.target === this) closeConfirm(false);
+  });
+  // 扫码弹窗与确认框同口径：点遮罩关闭（Esc 已有）。扫码轮询在 closeQR 里作废
+  $("#qrMask").addEventListener("click", function (e) {
+    if (e.target === this) closeQR();
   });
 
   /* ─────────── 事件委托 ─────────── */
@@ -1749,12 +2663,11 @@
         // 登出必须停掉所有后台活动：否则音频继续播、二维码仍在轮询 /api/qr/status
         var ok = await confirmBox({ title: "退出登录", text: "退出后需要重新输入管理密码才能回到面板。", okText: "退出" });
         if (!ok) return;
-        // 先清干净现场（关弹窗会归还焦点），再通知服务端
-        stopPreview();
-        abortPreview();
-        closeQR();
-        stopLogsPoll();
-        clearInterval(overviewTimer);
+        // 先清干净现场（关弹窗会归还焦点），再通知服务端。
+        // 现场作废（代际推进 + _cfgForget）与 401 路径共用同一段：漏掉会让重登后
+        // loadConfig 早退、以登出前的旧配置 DOM 为基线整包覆盖服务端配置
+        teardownLocal();
+        invalidatePanelState();
         clearToasts();
         try { await jpost("/api/auth/logout", {}); } catch (err) { /* 401 也算已登出 */ }
         authGen++;
@@ -1778,16 +2691,14 @@
           });
           // 合成一条 toast：一次发 3 条会互相挤掉，且读屏连播三段
           toast(lines.join("；"), bad ? "warn" : "ok");
-          loadOverview();
+          loadOverview(true) /* 静默：不重建骨架屏、数字不重滚 */;
         } catch (err) { toast(err.message, "error"); }
       },
       "do-search": doSearch,
       "do-resolve": doResolve,
       // 错误态里的「重试」：按当前面板重新走对应 loader
       "panel-retry": function () {
-        var loaders = { overview: loadOverview, accounts: loadAccounts, stats: loadStats,
-          acl: loadAcl, config: loadConfig, sessions: loadSessions, logs: loadLogsPanel };
-        var fn = loaders[curPanel];
+        var fn = PANEL_LOADERS[curPanel];
         if (fn) fn().catch(function (e) { if (e && !e.aborted) toast(e.message, "error"); });
       },
       "preview": function () { playPreview(t.dataset.source, t.dataset.sid, t); },
@@ -1795,11 +2706,20 @@
       "remote-refresh": loadScopes,
       "history-refresh": function () { loadHistory().catch(function () {}); },
       "logs-clear": function () {
-        // 记时刻而不是只清 DOM：不停轮询的话 2.5s 后新日志会立刻覆盖「已清屏」
-        _clearedAt = Math.floor(Date.now() / 1000);
+        // 以**服务端**最新一条的 ts 为清屏界线：用客户端 Date.now() 的话，
+        // 本机时钟快于服务端时，偏移窗口内的新日志会被整批吞掉。
+        // 还没拉到过任何日志时退回本地时钟（空屏清屏，无实际影响）
+        _clearedAt = _logNewestTs || Math.floor(Date.now() / 1000);
         var box = $("#logConsole");
-        // 只同步 seq，失败无碍：本地已清屏，下一轮轮询会照常带回新日志
-        if (_logSeq) { jget("/api/logs?after=" + _logSeq).then(function (d) { _logSeq = num(d.seq); }).catch(function () {}); }
+        // 只同步 seq，失败无碍：本地已清屏，下一轮轮询会照常带回新日志。
+        // 代际快照对齐 pollLogsOnce：in-flight 期间切走再重进日志面板，
+        // _logLoadSeq 已推进，旧请求返回不得回写旧 _logSeq（after=旧值会漏日志）
+        if (_logSeq) {
+          var clearGen = _logLoadSeq;
+          jget("/api/logs?after=" + _logSeq).then(function (d) {
+            if (clearGen === _logLoadSeq && d) _logSeq = num(d.seq);
+          }).catch(function () {});
+        }
         box.innerHTML = '<div class="empty-state">已清屏（仅本地显示）</div>';
       },
       "acl-copy-black": function () { aclCopy("blacklist"); },
@@ -1861,7 +2781,12 @@
       },
       "pwd-change": async function () {
         var oldV = $("#oldPwd").value, newV = $("#newPwd").value;
+        if (!oldV) { toast("请输入当前密码", "warn"); $("#oldPwd").focus(); return; }
         if (!newV || newV.length < 6) { toast("新密码至少 6 位", "warn"); return; }
+        // 与服务端同口径的弱口令前置校验（纯数字短密码在 600k PBKDF2 下仍是分钟级离线爆破）
+        if (/^\d+$/.test(newV) && newV.length < 8) {
+          toast("纯数字密码至少 8 位，建议混入字母或符号", "warn"); return;
+        }
         try {
           await jpost("/api/auth/change-password", { old: oldV, password: newV });
           $("#oldPwd").value = ""; $("#newPwd").value = "";
@@ -1912,6 +2837,10 @@
   });
   $("#blackInput").addEventListener("keydown", function (e) { if (e.key === "Enter") aclAdd("blacklist", "#blackInput"); });
   $("#whiteInput").addEventListener("keydown", function (e) { if (e.key === "Enter") aclAdd("whitelist", "#whiteInput"); });
+  // 凭证导入的 Enter 提交（同页 black/white 输入框都有，此处补齐）
+  $("#cookieValue").addEventListener("keydown", function (e) {
+    if (e.key === "Enter") { e.preventDefault(); var b = $('button[data-act="cookie-save"]'); if (b) b.click(); }
+  });
   $("#resolveInput").addEventListener("keydown", function (e) {
     if (e.key === "Enter" && (e.ctrlKey || e.metaKey)) doResolve();
   });
@@ -1925,7 +2854,11 @@
     // 焦点陷阱：弹窗打开时 Tab 在弹窗内循环，否则键盘用户会 Tab 到背景内容上。
     // 原 $$ 只接受 1 个参数，这里传的 #qrDialog 被静默丢弃 → 扫全文档 → 不回绕。
     if (e.key !== "Tab") return;
-    var dlgSel = $("#qrMask").hidden ? (!$("#confirmMask").hidden ? "#confirmDialog" : null) : "#qrDialog";
+    var dlgSel = !$("#loginMask").hidden
+      ? ".login-box"   // 登录遮罩是全屏模态：Tab 不能穿透到被遮住的侧边栏/底栏
+      : $("#qrMask").hidden
+      ? (!$("#confirmMask").hidden ? "#confirmDialog" : (!$("#moreSheet").hidden ? "#moreSheet" : null))
+      : "#qrDialog";
     if (!dlgSel) return;
     var f = $$(FOCUSABLE, $(dlgSel));
     if (!f.length) return;
@@ -1944,7 +2877,7 @@
     overviewTimer = setInterval(function () {
       if (document.hidden || !$("#loginMask").hidden) return;
       if (curPanel === "overview") loadOverview(true).catch(function () {});
-    }, 10000);
+    }, OVERVIEW_POLL_MS);
   }
   // 统一清理所有定时器：overviewTimer / qrTimer / _logTimer / _focusTimer
   // 分散在各处，必须有一个地方能一次停干净
@@ -1960,7 +2893,13 @@
     _debounceTimer = null;
     clearTimeout(_focusTimer);
     _focusTimer = null;
-    closeQR();
+    // closeQR 的 cancel 请求在 beforeunload 场景发不出去（无 keepalive）：
+    // 本地收尾即可，服务端孤儿会话由 10 分钟自然过期兜底
+    _qrOpenToken++;
+    clearTimeout(qrTimer);
+    qrTimer = null;
+    qrTicket = null;
+    $("#qrMask").hidden = true;
   }
 
   /* ─────────── 启动 ─────────── */
@@ -1980,7 +2919,9 @@
     measureScroll();
     try {
       var meta = await jget("/api/meta");
-      $("#chipVersion").innerHTML = '<span class="dot"></span>v' + esc(meta.version);
+      // 版本只对已登录会话下发（公开路由不泄漏版本号）：空值时隐藏徽标而不是显示孤零零的「v」
+      $("#chipVersion").innerHTML = meta.version ? '<span class="dot"></span>v' + esc(meta.version) : "";
+      $("#chipVersion").hidden = !meta.version;
       if (!meta.authed) { showLogin(); return; }
       boot();
     } catch (e) {
@@ -1988,9 +2929,40 @@
       // 会 clearToasts()，先弹的会被自己清掉；toastBox(z:500) 在登录遮罩(z:200)
       // 之外且层级更高，登录框上能正常看到这条错误
       showLogin();
+      // 顶栏状态芯片不能停在「加载中」：loadOverview 的 catch 有复位（其错误态
+      // 渲染含复位置），init 失败走不到 loadOverview，这里手动复位为「状态未知」
+      var mc = $("#chipMaster");
+      if (mc) { mc.classList.remove("ok"); mc.innerHTML = '<span class="dot"></span>状态未知'; }
       toast("无法连接面板服务：" + e.message, "error");
     }
   }
-  window.addEventListener("beforeunload", stopAllPolls);
+  // unload 期间 fetch 基本发不出去：只停本地定时器/在途请求（closeQR 的 cancel
+  // 请求卸载场景下无谓且发不出去，不调用）
+  // pagehide 而非 beforeunload：后者触发后页面进 bfcache，恢复（pageshow）时
+  // 定时器不会自动重建，面板会静默停更到手动刷新。pagehide 停、pageshow 按当前
+  // 面板重建轮询（overviewTimer 的 interval 回调自带 hidden/登录态守卫）
+  window.addEventListener("pagehide", stopAllPolls);
+  window.addEventListener("pageshow", function (e) {
+    // 只有 bfcache 恢复需要重建轮询/数据：首次加载 pageshow 同样会触发，此时
+    // init() 的 /api/meta 还没回来，这里跑 loader 会与 boot() 的重入双发一次
+    // 请求（登出态还必吃一次 401）。loginShown 守卫兜住「恢复时已登出」的形态
+    if (!e.persisted || loginShown) return;
+    // 无条件重启总览轮询：回调自带 hidden/登录态守卫。原先的
+    // `!$("#loginMask").hidden` 判断的是「登录遮罩可见=已登出」——恰好写反，
+    // 已登录（遮罩 hidden=true）反而不恢复，bfcache 恢复后总览静默停更
+    startOverviewPoll();
+    // 面板 loader 的在途请求不在 stopAllPolls 范围内（它只停搜索/解析/试听/QR
+    // 与本地定时器）：重入当前面板拉一次最新数据，旧响应由各 loader 的代际守卫
+    // 丢弃（logs 的轮询由 loadLogsPanel 内的 scheduleLogPoll 自行恢复）
+    var fn = PANEL_LOADERS[curPanel];
+    if (typeof fn === "function") Promise.resolve(fn()).catch(function () {});
+  });
+  // 漏网的 promise 异常兜底观测：只 console.warn 记录，不 preventDefault（不吞，
+  // 控制台仍能看到原始 reason），避免个别路径的 rejection 静默消失无迹可查
+  window.addEventListener("unhandledrejection", function (e) {
+    console.warn("[MusicHub] unhandled rejection:", e && e.reason);
+  });
+  // 静态 HTML 里的两个原生 select（投递会话 / 凭证类型）也换成手写下拉框
+  enhanceSelects(document);
   init();
 })();

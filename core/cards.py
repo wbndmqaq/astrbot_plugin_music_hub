@@ -7,8 +7,32 @@
 from __future__ import annotations
 
 from . import SOURCE_NAMES, SOURCES
+from .color import _public_http_url
 from .help_data import VERSION
 from .quality import quality_label
+
+
+def _safe_img_url(value) -> str:
+    """封面/头像 URL 清洗：非法 scheme 或指向内网的值置空。
+
+    卡片数据进模板后 `src="{{ ... }}"` 由渲染浏览器真实 GET，与 render.py 注入
+    CSS 的 hero 背景、封面取色下载同一威胁模型（半可信第三方数据）；只在渲染
+    出口拦截挡不住这条路径，必须在构造层先清洗，否则形成盲 SSRF。"""
+    if isinstance(value, str) and _public_http_url(value):
+        return value
+    return ""
+
+
+# 条目类卡片（generic/status）的行是调用方拼好的 dict，图片键统一在此清洗
+_IMG_KEYS = ("cover", "avatar")
+
+
+def _sanitize_img_fields(item: dict) -> dict:
+    out = dict(item)
+    for k in _IMG_KEYS:
+        if k in out:
+            out[k] = _safe_img_url(out[k])
+    return out
 
 
 # ──────────── 卡片数据构造 ────────────
@@ -30,7 +54,7 @@ def build_list_card_data(
                 "songName": s.get("name", ""),
                 "singerName": s.get("artist", ""),
                 "albumName": s.get("album", ""),
-                "cover": s.get("cover", ""),
+                "cover": _safe_img_url(s.get("cover", "")),
                 "duration": s.get("duration", ""),
                 "payplay": bool(s.get("pay")),
                 "trial": bool(s.get("trial")),
@@ -58,7 +82,7 @@ def build_versions_card_data(keyword: str, groups: list[dict], *, tip: str = "")
                 "songName": g.get("name", ""),
                 "singerName": g.get("artist", ""),
                 "albumName": g.get("album", ""),
-                "cover": g.get("cover", ""),
+                "cover": _safe_img_url(g.get("cover", "")),
                 "duration": g.get("duration", ""),
                 "payplay": not g.get("anyFree", True),
                 "trial": False,
@@ -86,7 +110,7 @@ def build_detail_card_data(song: dict, play: dict, source_label: str = "") -> di
         "songName": song.get("name", ""),
         "singerName": song.get("artist", ""),
         "albumName": song.get("album", ""),
-        "cover": song.get("cover", ""),
+        "cover": _safe_img_url(song.get("cover", "")),
         "songId": song.get("sid2") or song.get("sid", ""),
         "duration": song.get("duration", ""),
         "qualityLabel": play.get("label") or play.get("qualityLabel") or "",
@@ -106,7 +130,7 @@ def build_lyric_card_data(
         "songName": song.get("name", ""),
         "singerName": song.get("artist", ""),
         "albumName": song.get("album", ""),
-        "cover": song.get("cover", ""),
+        "cover": _safe_img_url(song.get("cover", "")),
         "lines": lines,
         "lineCount": len(lines),
         "page": page,
@@ -121,12 +145,12 @@ def build_comment_card_data(song: dict, comments: dict) -> dict:
         "sourceName": SOURCE_NAMES.get(song.get("source", ""), ""),
         "songName": song.get("name", ""),
         "singerName": song.get("artist", ""),
-        "cover": song.get("cover", ""),
+        "cover": _safe_img_url(song.get("cover", "")),
         "comments": [
             {
                 "index": c.get("index", i + 1),
                 "nick": c.get("nick", ""),
-                "avatar": c.get("avatar", ""),
+                "avatar": _safe_img_url(c.get("avatar", "")),
                 "time": c.get("time", ""),
                 "likes": c.get("likes", 0),
                 "content": c.get("content", ""),
@@ -149,7 +173,7 @@ def build_generic_card_data(
         "source": source,
         "sourceName": SOURCE_NAMES.get(source, ""),
         "total": len(items),
-        "items": items,
+        "items": [_sanitize_img_fields(it) for it in items],
         "tip": tip,
     }
 
@@ -169,7 +193,7 @@ def build_playlist_card_data(
                 "index": p.get("index", i + 1),
                 "name": p.get("name", ""),
                 "creator": p.get("creator", ""),
-                "cover": p.get("cover", ""),
+                "cover": _safe_img_url(p.get("cover", "")),
                 "trackCount": p.get("trackCount", 0),
                 "playCountText": _fmt_count(p.get("playCount", 0)),
             }
@@ -183,7 +207,7 @@ def build_status_card_data(sources_status: list[dict]) -> dict:
     return {
         "title": "Music Hub 登录状态",
         "version": VERSION,
-        "sources": sources_status,
+        "sources": [_sanitize_img_fields(s) for s in sources_status],
         "tip": "扫码登录：发送 ncm登录 / kg登录 / qq登录，或打开 WebUI 扫码。",
     }
 

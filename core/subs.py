@@ -13,11 +13,15 @@ import datetime
 from astrbot.api import logger
 
 from . import SOURCE_KG, SOURCE_NAMES, SOURCE_NCM
+from .errors import ApiError
 
 TAG = "[music_hub]"
 _KV_KEY = "subs_v1"
 _SEEN_CAP = 200
 _PUSH_LIMIT = 10
+# 日推取数失败后，同一会话当天最多重发的失败占位条数：超过即放弃当天（标记完成），
+# 避免调度器每小时重试时给订阅者发一整天「获取失败」
+_DAILY_FAIL_RETRY_CAP = 3
 
 
 def _same_artist(want: str, got: str) -> bool:
@@ -25,8 +29,18 @@ def _same_artist(want: str, got: str) -> bool:
 
     只按归一化用的多歌手分隔符「 / 」拆分：「周杰伦&费玉清」是另一个独立歌手实体
     （可单独订阅/退订），不能因为包含「周杰伦」就算命中，否则退订后仍会继续推送。
+
+    整串相等优先于拆分：含分隔符本身的歌手名（AC/DC、Simon & Garfunkel 类的
+    "Simon/Dunne"）拆分后不存在同名 part、永远匹配不上——先比整串再兜底拆分。
+    拆分兜底只用于 want 本身是多歌手串的形态（两侧顺序不同/分隔符变体）：
+    单名 want 反向拆 got 会把组合的分隔片段误判成命中（want="AC" vs
+    got="AC/DC" 的 part "AC"），造成退订后仍继续推送。
     """
     if not want:
+        return False
+    if got.strip() == want:
+        return True
+    if "/" not in want:
         return False
     return any(part.strip() == want for part in got.split("/"))
 
@@ -56,9 +70,19 @@ def _normalize_rows(data) -> dict:
             # 日推当日已推标记（YYYY-MM-DD）：定时任务失败会当日重试整轮，
             # 没有它每次重试都会把同一份日推重发给订阅者（最多十几次）
             "daily_date": str(row.get("daily_date") or ""),
+            # 日推取数失败的当日重试计数（配合 _DAILY_FAIL_RETRY_CAP 防轰炸）
+            "daily_fail_date": str(row.get("daily_fail_date") or ""),
+            "daily_fail_count": _opt_int(row.get("daily_fail_count")),
             "artists": artists,
         }
     return rows
+
+
+def _opt_int(v) -> int:
+    try:
+        return int(v or 0)
+    except (TypeError, ValueError):
+        return 0
 
 
 class Subscriptions:
@@ -128,26 +152,42 @@ class Subscriptions:
         # 「日推文案」与「关注的歌手新歌」对所有订阅会话是同一份数据：整轮各取一次。
         # 每个会话各取一次是 N 倍请求，会撞酷狗 20028 风控。
         daily = None
+        daily_ok = True
         if any(row.get("daily") and row.get("daily_date") != today for row in list(self._subs.values())):
-            daily = await self._push_daily()
+            daily, daily_ok = await self._push_daily()
         songs = None
         if any(row.get("artists") for row in list(self._subs.values())):
             songs = await self._fetch_followed_songs()
         for umo, row in list(self._subs.items()):
             try:
-                await self._push_one(umo, row, songs, daily, today)
+                await self._push_one(umo, row, songs, daily, today, daily_ok=daily_ok)
             except Exception as e:  # noqa: BLE001 - 单会话失败不影响其他
                 logger.warning(f"{TAG} 订阅推送失败（{umo}）：{e}")
+        if daily is not None and not daily_ok:
+            # 日推取数失败不算完成：上抛让调度器当日重试（重试轮里 successful 的
+            # 歌手新歌因 seen 已记不会重发）。不上抛的话一次瞬时网络错误就把
+            # 当天的日推整个吞掉——调度器的重试机制只认异常。
+            raise RuntimeError("日推获取失败，待当日重试")
 
     async def _push_one(
-        self, umo: str, row: dict, songs: list[dict] | None = None, daily: str | None = None, today: str = ""
+        self,
+        umo: str,
+        row: dict,
+        songs: list[dict] | None = None,
+        daily: str | None = None,
+        today: str = "",
+        daily_ok: bool | None = None,
     ) -> None:
-        """推送单个会话。songs/daily 是 push_all 整轮各取一次的共享结果，生产路径
+        """推送单个会话。songs/daily/daily_ok 是 push_all 整轮各取一次的共享结果，生产路径
         恒传实参（push_all 对「任一行订阅了对应内容」预检后才取，订阅行必拿到实取值）；
         留默认 None 仅为测试直调留门——未预取时本调用内自行补取一次。
+        daily_ok 必须与 daily 同源传入：push_all 取数失败时 daily 是失败文案而非 None，
+        缺了它失败日会被误标「已完成」，调度器重试与失败上限全部失效。
 
         日推按 daily_date 当日去重：定时任务失败（签到 403 等）会当日重试整轮，
-        成功发送过一次（含失败占位文案）就不再重发，否则订阅者一天收到十几次重复日推。
+        成功发送过一次就不再重发，否则订阅者一天收到十几次重复日推。
+        **取数失败不算完成**（daily_ok=False）：不落 daily_date，留给调度器当日重试；
+        失败重发有 _DAILY_FAIL_RETRY_CAP 次上限，超过即放弃当天防轰炸。
         """
         if not today:
             today = datetime.date.today().isoformat()
@@ -155,7 +195,9 @@ class Subscriptions:
         daily_due = bool(row.get("daily")) and row.get("daily_date") != today
         if daily_due:
             if daily is None:
-                daily = await self._push_daily()
+                daily, daily_ok = await self._push_daily()
+            elif daily_ok is None:
+                daily_ok = True  # 直调只传了文案没传标记：视为成功（兼容旧测试路径）
             parts.append(daily)
         artists = list(row.get("artists", []))
         fresh_sids: list[tuple[dict, list[str]]] = []
@@ -177,24 +219,42 @@ class Subscriptions:
             # 发送成功才把本批 sid / 当日标记并入并落盘；订阅/退订指令的写也在锁内，
             # 不串行化会丢更新。本段无 await 网络（_save 只入队），锁内循环不阻塞事件循环。
             async with self._lock:
-                for artist, sids in fresh_sids:
-                    merged = list(dict.fromkeys([*(artist.get("seen") or []), *sids]))
-                    artist["seen"] = merged[-_SEEN_CAP:]
-                if daily_due:
-                    row["daily_date"] = today
-                await self._save()
+                # 推送期间订阅者可能已退订（row 被 pop 出 _subs）：给孤儿 row 记的
+                # 状态永远不会落盘，白记还会在下轮重发——退订的会话不再补写
+                if self._subs.get(umo) is row:
+                    for artist, sids in fresh_sids:
+                        merged = list(dict.fromkeys([*(artist.get("seen") or []), *sids]))
+                        artist["seen"] = merged[-_SEEN_CAP:]
+                    if daily_due:
+                        if daily_ok:
+                            row["daily_date"] = today
+                            row["daily_fail_count"] = 0
+                        else:
+                            fails = row["daily_fail_count"] + 1 if row.get("daily_fail_date") == today else 1
+                            row["daily_fail_date"] = today
+                            row["daily_fail_count"] = fails
+                            if fails >= _DAILY_FAIL_RETRY_CAP:
+                                # 当天已重试到上限：标记完成，别再给订阅者发失败文案
+                                row["daily_date"] = today
+                    await self._save()
 
-    async def _push_daily(self) -> str:
+    async def _push_daily(self) -> tuple[str, bool]:
+        """日推文案。ok=False 表示**取数失败**（区别于「今日暂无」的空结果）：
+        失败不算完成当日推送，见 _push_one 的重试与上限逻辑。"""
         try:
             songs = await self._service.client_of(SOURCE_NCM).daily_recommend()
         except Exception as e:  # noqa: BLE001
-            return f"· 日推：获取失败（{e}）"
+            # 非 ApiError 原文可能带 host:port 等内部地址，不进订阅群文案
+            if isinstance(e, ApiError):
+                return f"· 日推：获取失败（{e.user_msg()}）", False
+            logger.warning(f"{TAG} 日推取数失败: {e}")
+            return "· 日推：获取失败（详见运行日志）", False
         if not songs:
-            return "· 日推：今日暂无推荐（需网易云保持登录）"
+            return "· 日推：今日暂无推荐（需网易云保持登录）", True
         lines = [f"· 日推 TOP{min(len(songs), _PUSH_LIMIT)}"]
         for i, s in enumerate(songs[:_PUSH_LIMIT], 1):
             lines.append(f"  {i}. {s.get('name')} - {s.get('artist')}")
-        return "\n".join(lines)
+        return "\n".join(lines), True
 
     async def _push_artist(self, artist: dict, songs: list[dict] | None = None) -> tuple[str, list[str]]:
         """单个歌手的新歌文案与本批 sid。

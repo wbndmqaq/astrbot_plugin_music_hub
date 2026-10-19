@@ -8,7 +8,7 @@ desc: |
   运行日志。完整指令与说明见仓库 README。
 
   依赖：QQ 音乐内置 qqmusic-api-python，开箱即用；网易云 / 酷狗各需一个 HTTP API
-  服务，默认地址已预填（公共实例 / 本机自建），见 README「三音源接入」。
+  服务（自建或社群公益实例），见 README「三音源接入」。
 version: 1.0.0
 author: wbndm
 repo: https://github.com/wbndmqaq/astrbot_plugin_music_hub
@@ -24,6 +24,8 @@ support_platforms:
   - weixin_oc
   - lark
   - dingtalk
+  - satori
+  - webchat
 tags:
   - 音乐
   - 点歌

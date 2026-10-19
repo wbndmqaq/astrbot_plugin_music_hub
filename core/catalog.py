@@ -93,8 +93,12 @@ async def _album_ncm(client: Any, kw: str) -> Resolution:
         return Resolution(None, [], [], not_found=True)
     if len(cands) > 1:
         return Resolution(None, [], cands)
-    detail = await client.album_detail(cands[0]["id"])
-    return Resolution(detail.get("album") or cands[0], detail.get("songs", []), [])
+    first = cands[0] if isinstance(cands[0], dict) else None
+    if not (first and first.get("id")):
+        # 首条缺 id（上游行残缺）：按候选列表返回而非让 KeyError 炸到路由兜底
+        return Resolution(None, [], cands)
+    detail = await client.album_detail(first["id"])
+    return Resolution(detail.get("album") or first, detail.get("songs", []), [])
 
 
 async def _album_kg(client: Any, kw: str) -> Resolution:
@@ -105,6 +109,9 @@ async def _album_kg(client: Any, kw: str) -> Resolution:
     if len(cands) > 1:
         return Resolution(None, [], cands)
     meta = cands[0]
+    if not (isinstance(meta, dict) and meta.get("id")):
+        # 首条缺 id（上游行残缺）：同 _album_ncm 口径按候选列表返回
+        return Resolution(None, [], cands)
     return Resolution(meta, await client.album_songs(meta["id"], DETAIL_LIMIT), [])
 
 
@@ -141,8 +148,12 @@ async def _playlist_kg(client: Any, kw: str) -> Resolution:
         return Resolution(None, [], [], not_found=True)
     if len(cands) > 1:
         return Resolution(None, [], cands)
-    songs, name, _cover = await client.playlist_songs(cands[0]["id"], DETAIL_LIMIT)
-    return Resolution({"name": name or cands[0].get("name", "")}, songs, [])
+    first = cands[0] if isinstance(cands[0], dict) else None
+    if not (first and first.get("id")):
+        # 首条缺 id（上游行残缺）：同专辑分支口径按候选列表返回
+        return Resolution(None, [], cands)
+    songs, name, _cover = await client.playlist_songs(first["id"], DETAIL_LIMIT)
+    return Resolution({"name": name or first.get("name", "")}, songs, [])
 
 
 async def _playlist_qq(client: Any, kw: str) -> Resolution:
@@ -168,6 +179,10 @@ async def _artist_kg(client: Any, kw: str) -> Resolution:
     """
     cands = await client.search(kw, ARTIST_CANDIDATE_LIMIT, "author")
     if not cands:
+        return Resolution(None, [], [], not_found=True)
+    # 首条非 dict / 缺 id 的守卫与同文件其余五处同族口径一致：上游行残缺时按
+    # 「没找到歌手」处理，不让 KeyError/TypeError 穿到路由兜底变「执行失败」
+    if not isinstance(cands[0], dict) or not cands[0].get("id"):
         return Resolution(None, [], [], not_found=True)
     artist = cands[0]
     return Resolution(artist, await client.artist_songs(artist["id"], DETAIL_LIMIT), [])
@@ -294,7 +309,9 @@ async def _new_albums_kg(client: Any, area: str) -> list[dict]:
     area_id = NEW_ALBUM_AREAS[SOURCE_KG].get(area, 0)
     if area_id:
         params["type"] = area_id
-    body = await client.request("/top/album", params, anon=True)
+    # kg.request 无 anon 参数（鉴权由 inject_cookie 控制）：传了必抛 TypeError，
+    # 酷狗音源「新碟」指令整体崩溃
+    body = await client.request("/top/album", params)
     data = data_of(body)
     items = list_of(data.get("info") or data.get("chn"))
     return [a for a in (normalize_album(x, i) for i, x in enumerate(items)) if a]
@@ -379,6 +396,22 @@ RANDOM_FETCHERS: dict[str, Any] = {
 }
 
 
+# 「随机」双轨的非个性化侧：RANDOM_FETCHERS 取的是登录账号的私人电台/日推
+# （管理员账号的画像内容），普通群成员若也走那张表，等于任何人都能公放管理员的
+# 私人电台——与 mh_daily/mh_fm 的 admin 闸门政策冲突。普通用户固定走这张表：
+# 各平台「新歌速递」榜（new_songs）是免登录的公开榜单，与登录账号无关。
+# 三平台的 new_songs 均有免参默认值，共用同一个实现。
+async def _random_public(client: Any, call: Any, src: str) -> list[dict]:
+    return await call(src, "explore", client.new_songs())
+
+
+RANDOM_PUBLIC_FETCHERS: dict[str, Any] = {
+    SOURCE_NCM: _random_public,
+    SOURCE_KG: _random_public,
+    SOURCE_QQ: _random_public,
+}
+
+
 async def _fm_ncm(client: Any) -> Any:
     return await client.personal_fm()
 
@@ -428,16 +461,22 @@ class ArtistAlbums(NamedTuple):
 async def _artist_albums_ncm(client: Any, call: Any, src: str, kw: str) -> ArtistAlbums:
     """网易云：搜歌手（type_=100 是歌手类型号）再取其专辑，两段各自记账。"""
     cands = await call(src, "explore", client.search(kw, 5, 100))
-    if not cands:
+    # 首条缺 id（上游行残缺）时按「没找到歌手」处理，不让 KeyError 被包装器
+    # 吃成「执行失败」（与 explore_social 的 target.get("id") 同口径）。
+    # 空列表守卫与下方 kg 分支同款：搜不到歌手是常态输入，cands[0] 裸下标
+    # 会 IndexError 穿到路由兜底，用户看到的不是既定的 not_found 文案
+    first_id = cands[0].get("id") if cands and isinstance(cands[0], dict) else None
+    if not first_id:
         return ArtistAlbums([], False)
-    return ArtistAlbums(await call(src, "explore", client.artist_albums(cands[0]["id"], 15)), True)
+    return ArtistAlbums(await call(src, "explore", client.artist_albums(first_id, 15)), True)
 
 
 async def _artist_albums_kg(client: Any, call: Any, src: str, kw: str) -> ArtistAlbums:
     cands = await call(src, "explore", client.search(kw, ARTIST_CANDIDATE_LIMIT, "author"))
-    if not cands:
+    first_id = cands[0].get("id") if cands and isinstance(cands[0], dict) else None
+    if not first_id:
         return ArtistAlbums([], False)
-    return ArtistAlbums(await call(src, "explore", client.artist_albums(cands[0]["id"], 15)), True)
+    return ArtistAlbums(await call(src, "explore", client.artist_albums(first_id, 15)), True)
 
 
 async def _artist_albums_qq(client: Any, call: Any, src: str, kw: str) -> ArtistAlbums:
@@ -529,6 +568,7 @@ __all__ = [
     "PLAYLIST_COMMENT_TYPES",
     "PLAYLIST_RECOMMENDERS",
     "RANDOM_FETCHERS",
+    "RANDOM_PUBLIC_FETCHERS",
     "RECOMMEND_CATEGORY_SOURCES",
     "RESOLVERS",
     "Resolution",

@@ -36,8 +36,13 @@ async def _act_lyric(service, event, song):
         return
     lines = _parse_lrc_lines(lyric.get("lrc", ""))
     trans = _parse_lrc_lines(lyric.get("tlyric", ""))
-    if trans and len(trans) <= 12:
-        lines = lines + ["── 翻译 ──"] + trans
+    if trans:
+        # 翻译超长时截断保留前 12 行，而不是整段丢弃（原先 >12 行整体不要，
+        # 用户会以为这首歌没有翻译）；截断处补一行说明
+        shown_trans = trans[:12]
+        if len(trans) > 12:
+            shown_trans = shown_trans + ["（翻译仅展示前 12 行）"]
+        lines = lines + ["── 翻译 ──"] + shown_trans
     if not lines:
         await service.reply(event, "暂无歌词")
         return
@@ -192,12 +197,19 @@ async def _act_climax(service, event, song):
         return
 
     def _fmt(ms):
-        s = int(ms / 1000)
+        # 上游字段存在但为 null 时 .get(key, 0) 拿到的是 None 而非 0，
+        # 不兜底会在 int(None / 1000) 上 TypeError，用户只看到通用报错
+        s = int((ms or 0) / 1000)
         return f"{s // 60}:{s % 60:02d}"
 
+    start = info.get("start_ms") or 0
+    end = info.get("end_ms") or 0
+    if not start and not end:
+        await service.reply(event, "未找到该歌的高潮片段信息")
+        return
     await service.reply(
         event,
-        f"♪ {song.get('name')} 高潮片段：{_fmt(info.get('start_ms', 0))} ~ {_fmt(info.get('end_ms', 0))}",
+        f"♪ {song.get('name')} 高潮片段：{_fmt(start)} ~ {_fmt(end)}",
     )
 
 

@@ -7,13 +7,17 @@ from astrbot.api.event import filter
 from ..core.resolve import HINTS, _looks_like_share, collect_text, handle_resolve, is_plugin_command
 from .base import Route
 
+# 分享文本的最短长度：三平台短链最短形如 `https://b23.tv/xxxx` 也不止 8 字符，
+# 低于阈值连最短短链都不可能是，直接跳过省掉后面的正则
+_MIN_SHARE_LEN = 8
+
 
 async def run_resolve(service, event):
     if not service.config.enable or not service.config.enable_resolve:
         return
     # resolveCards 只管 JSON 音乐卡片；文本里的分享链接始终解析
     text = collect_text(event, include_json=service.config.resolve_cards)
-    if not text or len(text) < 8:
+    if not text or len(text) < _MIN_SHARE_LEN:
         return
     if is_plugin_command(text):
         return

@@ -77,6 +77,10 @@ def _browser_dead(e: BaseException) -> bool:
 # ──────────── 模板（跨实例共享，模板内容不变时无需重编译） ────────────
 _compiled_templates: dict[str, object] = {}
 
+# 卡片视口宽度：_BASE_CSS 的 .page 与 Playwright viewport 共用同一来源，
+# 改卡片宽只需动这里（高度给足即可，截图按内容裁）
+_CARD_WIDTH = 640
+
 # 9 个渲染模板共用的基础样式（:root 调色板 / 字体栈 / 页宽），由渲染通道在
 # 编译时统一注入首个 </style> 前 —— 曾因逐模板复制粘贴发生 :root 漂移。
 # 各模板的 hero 渐变 / 噪点参数并不一致，不能一并抽上来，仍留在各自模板里。
@@ -91,8 +95,10 @@ _BASE_CSS = """\
 html{width:fit-content}
 body{font-family:"MiSans","HarmonyOS Sans SC","Microsoft YaHei UI","PingFang SC",sans-serif;
   background:var(--mh-soft);color:var(--mh-text);-webkit-font-smoothing:antialiased}
-.page{width:640px;padding:26px 22px}
+.page{width:__CARD_WIDTH__px;padding:26px 22px}
 """
+# CSS 里的花括号不能走 f-string：宽度占位符编译期一次替换
+_BASE_CSS = _BASE_CSS.replace("__CARD_WIDTH__", str(_CARD_WIDTH))
 
 
 def _compile_template(tmpl_path: str):
@@ -130,6 +136,10 @@ class Renderer:
         self._browser = None
         self._lock = asyncio.Lock()
         self._disabled = False
+        # 渲染并发上限：每个 Chromium page（640×2200 @3x）栅格表面 ~50MB，
+        # 多群同时出卡（聚合搜索/连播列表）时无上限并发放大内存尖峰，低内存
+        # 主机可能 OOM。卡片渲染本就是亚秒级操作，串行化 2 路不影响吞吐
+        self._slots = asyncio.Semaphore(2)
 
     @property
     def disabled(self) -> bool:
@@ -194,8 +204,14 @@ class Renderer:
         browser = await self._ensure_browser()
         if browser is None:
             return False
+        async with self._slots:
+            return await self._render_locked(browser, html, out_path, bg)
+
+    async def _render_locked(self, browser, html: str, out_path: str, bg: str) -> bool:
         try:
-            page = await browser.new_page(viewport={"width": 640, "height": 2200}, device_scale_factor=3)
+            page = await browser.new_page(
+                viewport={"width": _CARD_WIDTH, "height": 2200}, device_scale_factor=3
+            )
         except Exception as e:  # noqa: BLE001
             if not _browser_dead(e):
                 raise
@@ -207,9 +223,13 @@ class Renderer:
         try:
             try:
                 await page.set_content(html, wait_until="networkidle", timeout=12000)
-            except Exception:  # noqa: BLE001
-                with contextlib.suppress(Exception):
+            except Exception:
+                try:
                     await page.set_content(html, wait_until="load", timeout=8000)
+                except Exception:
+                    # 两次装载都失败时页面停在 about:blank，继续走下去会截出
+                    # 空白 PNG 还返回 True——raise 交给外层走「删产物+回退文本」
+                    raise
             safe_bg = bg if isinstance(bg, str) and bg.startswith("#") and len(bg) == 7 else "#faf4f2"
             await page.evaluate(
                 """(bg) => {
@@ -226,7 +246,13 @@ class Renderer:
                 await page.evaluate("document.fonts.ready.then(() => {})")
             await page.wait_for_timeout(200)
 
-            el = await page.query_selector(".page") or await page.query_selector(".card") or page
+            el = await page.query_selector(".page") or await page.query_selector(".card")
+            if el is None:
+                # 模板漏写 .page/.card 锚点时退回整页截图。不能把 el 兜底成 page：
+                # Page 没有 bounding_box()，对它取尺寸必抛 AttributeError，
+                # 渲染整体失败静默回退文本，且极难排查
+                await page.screenshot(path=out_path, type="png", full_page=True, animations="disabled")
+                return True
             box = await el.bounding_box()
             if box:
                 need_w = int(box["x"] + box["width"] + 4)
@@ -248,10 +274,16 @@ class Renderer:
             await asyncio.to_thread(_remove_output, out_path)
             return False
         except BaseException:
-            await asyncio.to_thread(_remove_output, out_path)
+            # 取消路径下 await 任何协程都会立即再抛 CancelledError，清理执行不到
+            # ——用 fire-and-forget 的执行器调用，半截产物在取消后仍被删除
+            # （孤儿由 startup_sweep 兜底，这里只是不等 1 小时）
+            asyncio.get_running_loop().run_in_executor(None, _remove_output, out_path)
             raise
         finally:
-            with contextlib.suppress(Exception):
+            # CancelledError（BaseException）不被 suppress(Exception) 接住：
+            # 取消路径下 await page.close() 自身立刻再抛 CancelledError，
+            # page 对象泄漏到 Chromium 进程直到浏览器整体关闭
+            with contextlib.suppress(asyncio.CancelledError, Exception):
                 await page.close()
 
     async def close(self) -> None:
@@ -288,6 +320,11 @@ _THEME_VARS = (
 )
 _HERO_BG_CARDS = ("detail", "lyric", "comment")
 
+# _hero_bg_css 的字符剥离表：反斜杠/引号（断字符串）+ 换行/回车/制表符（断 CSS
+# badstring 后注入新声明）。urlsplit 预检前会剥 \t\r\n，检查照过但注入的 safe
+# 若保留原字符仍可被利用——在剥离层一次解决
+_CSS_STRIP_TABLE = str.maketrans("", "", "\\\"'\r\n\t")
+
 DEFAULT_PAGE_BG = "#faf4f2"
 
 
@@ -323,6 +360,67 @@ async def apply_theme(data: dict) -> None:
         pass
 
 
+# 会内联为 data URI 的图片字段（coverUrl 是 apply_theme 写入 hero 背景来源的字段）
+_INLINE_FIELDS = ("cover", "avatar", "coverUrl")
+
+
+async def inline_cover_images(data: dict) -> None:
+    """把卡片数据里全部图片 URL 代理下载成 data URI（逐跳内网复检 + 缓存）。
+
+    Chromium 对 ``<img src>``/hero 背景自动跟随重定向——公网封面 302 到内网可
+    绕过构造层的 host 字面预检（下载/取色路径逐跳复检，唯独渲染通道此前缺失）。
+    内联后 Chromium 对封面零网络请求，渲染与下载通道的威胁模型对齐。下载失败
+    的字段置空走模板 onerror 占位，绝不把未复检的 URL 留给浏览器。"""
+    refs: list[tuple[dict, str, str]] = []
+
+    def _collect(node, depth: int = 0) -> None:
+        if depth > 4:  # 卡片数据层级有限，深度护栏防异常结构拖爆遍历
+            return
+        if isinstance(node, dict):
+            for k, v in node.items():
+                if isinstance(v, str) and k in _INLINE_FIELDS and v.startswith("http"):
+                    refs.append((node, k, v))
+                elif isinstance(v, (dict, list)):
+                    _collect(v, depth + 1)
+        elif isinstance(node, list):
+            for it in node:
+                if isinstance(it, (dict, list)):
+                    _collect(it, depth + 1)
+
+    _collect(data)
+    if not refs:
+        return
+    try:
+        from .api.http import get_session
+
+        session = get_session()
+        urls = list({u for _, _, u in refs})
+        # return_exceptions=True：单张封面失败只把该字段置空。整体 gather 失败
+        # 再整卡回退原始 URL，会把同卡内其他「从未复检」的 URL 交回 Chromium
+        # 直连——逐跳复检被整体绕过，等于退回本修复落地前的状态
+        results = await asyncio.gather(
+            *(mh_color.cover_data_uri(u, session) for u in urls), return_exceptions=True
+        )
+        mapping: dict[str, str] = {}
+        for u, r in zip(urls, results, strict=True):
+            if isinstance(r, BaseException):
+                logger.warning(f"{TAG} 封面内联失败（该字段置空）: {type(r).__name__}: {r}")
+                mapping[u] = ""
+            else:
+                mapping[u] = r
+        for node, key, url in refs:
+            node[key] = mapping.get(url, "")
+    except Exception as e:  # noqa: BLE001 — 内联编排失败不能拖垮渲染
+        logger.warning(f"{TAG} 封面内联编排失败（字面预检后回退直连渲染）: {e}")
+        # 回退路径至少重过一遍 host 字面预检：内网/畸形 URL 直接置空，
+        # 只有公网字面量才留给 Chromium（字面预检的 redirect 残面同口径接受）
+        from .color import _public_http_url
+
+        for node, key, url in refs:
+            if not url.startswith(("http://", "https://")) or not _public_http_url(url):
+                node[key] = ""
+
+
 def theme_bg(data: dict, source: str) -> str:
     theme = data.get("theme") if isinstance(data, dict) else None
     soft = theme.get("soft") if isinstance(theme, dict) else None
@@ -332,9 +430,22 @@ def theme_bg(data: dict, source: str) -> str:
 
 
 def _hero_bg_css(url: str) -> str:
-    safe = url.replace("\\", "").replace('"', "").replace("'", "")
-    if not safe.startswith("http"):
-        return ""
+    # 剥换行/制表符：CSS 带引号 url 字符串遇裸换行变 badstring，其后文本被当
+    # 普通 CSS token 解析、可注入新的 url() 声明（urlsplit 预检前会剥 \t\r\n，
+    # 检查照过但注入的 safe 保留原字符——必须在这里一并剥掉）
+    safe = url.translate(_CSS_STRIP_TABLE)
+    # 渲染管线已把封面内联为 data URI（cover_data_uri 产物：白名单前缀 + base64，
+    # 不含引号/反斜杠，CSS 字符串上下文无断词面）。仍保留 http 分支的字面预检作
+    # 为未内联路径的纵深防御
+    if not (safe.startswith("data:image/") and ";base64," in safe):
+        if not safe.startswith("http"):
+            return ""
+        # 注入 CSS 后由本机 Chromium 拉取，与封面下载同一威胁模型（半可信第三方数据）：
+        # 内网地址不放行——取色下载已拦，这里不加会从渲染路径绕回去
+        from .color import _public_http_url
+
+        if not _public_http_url(safe):
+            return ""
     return (
         ".hero{isolation:isolate;position:relative;overflow:hidden;}"
         f'.hero::before{{content:"";position:absolute;inset:0;z-index:-1;'
@@ -356,8 +467,10 @@ def inject_theme_css(html: str, data: dict, tmpl_name: str, source: str) -> str:
         pairs.extend(f"--mh-{k.replace('_', '-')}:{v}" for k, v in brand.items() if v)
     theme = data.get("theme")
     if isinstance(theme, dict):
+        # 值来自内部取色（hex/rgba），仍做 CSS 注入纵深防御：剥 ; 与花括号，
+        # autoescape 只管 HTML 文本节点，管不住 style 块里的 CSS 断词
         pairs.extend(
-            f"--mh-{k.replace('_', '-')}:{str(theme[k]).replace(';', '')}"
+            f"--mh-{k.replace('_', '-')}:{str(theme[k]).replace(';', '').replace('{', '').replace('}', '')}"
             for k in _THEME_VARS
             if theme.get(k)
         )

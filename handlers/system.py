@@ -15,14 +15,20 @@ from .base import Route
 _SRC = r"(ncm|kg|qqm|qq)?"
 _SRC_STRICT = r"(ncm|kg|qqm|qq)"
 
-_RE_HELP = r"^\s*#?(?:音乐|mh|点歌)?\s*(?:帮助|菜单|help)\s*$"
-_RE_SETTINGS = r"^\s*#?(?:音乐|mh)?\s*(?:设置|配置)\s*$"
-_RE_QUALITY = rf"^\s*#?{_SRC}\s*音质\s*(\S*)\s*$"
-_RE_API = rf"^\s*#?{_SRC_STRICT}\s*api\s+(\S+)\s*$"
-_RE_STATS = r"^\s*#?(?:音乐|mh)?\s*统计\s*$"
-_RE_TEST = r"^\s*#?(?:音乐|mh)?\s*测试\s*$"
-_RE_WEBUI = r"^\s*#?(?:音乐|mh)?\s*web\s*ui\s*$"
-_RE_TOGGLE = r"^\s*#?(?:音乐|mh)?\s*(开启|关闭)\s+(点歌|解析|卡片|语音|文件)\s*$"
+_RE_HELP = r"^\s*[#＃]?(?:音乐|mh|点歌)?\s*(?:帮助|菜单|help)\s*$"
+_RE_SETTINGS = r"^\s*[#＃]?(?:音乐|mh)?\s*(?:设置|配置)\s*$"
+# 音源可在「音质」前（ncm 音质 320）也可在后（音质 ncm 320，兜底提示用的是这种语序），
+# 两种都要能匹配，否则照提示输入会静默无响应。
+# 后语序分支放前面：否则「音质 ncm」会被前语序分支先命中、把 ncm 当成档位值。
+# _SRC 自带捕获组：组 1 = 前语序音源，组 2 = 后语序音源，组 3 = 档位值
+_RE_QUALITY = rf"^\s*[#＃]?(?:音质\s*(?:{_SRC}\s*)?|{_SRC}\s*音质)\s*(\S*)\s*$"
+# 地址组可选：裸「ncm api」（漏打地址）原先整条不匹配、静默无响应，run_api
+# 的用法分支成了死代码——与「换源」「登录」的修法对齐，空地址由 handler 回用法
+_RE_API = rf"^\s*[#＃]?{_SRC_STRICT}\s*api(?:\s+(.+?))?\s*$"
+_RE_STATS = r"^\s*[#＃]?(?:音乐|mh)?\s*统计\s*$"
+_RE_TEST = r"^\s*[#＃]?(?:音乐|mh)?\s*测试\s*$"
+_RE_WEBUI = r"^\s*[#＃]?(?:音乐|mh)?\s*web\s*ui\s*$"
+_RE_TOGGLE = r"^\s*[#＃]?(?:音乐|mh)?\s*(开启|关闭)\s*(点歌|解析|卡片|语音|文件)\s*$"
 
 _QUALITY_TABLES = {"ncm": NCM_LABEL, "kg": KG_LABEL, "qq": QQ_LABEL}
 
@@ -81,14 +87,22 @@ def _format_settings_text(data: dict) -> str:
 
 async def run_quality(service, event):
     m = re.search(_RE_QUALITY, event.message_str, re.IGNORECASE)
-    src = token_to_source(m.group(1) if m else None, service.config.default_source)
+    # 组 1 =「音质」前语序的音源，组 2 = 后语序的音源，组 3 = 档位值
+    src_token = (m.group(1) or m.group(2)) if m else None
+    explicit = bool(src_token)
+    src = token_to_source(src_token, service.config.default_source)
     if src == "auto":
         src = "ncm"
-    value = (m.group(2) if m else "").strip().lower()
+    value = (m.group(3) if m else "").strip().lower()
     if not value:
         cur = service.config.src_quality(src)
+        # 默认音源是 auto 时未写前缀会静默落到 ncm：提示指定方式，避免改错源
+        implicit_tip = (
+            "" if explicit or service.config.default_source != "auto" else "；可用「音质 ncm 320」指定音源"
+        )
         await service.reply(
-            event, f"[{SOURCE_NAMES[src]}] 当前最高音质：{cur}（{_QUALITY_TABLES[src].get(cur, cur)}）"
+            event,
+            f"[{SOURCE_NAMES[src]}] 当前最高音质：{cur}（{_QUALITY_TABLES[src].get(cur, cur)}）{implicit_tip}",
         )
         return
     if value not in _QUALITY_TABLES[src]:
@@ -113,9 +127,36 @@ async def run_api(service, event):
     if src in ("", "qq"):
         await service.reply(event, "用法：ncm api <地址> 或 kg api <地址>（QQ 音源内置，无需配置）")
         return
+    if not url:
+        # 地址组改可选后的空参形态：回用法而不是静默（备注校验对空串恒假，须前置）
+        await service.reply(event, f"用法：{src} api <地址>")
+        return
+    if re.search(r"\s", url):
+        # 正则放宽后整段（含备注）都会被取进地址组：地址本身不能含空白，
+        # 这里拦下给用法反馈，而不是把脏地址写进配置
+        await service.reply(event, "API 地址不能包含空格")
+        return
     from ..core.config import normalize_base
 
     url = normalize_base(url)
+    # 只放行 http/https：normalize_base 不校验协议，file://、ftp:// 等会被
+    # 服务器直接发起请求（admin-only，但 WebUI 弱口令场景下面会被放大）
+    if not url.lower().startswith(("http://", "https://")):
+        await service.reply(event, "API 地址必须以 http:// 或 https:// 开头")
+        return
+    # 拒绝内网/回环地址（与 WebUI 写侧 _api_admin 同口径）：持有管理员会话者
+    # 可借「测试」的连通性输出差异对内网做存活探测
+    from urllib.parse import urlparse
+
+    from ..core.media import _is_internal_host
+
+    if _is_internal_host(urlparse(url).hostname or ""):
+        await service.reply(
+            event,
+            "拒绝内网/回环地址：服务器会向该地址发起请求，"
+            "填公网可访问的 API 服务地址（本机自建请用反向代理）",
+        )
+        return
     node = dict(service.config.src_node(src))
     old_base = node.get("apiBase", "")
     node["apiBase"] = url
@@ -128,16 +169,42 @@ async def run_api(service, event):
         path, params = API_PROBE_PARAMS[src]
         await service.client_of(src).request(path, params)
         await service.reply(event, "连通性 OK ✓" + ("" if saved else "（保存失败，重启后失效）"))
+    except asyncio.CancelledError:
+        # 重载/停用的取消同样不能把坏地址留在磁盘：回滚后原样上抛（取消语义不变，
+        # 由路由兜底的 CancelledError 通道收尾）
+        node["apiBase"] = old_base
+        service.config.set(src, node)
+        await service.config.save_async()
+        raise
     except ApiError as e:
         # 探针走的就是配置里的新地址，只能先保存再探测；失败回滚旧值，别让坏地址留在
         # 配置里（客户端按 config 现读 base，set 即生效，回滚无需重建客户端）。
         node["apiBase"] = old_base
         service.config.set(src, node)
         restored = await service.config.save_async()
+        if restored:
+            await service.reply(event, f"新地址连通性失败：{e.user_msg()}，已还原为原地址")
+        else:
+            # 还原保存失败：坏地址仍在磁盘、重启后依旧生效——文案必须说清这个状态，
+            # 「已还原（保存失败，重启后失效）」字面意思恰好说反
+            await service.reply(
+                event,
+                f"新地址连通性失败：{e.user_msg()}。还原未能保存，重启后仍为新地址，请手动改回或重试",
+            )
+    except Exception as e:  # noqa: BLE001
+        # http.request_json 对非 "closed" 的 RuntimeError 等意外异常是显式 re-raise
+        # 的（探针段的 CancelledError/ApiError 兜不住）：漏接会既不回滚也不告知，
+        # 坏地址留在配置里且管理员只看到「执行失败」。与 ApiError 分支同一回滚口径，
+        # 异常原文落日志不透出（service.log_warn 已做脱敏）
+        service.log_warn(f"[music_hub] API 连通性探针异常: {e}")
+        node["apiBase"] = old_base
+        service.config.set(src, node)
+        restored = await service.config.save_async()
         await service.reply(
             event,
-            f"新地址连通性失败：{e.user_msg()}，已还原为原地址"
-            + ("" if restored else "（保存失败，重启后失效）"),
+            "新地址连通性失败（服务异常），已还原为原地址"
+            if restored
+            else "新地址连通性失败，且还原未能保存，请手动改回",
         )
 
 
@@ -190,6 +257,11 @@ async def run_test(service, event):
     await service.reply(event, "\n".join(lines))
 
 
+# UDP connect 探测用的对端地址： AliDNS anycast（纯路由探测，不发包不依赖其 DNS 服务）。
+# 只为让 getsockname 吐出本机出口 IP，选任何稳定公网地址皆可；失败回环兜底
+_LAN_PROBE_ADDR = ("223.5.5.5", 80)
+
+
 def _detect_lan_ip() -> str:
     """探测本机局域网 IP。UDP connect 不发包，通常瞬时返回；失败回环地址。"""
     import socket
@@ -197,7 +269,7 @@ def _detect_lan_ip() -> str:
     s = None
     try:
         s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        s.connect(("223.5.5.5", 80))
+        s.connect(_LAN_PROBE_ADDR)
         return s.getsockname()[0]
     except Exception:  # noqa: BLE001
         return "127.0.0.1"
@@ -216,7 +288,10 @@ async def run_webui(service, event):
     display = lan_ip if host in ("0.0.0.0", "") else host
     await service.reply(
         event,
-        f"♪ Music Hub 管理面板：http://{display}:{cfg.webui_port}\n（默认密码见插件配置 webui.password）",
+        # 配置里存的是 PBKDF2 哈希（登录用不了）：初始口令在插件数据目录的
+        # 告知文件里，登录改密后该文件自动删除
+        f"♪ Music Hub 管理面板：http://{display}:{cfg.webui_port}\n"
+        "（初始密码见插件数据目录 webui_initial_password.txt，登录后请修改密码）",
     )
 
 
@@ -233,6 +308,9 @@ async def run_toggle(service, event):
         "文件": "uploadFile",
     }.get(target)
     if not key:
+        # 正则限定了开关词，正常到不了这里；配置漂移（新增开关忘同步映射）时
+        # 给一句反馈而不是静默无响应
+        await service.reply(event, "未知开关，可用：点歌 / 解析 / 卡片 / 语音 / 文件")
         return
     service.config.set(key, on)
     saved = await service.config.save_async()
@@ -285,6 +363,9 @@ def routes() -> list[Route]:
             run_test,
             admin=True,
             priority=6,
+            # 每次全量探针最多 5 个上游请求（ncm search + kg 热搜 + QQ 登录态）：
+            # 与其他 admin 路由同口径挂 2s 轻频控，防连发刷穿上游
+            throttle=2.0,
         ),
         Route(
             re.compile(_RE_WEBUI, re.IGNORECASE),

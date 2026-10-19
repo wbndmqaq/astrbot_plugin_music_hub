@@ -15,6 +15,10 @@ from .system import routes as system_routes
 
 
 def all_routes() -> list[Route]:
+    # 顺序即同优先级仲裁：框架 registry 对同 priority 路由按登记序稳定排序，
+    # 重叠指令靠「先登记者先执行」裁决（如 explore/detail 的子命令路由先于 play 的
+    # 音源前缀别名）。新增与既有路由重叠的指令时，优先用 priority 拉开次序，
+    # 不要依赖这里的排列顺序。
     return [
         *share_routes(),
         *auth_routes(),

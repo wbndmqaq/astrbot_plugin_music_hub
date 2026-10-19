@@ -119,9 +119,15 @@ def routes() -> list[Route]:
         Route(re.compile(_RE_ALBUM, re.IGNORECASE), "mh_album", "专辑曲目", run_album, priority=6),
         Route(re.compile(_RE_PLAYLIST, re.IGNORECASE), "mh_playlist", "歌单曲目", run_playlist, priority=6),
         Route(re.compile(_RE_HOT, re.IGNORECASE), "mh_hot", "热搜榜", run_hot_search, priority=6),
+        # 「随机」对普通用户保持可用、不走 admin 闸门：个性化取数（管理员私人电台/日推）
+        # 与非个性化新歌榜的双轨在 run_random 内部按身份分流（见 explore_daily）
         Route(re.compile(_RE_RANDOM, re.IGNORECASE), "mh_random", "随机来一首", run_random, priority=6),
-        Route(re.compile(_RE_DAILY, re.IGNORECASE), "mh_daily", "每日推荐", run_daily, priority=6),
-        Route(re.compile(_RE_FM, re.IGNORECASE), "mh_fm", "私人电台", run_fm, priority=6),
+        # 每日推荐/私人电台/历史日推是登录账号的个性化内容：与账号类指令同口径
+        # 加 admin 闸门，避免群成员浏览管理员账号的偏好画像（account.py 注释同理由）
+        Route(
+            re.compile(_RE_DAILY, re.IGNORECASE), "mh_daily", "每日推荐", run_daily, priority=6, admin=True
+        ),
+        Route(re.compile(_RE_FM, re.IGNORECASE), "mh_fm", "私人电台", run_fm, priority=6, admin=True),
         Route(
             re.compile(_RE_RECOMMEND, re.IGNORECASE), "mh_recommend", "歌单推荐", run_recommend, priority=6
         ),
@@ -170,6 +176,7 @@ def routes() -> list[Route]:
             "历史日推",
             run_history_daily,
             priority=6,
+            admin=True,
         ),
         Route(
             re.compile(_RE_PLAYLIST_CATS, re.IGNORECASE),
@@ -207,6 +214,9 @@ def routes() -> list[Route]:
             priority=7,
         ),
     ]
+    # 浏览发现类指令全部直刷上游 API，统一挂轻频控（与点歌冷却分开计）：
+    # 这是三平台风控（403/152）的高发区，原先完全无节流
     for r in rs:
         r.gated = True
+        r.throttle = 2.0
     return rs

@@ -1,4 +1,4 @@
-"""explore 域模块：social类发现指令。"""
+"""explore 域模块：social 类发现指令。"""
 
 from __future__ import annotations
 
@@ -43,10 +43,16 @@ async def run_album_comments(service, event):
         await service.reply(event, f"没有找到专辑「{kw}」")
         return
     if len(cands) > 1:
-        rows = " / ".join(f"{c.get('name')}（{c.get('artist', '')}）" for c in cands[:4])
+        # name 缺省时兜底空串：f-string 里裸 c.get('name') 会把字面 None 发给用户
+        rows = " / ".join(f"{c.get('name') or ''}（{c.get('artist') or ''}）" for c in cands[:4])
         await service.reply(event, f"「{kw}」命中多张专辑，请写更具体：{rows}")
         return
     target = cands[0]
+    if not target.get("id"):
+        # 上游行缺 id 时 KeyError 会被包装器吃成「执行失败」，给明确文案（与
+        # explore_playlist/explore_rank 的 .get + 提示口径一致）
+        await service.reply(event, "这张专辑的数据不完整，无法获取评论，稍后再试")
+        return
     comments = await service.call(src, "comment", client.comments(target["id"], 12, kind="album"))
     if not comments.get("hot"):
         await service.reply(event, "这张专辑暂无热门评论")
@@ -72,10 +78,14 @@ async def run_playlist_comments(service, event):
         await service.reply(event, f"没有找到歌单「{kw}」")
         return
     if len(cands) > 1:
-        rows = " / ".join(c.get("name", "") for c in cands[:4])
+        # 对齐上方专辑评论的多命中格式：歌单名（创作者），缺省兜底空串防字面 None
+        rows = " / ".join(f"{c.get('name') or ''}（{c.get('creator') or ''}）" for c in cands[:4])
         await service.reply(event, f"「{kw}」命中多个歌单，请写更具体：{rows}")
         return
     target = cands[0]
+    if not target.get("id"):
+        await service.reply(event, "这个歌单的数据不完整，无法获取评论，稍后再试")
+        return
     comments = await service.call(src, "comment", client.comments(target["id"], 12, kind="playlist"))
     if not comments.get("hot"):
         await service.reply(event, "这个歌单暂无热门评论")
@@ -123,7 +133,11 @@ async def run_singer_mvs(service, event):
     if not kw:
         await service.reply(event, "用法：歌手MV 歌手名")
         return
-    singer, mvs = await service.client_of(src).artist_mvs_by_keyword(kw, 10)
+    # 走 service.call 记账：与 account/detail 的全量记账纪律一致，
+    # WebUI 统计与「失败原因 TOP」才覆盖得到这两条路径
+    singer, mvs = await service.call(
+        src, "explore", service.client_of(src).artist_mvs_by_keyword(kw, 10), detail=kw
+    )
     if singer is None or not mvs:
         await service.reply(event, f"没有找到「{kw}」的 MV")
         return
@@ -148,7 +162,9 @@ async def run_similar_singers(service, event):
     if not kw:
         await service.reply(event, "用法：相似歌手 歌手名")
         return
-    singer, cands = await service.client_of(src).similar_singers_by_keyword(kw, 10)
+    singer, cands = await service.call(
+        src, "explore", service.client_of(src).similar_singers_by_keyword(kw, 10), detail=kw
+    )
     if singer is None:
         await service.reply(event, f"没有找到歌手「{kw}」")
         return

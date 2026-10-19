@@ -20,7 +20,6 @@ def format_versions_text(data: dict) -> str:
     return "\n".join(lines)
 
 
-# ──────────── 纯文本兜底 ────────────
 def format_list_text(data: dict) -> str:
     lines = [f"♪ 点歌「{data.get('keyword', '')}」 共 {data.get('total', 0)} 首"]
     for s in data.get("songs", []):
